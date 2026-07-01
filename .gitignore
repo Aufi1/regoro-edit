@@ -1,0 +1,4 @@
+node_modules/
+# Auth-Secret pro Site — NIE committen/ausliefern:
+.regoro/
+*.log

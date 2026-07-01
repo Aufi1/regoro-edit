@@ -1,0 +1,11 @@
+:root { --accent:#e2571e; --ink:#16222e; }
+* { box-sizing:border-box; }
+body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
+  color:var(--ink); margin:0; line-height:1.55; }
+.wrap { max-width:880px; margin:0 auto; padding:24px; }
+header { background:var(--ink); color:#fff; }
+header a { color:#fff; text-decoration:none; margin-right:16px; }
+h1 { font-size:32px; }
+.hero img, .team img { width:100%; height:220px; object-fit:cover; border-radius:10px; background:#ccd; }
+.btn { display:inline-block; background:var(--accent); color:#fff; padding:10px 16px; border-radius:8px; text-decoration:none; }
+footer { color:#5a6b78; font-size:14px; border-top:1px solid #e6ebef; margin-top:32px; }

@@ -1,0 +1,38 @@
+# Beispiel-Caddyfile für den regoro-edit Inline-Editor.
+#
+# Aufgabe des Proxys:
+#   - statische Site direkt ausliefern (schnell, billig, der Bun-Prozess ist
+#     dafür NICHT im Pfad),
+#   - /edit* an den Bun-Editor-Host (localhost:8788) weiterreichen (Auth dort),
+#   - TLS automatisch (Let's-Encrypt / ACME) — das Auth-Cookie ist `Secure`,
+#     setzt also HTTPS voraus,
+#   - .regoro/ und alle Dotfiles HART blocken (404) — die Auth-Datei darf
+#     niemals ausgeliefert werden.
+#
+# Anpassen: Domain, root-Pfad zur Site, ggf. Port.
+
+example.com {
+    encode gzip
+
+    # --- Harte Block-Regel: Auth-Datei + Dotfiles nie ausliefern ---------------
+    # Greift VOR allem anderen. Deckt /.regoro/... und beliebige versteckte
+    # Dateien/Verzeichnisse (/.git, /.env, ...) ab.
+    @hidden path /.regoro/* /.*
+    handle @hidden {
+        respond 404
+    }
+
+    # --- Editor-Routen an den Bun-Host (Auth + Sessions laufen dort) -----------
+    @editor path /edit*
+    handle @editor {
+        reverse_proxy localhost:8788
+    }
+
+    # --- Alles andere: statische Site direkt ausliefern -----------------------
+    # WICHTIG: derselbe Ordner, den `regoro-edit <dir>` bearbeitet, sonst
+    # divergieren öffentliche Seite und Editier-Ziel.
+    handle {
+        root * /srv/site
+        file_server
+    }
+}
