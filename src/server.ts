@@ -20,19 +20,28 @@ export interface ServerOptions {
 }
 
 /**
+ * Listet die top-level .html-Seiten in siteDir (Allowlist-Regex), sortiert.
+ * Leeres Array, wenn keine passende Datei existiert — im Gegensatz zu
+ * discoverPages ohne Fallback, damit Aufrufer "keine Seiten" erkennen können.
+ */
+export function listPageFiles(siteDir: string): string[] {
+  try {
+    return readdirSync(siteDir, { withFileTypes: true })
+      .filter((e) => e.isFile() && PAGE_RE.test(e.name))
+      .map((e) => e.name)
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Findet die top-level .html-Seiten in siteDir (Allowlist-Regex). Fällt auf
  * ["index.html"] zurück, wenn keine passende Datei gefunden wird.
  */
 export function discoverPages(siteDir: string): string[] {
-  let entries: string[] = [];
-  try {
-    entries = readdirSync(siteDir, { withFileTypes: true })
-      .filter((e) => e.isFile() && PAGE_RE.test(e.name))
-      .map((e) => e.name);
-  } catch {
-    entries = [];
-  }
-  return entries.length > 0 ? entries.sort() : ["index.html"];
+  const entries = listPageFiles(siteDir);
+  return entries.length > 0 ? entries : ["index.html"];
 }
 
 export function startServer(opts: ServerOptions): { port: number } {
