@@ -4,3 +4,5 @@ node_modules/
 *.log
 # Standalone-Binaries (bun run build:binary / Release-Workflow) — ~91 MB pro Stück.
 dist/
+# gstack-Workspace (Pläne/Reviews) — Symlink, nicht committen:
+docs/gstack
