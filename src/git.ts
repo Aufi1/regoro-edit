@@ -71,20 +71,36 @@ export function ensureRepo(repoRoot: string): void {
   }
 }
 
+/** git meldet ein Repo ohne jeden Commit so (Wortlaut variiert nach Version/Locale). */
+const EMPTY_REPO_RE = /unknown revision|ambiguous argument|Needed a single revision|bad revision/i;
+
 /**
- * Zählt die Commits im Repo. 0 = kein Repo oder kein HEAD.
+ * Zählt die Commits im Repo.
+ *   0    = kein Repo, oder ein Repo ganz ohne Commit
+ *   n>0  = so viele Commits
+ *   null = LÄSST SICH NICHT BESTIMMEN (git verweigert, z.B. "dubious ownership")
  *
  * Für `regoro disable --purge`: Ein Repo mit genau einem Commit enthält nur den
  * Baseline-Stand von `init` — dort ist nichts verloren, wenn es gelöscht wird.
  * Ab zwei Commits steckt Arbeit drin, die es sonst nirgends gibt (der Editor ist
  * die einzige Quelle; die Fabrik kennt diese Änderungen nicht).
+ *
+ * Deshalb `null` statt `0` im Fehlerfall — fail-closed. Ein pauschales `return 0`
+ * hätte ein Repo voller Kundenarbeit für leer gehalten, sobald git es nicht lesen
+ * kann, und `--purge` hätte es gelöscht. Aufrufer MÜSSEN null als "nicht löschen"
+ * behandeln.
  */
-export function countCommits(repoRoot: string): number {
+export function countCommits(repoRoot: string): number | null {
   if (!existsSync(join(repoRoot, ".git"))) return 0;
   const res = Bun.spawnSync(["git", "-C", repoRoot, "rev-list", "--count", "HEAD"]);
-  if (res.exitCode !== 0) return 0; // kein HEAD (leeres Repo) oder git verweigert
-  const n = Number(new TextDecoder().decode(res.stdout).trim());
-  return Number.isFinite(n) ? n : 0;
+  if (res.exitCode === 0) {
+    const n = Number(new TextDecoder().decode(res.stdout).trim());
+    return Number.isFinite(n) ? n : null;
+  }
+  // Repo ohne Commit ist ein legitimer Zustand (git init, nichts committet).
+  const stderr = new TextDecoder().decode(res.stderr);
+  if (EMPTY_REPO_RE.test(stderr)) return 0;
+  return null; // alles andere: git verweigert die Auskunft
 }
 
 /** Committet genau pagePath; no-op-tolerant (keine Änderung → kein Fehler). */

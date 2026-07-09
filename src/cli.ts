@@ -233,15 +233,30 @@ function cmdDisable(args: string[]): void {
     fail(`nicht initialisiert: ${authDir} existiert nicht.\n  Es gibt nichts abzuschalten.`);
   }
 
+  // null = git konnte die Historie nicht lesen. Dann NIEMALS löschen (fail-closed):
+  // ein Repo voller Kundenarbeit sähe sonst aus wie ein leeres.
   const commits = countCommits(siteDir);
+  const disableCmd = siteDirArg === "." ? "regoro disable" : `regoro disable ${siteDirArg}`;
 
-  if (purge && commits > 1) {
+  if (purge && commits === null) {
+    fail(
+      "die Versionshistorie lässt sich nicht lesen — git verweigert die Auskunft.\n" +
+        "  Ob darin gespeicherte Bearbeitungen stecken, ist damit unbekannt, und\n" +
+        "  --purge würde sie unwiederbringlich löschen. Abgebrochen.\n\n" +
+        "  Nachsehen, woran es liegt:\n" +
+        `    git -C ${shellQuote(siteDir)} log --oneline\n\n` +
+        "  Nur den Editor abschalten (rührt .git nicht an):\n" +
+        `    ${disableCmd}`,
+    );
+  }
+
+  if (purge && commits !== null && commits > 1) {
     fail(
       `${commits} Commits im Site-Repo — darin stecken gespeicherte Bearbeitungen.\n` +
         "  Der Editor ist die einzige Quelle dieser Änderungen; --purge würde sie\n" +
         "  unwiederbringlich löschen. Abgebrochen.\n\n" +
         "  Nur den Editor abschalten (Historie bleibt):\n" +
-        `    ${siteDirArg === "." ? "regoro disable" : `regoro disable ${siteDirArg}`}\n\n` +
+        `    ${disableCmd}\n\n` +
         "  Historie ansehen:\n" +
         `    git -C ${shellQuote(siteDir)} log --oneline`,
     );
@@ -255,6 +270,8 @@ function cmdDisable(args: string[]): void {
   if (purge) {
     rmSync(join(siteDir, ".git"), { recursive: true, force: true });
     console.log("  git-Repo entfernt (enthielt keine gespeicherten Bearbeitungen).");
+  } else if (commits === null) {
+    console.log("  git-Repo bleibt erhalten (Historie nicht lesbar — unangetastet).");
   } else if (commits > 0) {
     console.log(`  git-Repo bleibt erhalten (${commits} Version${commits === 1 ? "" : "en"}).`);
   }

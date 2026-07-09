@@ -186,6 +186,52 @@ describe("regoro disable", () => {
     expect(proc.exitCode).toBe(0);
     expect(existsSync(join(site, ".regoro"))).toBe(false);
   });
+
+  // Fail-closed: Kann git die Historie nicht lesen (z.B. "dubious ownership"),
+  // ist UNBEKANNT, ob Kundenarbeit darin steckt. countCommits() gibt dann null.
+  // Ein früheres `return 0` hätte ein volles Repo für leer gehalten und --purge
+  // hätte es gelöscht.
+  describe("git verweigert die Auskunft", () => {
+    function withFakeGit(args: string[]) {
+      const bin = mkdtempSync(join(tmpdir(), "regoro-fg-"));
+      writeFileSync(
+        join(bin, "git"),
+        '#!/bin/sh\n>&2 echo "fatal: detected dubious ownership"\nexit 128\n',
+        { mode: 0o755 },
+      );
+      const proc = Bun.spawnSync(["bun", CLI, "disable", ...args], {
+        cwd: dir,
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
+      });
+      rmSync(bin, { recursive: true, force: true });
+      return { code: proc.exitCode, stdout: proc.stdout.toString(), stderr: proc.stderr.toString() };
+    }
+
+    test("--purge bricht ab und löscht NICHTS", () => {
+      makeSite(dir);
+      expect(runInit([], { cwd: dir }).code).toBe(0);
+      makeEdit(dir); // echte Kundenarbeit im Repo
+
+      const r = withFakeGit(["--purge"]);
+
+      expect(r.code).toBe(1);
+      expect(r.stderr).toContain("lässt sich nicht lesen");
+      expect(existsSync(join(dir, ".git"))).toBe(true); // Historie gerettet
+      expect(existsSync(join(dir, ".regoro", "auth.json"))).toBe(true);
+    });
+
+    test("ohne --purge funktioniert das Abschalten trotzdem", () => {
+      makeSite(dir);
+      expect(runInit([], { cwd: dir }).code).toBe(0);
+
+      const r = withFakeGit([]);
+
+      expect(r.code).toBe(0);
+      expect(existsSync(join(dir, ".regoro"))).toBe(false);
+      expect(existsSync(join(dir, ".git"))).toBe(true); // unangetastet
+      expect(r.stdout).toContain("nicht lesbar");
+    });
+  });
 });
 
 describe("regoro init", () => {
