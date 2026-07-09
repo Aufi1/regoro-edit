@@ -1,6 +1,6 @@
 {
   "name": "regoro-edit",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Inline-WYSIWYG-Editor für bestehende statische HTML-Websites. Installieren, Passwort setzen, an jede Seite /edit anhängen.",
   "type": "module",
   "bin": {
