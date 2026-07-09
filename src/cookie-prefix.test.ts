@@ -15,6 +15,7 @@ import { join } from "node:path";
 import {
   cookieName,
   readCookieTokens,
+  MAX_SESSION_COOKIES,
   issueCookie,
   checkCookie,
   hashPassword,
@@ -88,6 +89,22 @@ describe("auth.ts — readCookieTokens liest ALLE gleichnamigen Cookies", () => 
 
   test("Token mit '=' im Wert bleibt intakt", () => {
     expect(readCookieTokens(`${name}=v1.123.sig==`)).toEqual(["v1.123.sig=="]);
+  });
+
+  test("mehr als MAX_SESSION_COOKIES Kandidaten werden gekappt", () => {
+    // Ohne Grenze bestimmt der Angreifer, wie oft der Server HMAC rechnet:
+    // ein 16-KB-Header fasst ~200 Kandidaten (~1,6 ms CPU pro Request).
+    const header = Array.from({ length: 50 }, (_, i) => `${name}=t${i}`).join("; ");
+    const tokens = readCookieTokens(header);
+
+    expect(tokens).toHaveLength(MAX_SESSION_COOKIES);
+    expect(tokens[0]).toBe("t0");
+    expect(tokens.at(-1)).toBe(`t${MAX_SESSION_COOKIES - 1}`);
+  });
+
+  test("genau MAX_SESSION_COOKIES Kandidaten kommen vollständig durch", () => {
+    const header = Array.from({ length: MAX_SESSION_COOKIES }, (_, i) => `${name}=t${i}`).join("; ");
+    expect(readCookieTokens(header)).toHaveLength(MAX_SESSION_COOKIES);
   });
 });
 

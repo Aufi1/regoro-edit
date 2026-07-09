@@ -200,7 +200,21 @@ export function checkCookie(auth: AuthConfig | null, token: string): boolean {
 }
 
 /**
- * Liest ALLE Token-Werte mit unserem Cookie-Namen aus einem Cookie-Header.
+ * Obergrenze für gleichnamige Session-Cookies, die wir überhaupt prüfen.
+ *
+ * Legitim gibt es höchstens eines (`__Host-` verbietet dem Browser Duplikate).
+ * Selbst ohne Präfix wären es die Host-Cookies plus je eines pro Ancestor-Domain,
+ * also eine Handvoll. 8 wird im Normalbetrieb nie erreicht.
+ *
+ * Zweck: Ohne Grenze bestimmt der Angreifer, wie oft wir HMAC rechnen. Gemessen
+ * kostet ein 16-KB-Header voller Kandidaten ~1,6 ms (202 × ~7,8 µs) — weniger als
+ * ein /edit-Render, aber angreifergesteuerte, unbegrenzte Arbeit gehört begrenzt.
+ */
+const MAX_SESSION_COOKIES = 8;
+
+/**
+ * Liest die Token-Werte mit unserem Cookie-Namen aus einem Cookie-Header,
+ * höchstens MAX_SESSION_COOKIES viele.
  *
  * Bewusst eine Liste, nicht der erste Treffer: Ein Header kann denselben Namen
  * mehrfach enthalten (Host-Cookie + untergeschobenes Domain-Cookie einer
@@ -215,9 +229,14 @@ export function readCookieTokens(cookieHeader: string | null): string[] {
   const out: string[] = [];
   for (const part of cookieHeader.split(";")) {
     const [name, ...rest] = part.trim().split("=");
-    if (name === wanted) out.push(rest.join("="));
+    if (name === wanted) {
+      out.push(rest.join("="));
+      if (out.length >= MAX_SESSION_COOKIES) break;
+    }
   }
   return out;
 }
+
+export { MAX_SESSION_COOKIES };
 
 export { COOKIE_BASE };
