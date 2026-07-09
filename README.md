@@ -47,8 +47,19 @@ davor gälten sie für `curl`, nicht für `sh`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Aufi1/regoro-edit/main/install.sh \
-  | REGORO_INSTALL_DIR=/usr/local/bin REGORO_VERSION=v0.1.0 sh
+  | REGORO_INSTALL_DIR=/usr/local/bin REGORO_VERSION=v0.1.3 sh
 ```
+
+## Die Befehle
+
+| Befehl | Zweck |
+|---|---|
+| `regoro init` | Passwort setzen, Git-Repo anlegen. Einmal pro Site. |
+| `regoro run` | Editor-Server starten. Läuft im Vordergrund, bis `Strg-C`. |
+| `regoro service` | systemd-Unit + Caddy-Block für den Dauerbetrieb ausgeben. |
+| `regoro disable` | Editor wieder abschalten. |
+
+Alle nehmen den Site-Ordner aus dem aktuellen Verzeichnis; ein Pfad als Argument geht genauso.
 
 ## Schnellstart (2 Schritte)
 
@@ -58,10 +69,7 @@ regoro init      # Passwort setzen (legt <site>/.regoro/auth.json an)
 regoro run       # Editor starten
 ```
 
-Beide Befehle nehmen den Site-Ordner aus dem aktuellen Verzeichnis; `regoro init /pfad/zu/site`
-geht genauso.
-
-Dann im Browser `http://localhost:8788/` öffnen (deine Site) und an eine beliebige Seite `/edit` anhängen → Login → bearbeiten.
+Dann im Browser `http://localhost:8788/` öffnen (deine Site) und an eine beliebige Seite `/edit` anhängen → Login → bearbeiten. Über `localhost` funktioniert das ohne weitere Einstellungen.
 
 > **Ausprobieren ohne eigene Site:** In diesem Repo liegt eine Beispiel-Site unter `examples/site`:
 > ```bash
@@ -114,25 +122,36 @@ Jede Speicherung und jede Wiederherstellung ist ein Git-Commit im Site-Ordner. I
 
 Annahme: Deine Website ist unter ihrer Domain bereits erreichbar, per HTTPS. Der Editor kommt daneben — ein lokaler Prozess, an den der Proxy nur `/edit*` weiterreicht.
 
-`regoro service` erzeugt beides, was du dafür brauchst, und sucht sich die Pfade selbst zusammen:
+Der einzige Befehl, den du tippst:
 
 ```bash
 cd /pfad/zu/deiner/site
 regoro service --domain deine-domain.de
 ```
 
-Das druckt eine fertige **systemd-Unit** (mit Site-Ordner, Binary-Pfad und einem aus dem Ordnernamen abgeleiteten Port) und den passenden **Caddy-Block** (Dotfile-Block, `/edit*` an den Editor, Extension-Allowlist für die statische Site). Direkt weiterleiten:
+Er schreibt nichts. Er **druckt** drei Dinge, und du kopierst sie:
+
+1. eine fertige **systemd-Unit** — Site-Ordner, Pfad zum `regoro`-Binary und ein aus dem Ordnernamen abgeleiteter Port sind bereits eingesetzt;
+2. den passenden **Caddy-Block** — Dotfile-Sperre, `/edit*` an den Editor, Extension-Allowlist für die statische Site;
+3. die **Aktivierungsbefehle**, fertig mit deinem Dienstnamen (z. B. `regoro-mueller`), nicht mit Platzhaltern.
+
+Du musst weder die Unit noch den Caddy-Block selbst schreiben. Die Befehle aus Punkt 3 sehen so aus und stehen so in der Ausgabe, nur mit ausgefülltem Namen:
 
 ```bash
-regoro service --systemd | sudo tee /etc/systemd/system/regoro-<slug>.service > /dev/null
-sudo systemctl enable --now regoro-<slug>
+regoro service /pfad/zu/deiner/site --systemd | sudo tee /etc/systemd/system/regoro-mueller.service > /dev/null
+sudo systemctl daemon-reload
+sudo systemctl enable --now regoro-mueller
 
-regoro service --caddy --domain deine-domain.de | sudo tee -a /etc/caddy/Caddyfile > /dev/null
+regoro service /pfad/zu/deiner/site --caddy --domain deine-domain.de | sudo tee -a /etc/caddy/Caddyfile > /dev/null
 sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 sudo systemctl reload caddy
 ```
 
-Der Caddy-Block **ersetzt** einen bestehenden Block für dieselbe Domain — er liefert die Site selbst aus, weil die Allowlist vor dem `file_server` greifen muss. Wer lieber von Hand baut, findet dieselbe Konfiguration in `Caddyfile.example`.
+`--systemd` und `--caddy` geben jeweils nur den reinen Inhalt aus, ohne die Überschriftenzeilen der Übersicht — deshalb lassen sie sich direkt in eine Datei leiten.
+
+**Achtung:** Der Caddy-Block liefert die Site selbst aus (die Allowlist muss vor dem `file_server` greifen). Hast du für die Domain schon einen Block, **ersetze** ihn — nicht anhängen. Dieselbe Konfiguration steht kommentiert in `Caddyfile.example`.
+
+Danach ist der Editor unter `https://deine-domain.de/edit` erreichbar, das `Secure`-Cookie funktioniert, und `EDITOR_INSECURE_COOKIE` brauchst du nie.
 
 Alternativ per Docker – siehe `Dockerfile` (Site als Volume mounten; `init` einmalig im gemounteten Ordner ausführen, damit die Auth-Datei zur Laufzeit vorliegt und **nicht** ins Image gebacken wird).
 
@@ -197,7 +216,7 @@ Ein Release entsteht durch einen Tag (`v*`): `.github/workflows/release.yml` bau
 vier Binaries, erzeugt `SHA256SUMS` und hängt beides ans Release — von dort lädt
 `install.sh`.
 
-Der Editor-Kern liegt unter `src/` (`contract`/`serve`/`apply`/`git` sind infrastruktur-agnostisch; `auth`/`host`/`server`/`cli` bilden die HTTP-/Setup-Schicht). Das Browser-Overlay ist `src/overlay.client.js`.
+Der Editor-Kern liegt unter `src/` (`contract`/`serve`/`apply`/`git` sind infrastruktur-agnostisch; `auth`/`host`/`server`/`cli` bilden die HTTP-/Setup-Schicht; `service.ts` erzeugt nur Text für `regoro service`). Das Browser-Overlay ist `src/overlay.client.js`.
 
 ## Lizenz
 
