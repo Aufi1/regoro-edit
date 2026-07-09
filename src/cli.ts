@@ -35,7 +35,7 @@ import {
  * Import würde `resolveJsonModule` erzwingen und im --compile-Binary die
  * package.json mitbündeln.
  */
-export const VERSION = "0.1.3";
+export const VERSION = "0.2.0";
 
 const USAGE = `regoro — Inline-Editor
 

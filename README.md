@@ -47,7 +47,7 @@ davor gälten sie für `curl`, nicht für `sh`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Aufi1/regoro-edit/main/install.sh \
-  | REGORO_INSTALL_DIR=/usr/local/bin REGORO_VERSION=v0.1.3 sh
+  | REGORO_INSTALL_DIR=/usr/local/bin REGORO_VERSION=v0.2.0 sh
 ```
 
 ## Die Befehle
