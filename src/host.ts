@@ -5,10 +5,11 @@
  * Auth-Fehler → 404 (nicht 401), außer /edit/login. Alle Antworten noindex/no-store.
  */
 import { join, resolve, dirname, basename, extname, sep, posix } from "node:path";
-import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, statSync, mkdirSync, realpathSync } from "node:fs";
 import { parseHTML } from "linkedom";
+// Bun-"file"-Import: liefert einen Pfad, den bun build --compile mit einbettet.
+import overlayAsset from "./overlay.client.js" with { type: "file" };
 import {
   verifyPassword,
   issueCookie,
@@ -62,7 +63,12 @@ const PAGE_RE = /^[a-z0-9-]+\.html$/;
 // (Argument-Injection wie `-f`), symbolische Refs (HEAD/main/Tags → Lesen
 // fremder Branches) und `..`/`@` aus.
 const COMMIT_RE = /^[0-9a-f]{7,40}$/;
-const OVERLAY_PATH = join(dirname(fileURLToPath(import.meta.url)), "overlay.client.js");
+// Overlay-Pfad: In der Entwicklung ist das der echte Plattenpfad (jeder Request
+// liest frisch — Invariante bleibt), in einem `bun build --compile`-Binary der
+// eingebettete /$bunfs/-Pfad. Früher aus import.meta.url gebaut; das zeigte im
+// Binary ins Leere → /edit-assets/overlay.js gab 404 und der Editor war stumm
+// funktionslos. readFileSync/existsSync können beide Pfade.
+const OVERLAY_PATH: string = overlayAsset;
 
 // Allowlist statischer Asset-Extensions → Content-Type. KEIN .html hier
 // (Seiten laufen über den /edit-Pfad; Asset-Serving darf keine beliebigen

@@ -2,3 +2,5 @@ node_modules/
 # Auth-Secret pro Site — NIE committen/ausliefern:
 .regoro/
 *.log
+# Standalone-Binaries (bun run build:binary / Release-Workflow) — ~91 MB pro Stück.
+dist/
