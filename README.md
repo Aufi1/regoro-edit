@@ -129,6 +129,18 @@ Alternativ per Docker – siehe `Dockerfile` (Site als Volume mounten; `init` ei
 | `PORT` | `8788` | Port des Editor-Servers |
 | `EDITOR_INSECURE_COOKIE` | *(nicht gesetzt)* | `=1` lässt das `Secure`-Cookie-Flag weg – **nur für lokales HTTP** (Dogfooding), **nie in Produktion**. |
 
+## Editor wieder abschalten
+
+```bash
+regoro disable            # im Site-Ordner
+```
+
+Entfernt `.regoro/`. Die Website wird unverändert weiter ausgeliefert, alle `/edit*`-Routen antworten mit `404` (fail-closed). Umkehrbar mit `regoro init`.
+
+Die Versionshistorie (`.git`) bleibt dabei erhalten — **jede Speicherung im Editor ist ein Commit, und der Editor ist die einzige Quelle dieser Änderungen.** `regoro disable --purge` löscht `.git` mit, aber nur solange nichts anderes darin steht als der Baseline-Commit von `init`. Sobald es gespeicherte Bearbeitungen gibt, bricht `--purge` ab und rührt nichts an.
+
+## Weitere CLI-Optionen
+
 Die CLI kennt außerdem `regoro init <site> --password-stdin` (Passwort aus stdin, für Skripte/Docker) und `--force`.
 
 `init` bricht ab, wenn die Site bereits eine `.regoro/auth.json` hat oder der Ordner keine top-level `*.html` enthält — beides schützt davor, versehentlich den falschen Ordner zu initialisieren oder ein bestehendes Passwort zu überschreiben. `--force` hebt beide Guards auf; bei bestehender Auth-Datei setzt es das Passwort neu und macht **alle laufenden Sessions ungültig** (das Cookie-Secret wird mit erneuert).

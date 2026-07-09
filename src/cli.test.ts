@@ -85,6 +85,109 @@ describe("regoro — CLI-Grundgerüst", () => {
   });
 });
 
+describe("regoro disable", () => {
+  function runDisable(args: string[] = [], cwd = dir) {
+    const proc = Bun.spawnSync(["bun", CLI, "disable", ...args], { cwd });
+    return {
+      code: proc.exitCode,
+      stdout: proc.stdout.toString(),
+      stderr: proc.stderr.toString(),
+    };
+  }
+
+  /** Simuliert eine gespeicherte Bearbeitung: zweiter Commit im Site-Repo. */
+  function makeEdit(at: string): void {
+    writeFileSync(join(at, "index.html"), "<html><body><p>Geändert</p></body></html>");
+    Bun.spawnSync(["git", "-C", at, "add", "-A"]);
+    Bun.spawnSync([
+      "git", "-C", at,
+      "-c", "user.name=T", "-c", "user.email=t@t.local",
+      "commit", "-m", "Edit",
+    ]);
+  }
+
+  test("entfernt .regoro/, lässt Website und Historie stehen", () => {
+    makeSite(dir);
+    expect(runInit([], { cwd: dir }).code).toBe(0);
+
+    const r = runDisable();
+
+    expect(r.code).toBe(0);
+    expect(existsSync(join(dir, ".regoro"))).toBe(false);
+    expect(existsSync(join(dir, "index.html"))).toBe(true); // Website unangetastet
+    expect(existsSync(join(dir, ".git"))).toBe(true); // Historie bleibt
+    expect(r.stdout).toContain("Editor ist für diese Site aus");
+  });
+
+  test("ohne .regoro/ → Exit 1, nichts zu tun", () => {
+    makeSite(dir);
+    const r = runDisable();
+
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("nicht initialisiert");
+  });
+
+  test("danach lässt sich die Site wieder initialisieren", () => {
+    makeSite(dir);
+    expect(runInit([], { cwd: dir }).code).toBe(0);
+    expect(runDisable().code).toBe(0);
+
+    const r = runInit([], { cwd: dir }); // kein Guard blockiert
+    expect(r.code).toBe(0);
+    expect(existsSync(join(dir, ".regoro", "auth.json"))).toBe(true);
+  });
+
+  test("--purge entfernt .git, wenn nur der Baseline-Commit existiert", () => {
+    makeSite(dir);
+    expect(runInit([], { cwd: dir }).code).toBe(0);
+
+    const r = runDisable(["--purge"]);
+
+    expect(r.code).toBe(0);
+    expect(existsSync(join(dir, ".git"))).toBe(false);
+    expect(existsSync(join(dir, "index.html"))).toBe(true);
+  });
+
+  test("--purge VERWEIGERT, sobald gespeicherte Bearbeitungen existieren", () => {
+    makeSite(dir);
+    expect(runInit([], { cwd: dir }).code).toBe(0);
+    makeEdit(dir); // zweiter Commit = Kundenarbeit
+
+    const r = runDisable(["--purge"]);
+
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("gespeicherte Bearbeitungen");
+    // NICHTS wurde gelöscht — auch die Auth-Datei nicht.
+    expect(existsSync(join(dir, ".git"))).toBe(true);
+    expect(existsSync(join(dir, ".regoro", "auth.json"))).toBe(true);
+  });
+
+  test("ohne --purge geht das Abschalten auch mit Bearbeitungen", () => {
+    makeSite(dir);
+    expect(runInit([], { cwd: dir }).code).toBe(0);
+    makeEdit(dir);
+
+    const r = runDisable();
+
+    expect(r.code).toBe(0);
+    expect(existsSync(join(dir, ".regoro"))).toBe(false);
+    expect(existsSync(join(dir, ".git"))).toBe(true);
+    expect(r.stdout).toContain("2 Versionen");
+  });
+
+  test("mit explizitem siteDir statt cwd", () => {
+    const site = join(dir, "site");
+    mkdirSync(site);
+    makeSite(site);
+    expect(runInit([site], { cwd: dir }).code).toBe(0);
+
+    const proc = Bun.spawnSync(["bun", CLI, "disable", site], { cwd: dir });
+
+    expect(proc.exitCode).toBe(0);
+    expect(existsSync(join(site, ".regoro"))).toBe(false);
+  });
+});
+
 describe("regoro init", () => {
   test("ohne siteDir-Argument: initialisiert das aktuelle Verzeichnis", () => {
     makeSite(dir);

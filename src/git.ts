@@ -71,6 +71,22 @@ export function ensureRepo(repoRoot: string): void {
   }
 }
 
+/**
+ * Zählt die Commits im Repo. 0 = kein Repo oder kein HEAD.
+ *
+ * Für `regoro disable --purge`: Ein Repo mit genau einem Commit enthält nur den
+ * Baseline-Stand von `init` — dort ist nichts verloren, wenn es gelöscht wird.
+ * Ab zwei Commits steckt Arbeit drin, die es sonst nirgends gibt (der Editor ist
+ * die einzige Quelle; die Fabrik kennt diese Änderungen nicht).
+ */
+export function countCommits(repoRoot: string): number {
+  if (!existsSync(join(repoRoot, ".git"))) return 0;
+  const res = Bun.spawnSync(["git", "-C", repoRoot, "rev-list", "--count", "HEAD"]);
+  if (res.exitCode !== 0) return 0; // kein HEAD (leeres Repo) oder git verweigert
+  const n = Number(new TextDecoder().decode(res.stdout).trim());
+  return Number.isFinite(n) ? n : 0;
+}
+
 /** Committet genau pagePath; no-op-tolerant (keine Änderung → kein Fehler). */
 export function commitEdit(repoRoot: string, pagePath: string, msg: string): void {
   git(repoRoot, "add", "--", pagePath);
