@@ -14,7 +14,7 @@
  */
 import { existsSync, statSync } from "node:fs";
 import { resolve } from "node:path";
-import { authFilePath, createAuthFile } from "./auth.ts";
+import { authFilePath, createAuthFile, ensureGitignore } from "./auth.ts";
 import { ensureRepo } from "./git.ts";
 import { listPageFiles, startServer } from "./server.ts";
 
@@ -168,19 +168,27 @@ async function cmdInit(args: string[]): Promise<void> {
   if (pages.length > 0) {
     console.log(`Editierbare Seiten (${pages.length}): ${pages.join(", ")}`);
   }
-  if (!passwordStdin) console.log(""); // Abstand vor dem interaktiven Prompt
-
-  const password = await obtainPassword(passwordStdin);
-  // Reihenfolge wichtig: createAuthFile ZUERST — es schreibt .regoro/ + trägt
-  // ".regoro/" ins .gitignore ein, BEVOR der Baseline-Commit den Stand erfasst.
-  // So bleibt das HMAC-Secret (auth.json) untracked.
-  const { path } = await createAuthFile(siteDir, password);
-  // ensureRepo: idempotentes git init + pristine Baseline-Commit, falls noch
-  // kein HEAD existiert. Dadurch ist der UNBERÜHRTE Original-Stand der Seite als
-  // erste Version festgehalten — der erste Edit bekommt seine eigene Version,
-  // statt dass host.ts' lazy ensureRepo erst beim ersten Save den bereits
-  // editierten Stand als "Baseline" committet.
+  // Reihenfolge (in dieser Folge, nicht umstellen):
+  //
+  //   1. .gitignore  — ".regoro/" muss drinstehen, BEVOR irgendetwas committet wird.
+  //   2. ensureRepo  — git init + pristine Baseline-Commit. Hält den UNBERÜHRTEN
+  //      Stand als erste Version fest; sonst würde host.ts' lazy ensureRepo erst
+  //      beim ersten Save committen und den bereits editierten Stand als
+  //      "Baseline" ausgeben. Zu diesem Zeitpunkt existiert auth.json noch NICHT,
+  //      das Secret kann also gar nicht in den Commit geraten.
+  //   3. Passwort abfragen und auth.json schreiben — als LETZTES.
+  //
+  // Der Grund für 3 zuletzt: git kann fehlschlagen (z.B. "dubious ownership",
+  // wenn der Site-Ordner einem anderen User gehört). Früher lief createAuthFile
+  // zuerst — dann lag ein nutzloses Passwort im Ordner, und der "bereits
+  // initialisiert"-Guard blockierte den Wiederholungsversuch. Jetzt scheitert
+  // init, bevor der Nutzer überhaupt tippt, und ein zweiter Anlauf funktioniert.
+  ensureGitignore(siteDir);
   ensureRepo(siteDir);
+
+  if (!passwordStdin) console.log(""); // Abstand vor dem interaktiven Prompt
+  const password = await obtainPassword(passwordStdin);
+  const { path } = await createAuthFile(siteDir, password);
 
   console.log("");
   console.log("Auth-Datei angelegt:");

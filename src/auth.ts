@@ -119,7 +119,18 @@ export async function createAuthFile(
   return { path, secret };
 }
 
-/** Hängt ".regoro/" idempotent an <siteDir>/.gitignore an (mit trailing newline). */
+/**
+ * Hängt ".regoro/" idempotent an <siteDir>/.gitignore an (mit trailing newline).
+ *
+ * Exportiert, weil `regoro init` es aufrufen muss, BEVOR der Baseline-Commit
+ * entsteht — und der Baseline-Commit entsteht, bevor auth.json geschrieben wird
+ * (siehe cmdInit). Dadurch scheitert ein kaputtes git, ohne ein Passwort zu
+ * hinterlassen, und das Secret kann gar nicht erst in den Commit geraten.
+ */
+export function ensureGitignore(siteDir: string): void {
+  appendGitignore(siteDir);
+}
+
 function appendGitignore(siteDir: string): void {
   const gitignorePath = join(siteDir, ".gitignore");
   const entry = ".regoro/";

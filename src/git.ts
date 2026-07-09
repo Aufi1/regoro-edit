@@ -14,6 +14,18 @@ export interface Version {
 }
 
 /** Führt git im repoRoot aus (mit fixer Editor-Identität). Wirft bei non-zero. */
+/**
+ * Quotet einen Pfad für POSIX-sh, sodass er als EIN Argument ankommt.
+ *
+ * Nur für Befehle gedacht, die wir dem Nutzer zum Kopieren anzeigen — regoro
+ * selbst startet Prozesse ohne Shell (Bun.spawnSync mit argv-Array), dort ist
+ * nichts zu quoten. Einfache Anführungszeichen schützen alles außer sich selbst;
+ * ein enthaltenes ' wird als '\'' ausgeschleust.
+ */
+export function shellQuote(s: string): string {
+  return `'${s.split("'").join(`'\\''`)}'`;
+}
+
 export function git(repoRoot: string, ...args: string[]): string {
   const res = Bun.spawnSync([
     "git", "-C", repoRoot,
@@ -23,6 +35,24 @@ export function git(repoRoot: string, ...args: string[]): string {
   ]);
   if (res.exitCode !== 0) {
     const stderr = new TextDecoder().decode(res.stderr);
+    // Häufigster Stolperstein: Der Site-Ordner gehört einem anderen User als dem,
+    // der regoro ausführt (z.B. von einem Build-Prozess erzeugt). git verweigert
+    // dann jede Arbeit im Worktree. Die Roh-Meldung erklärt das schlecht.
+    if (stderr.includes("dubious ownership")) {
+      // Der Pfad geht in Befehle, die der Nutzer kopiert und ausführt. Ungequotet
+      // zerfiele er bei Leerzeichen in mehrere Argumente, und Metazeichen (;, $, `)
+      // würden von seiner Shell interpretiert — der kopierte Befehl träfe dann einen
+      // anderen Ordner oder führte Fremdes aus. Also einfach-quoten.
+      const q = shellQuote(repoRoot);
+      throw new Error(
+        `Der Ordner ${repoRoot} gehört einem anderen Benutzer — git verweigert die Arbeit darin.\n\n` +
+          "  Entweder den Ordner übereignen:\n" +
+          `    sudo chown -R "$(id -un)" ${q}\n\n` +
+          "  Oder git eine Ausnahme erlauben (nur bei eigenen, vertrauenswürdigen Daten):\n" +
+          `    git config --global --add safe.directory ${q}\n\n` +
+          "  Danach erneut ausführen.",
+      );
+    }
     throw new Error(`git ${args.join(" ")} fehlgeschlagen (${res.exitCode}): ${stderr}`);
   }
   return new TextDecoder().decode(res.stdout);
