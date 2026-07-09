@@ -30,6 +30,7 @@ Ein einzelner Bun-Prozess, der eine **bestehende statische Website** ausliefert 
 6. **Range-Format-Ops werden beim Speichern aus dem Live-DOM abgeleitet** (`collectRangeOpsFromDom` in overlay.client.js) — additive Formatierung über `.__regoro-range-fmt`-Spans, Entfernung über `.__regoro-range-unfmt`-Marker. Grund: robust gegen zwischenzeitliche Textedits. Nicht auf fixe gespeicherte Offsets zurückbauen.
 7. **Ephemer:** `data-edit-idx`/`data-edit-img-idx`/`data-edit-del-idx`/`data-edit-br-idx` werden nur in der `/edit`-Response injiziert, **nie auf Platte**. Roh-HTML ist die einzige Quelle, bei jedem `/edit`-Load neu abgeleitet.
 8. **Optimistic Locking:** `fileHash` → Mismatch = 409. Versionen = Git **pro Site** (`repoRoot === siteDir`); `init` legt einen pristine Baseline-Commit an.
+9. **Das Site-Repo ist die einzige Quelle der Kundenänderungen.** Der Editor schreibt direkt in die ausgelieferten Dateien; die Website-Pipeline kennt diese Commits nicht. Kein Befehl darf `.git` löschen, solange mehr als der Baseline-Commit darin steht — `cmdDisable` prüft das über `countCommits()` und bricht bei `--purge` ab. `disable` ohne `--purge` entfernt nur `.regoro/` (Editor aus, fail-closed) und lässt Website wie Historie unberührt.
 
 ## Testen / Checks
 ```bash

@@ -85,6 +85,200 @@ describe("regoro — CLI-Grundgerüst", () => {
   });
 });
 
+describe("Flag-Prüfung (vor jeder Wirkung)", () => {
+  test("`disable --help` druckt Usage und löscht NICHTS", () => {
+    makeSite(dir);
+    expect(runInit([], { cwd: dir }).code).toBe(0);
+
+    const proc = Bun.spawnSync(["bun", CLI, "disable", "--help"], { cwd: dir });
+
+    expect(proc.exitCode).toBe(0);
+    expect(proc.stdout.toString()).toContain("Verwendung:");
+    expect(existsSync(join(dir, ".regoro", "auth.json"))).toBe(true); // unangetastet
+  });
+
+  test("`init --help` druckt Usage und initialisiert NICHT", () => {
+    makeSite(dir);
+
+    const proc = Bun.spawnSync(["bun", CLI, "init", "--help"], { cwd: dir });
+
+    expect(proc.exitCode).toBe(0);
+    expect(proc.stdout.toString()).toContain("Verwendung:");
+    expect(existsSync(join(dir, ".regoro"))).toBe(false);
+    expect(existsSync(join(dir, ".git"))).toBe(false);
+  });
+
+  test("unbekannte Option wird abgelehnt statt still ignoriert", () => {
+    makeSite(dir);
+    expect(runInit([], { cwd: dir }).code).toBe(0);
+
+    const proc = Bun.spawnSync(["bun", CLI, "disable", "--purgee"], { cwd: dir });
+
+    expect(proc.exitCode).toBe(1);
+    expect(proc.stderr.toString()).toContain("unbekannte Option");
+    expect(existsSync(join(dir, ".regoro", "auth.json"))).toBe(true); // nichts passiert
+  });
+
+  test("unbekannte Option bei init wird abgelehnt", () => {
+    makeSite(dir);
+
+    const proc = Bun.spawnSync(["bun", CLI, "init", "--forse"], { cwd: dir });
+
+    expect(proc.exitCode).toBe(1);
+    expect(proc.stderr.toString()).toContain("unbekannte Option");
+    expect(existsSync(join(dir, ".regoro"))).toBe(false);
+  });
+});
+
+describe("regoro disable", () => {
+  function runDisable(args: string[] = [], cwd = dir) {
+    const proc = Bun.spawnSync(["bun", CLI, "disable", ...args], { cwd });
+    return {
+      code: proc.exitCode,
+      stdout: proc.stdout.toString(),
+      stderr: proc.stderr.toString(),
+    };
+  }
+
+  /** Simuliert eine gespeicherte Bearbeitung: zweiter Commit im Site-Repo. */
+  function makeEdit(at: string): void {
+    writeFileSync(join(at, "index.html"), "<html><body><p>Geändert</p></body></html>");
+    Bun.spawnSync(["git", "-C", at, "add", "-A"]);
+    Bun.spawnSync([
+      "git", "-C", at,
+      "-c", "user.name=T", "-c", "user.email=t@t.local",
+      "commit", "-m", "Edit",
+    ]);
+  }
+
+  test("entfernt .regoro/, lässt Website und Historie stehen", () => {
+    makeSite(dir);
+    expect(runInit([], { cwd: dir }).code).toBe(0);
+
+    const r = runDisable();
+
+    expect(r.code).toBe(0);
+    expect(existsSync(join(dir, ".regoro"))).toBe(false);
+    expect(existsSync(join(dir, "index.html"))).toBe(true); // Website unangetastet
+    expect(existsSync(join(dir, ".git"))).toBe(true); // Historie bleibt
+    expect(r.stdout).toContain("Editor ist für diese Site aus");
+  });
+
+  test("ohne .regoro/ → Exit 1, nichts zu tun", () => {
+    makeSite(dir);
+    const r = runDisable();
+
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("nicht initialisiert");
+  });
+
+  test("danach lässt sich die Site wieder initialisieren", () => {
+    makeSite(dir);
+    expect(runInit([], { cwd: dir }).code).toBe(0);
+    expect(runDisable().code).toBe(0);
+
+    const r = runInit([], { cwd: dir }); // kein Guard blockiert
+    expect(r.code).toBe(0);
+    expect(existsSync(join(dir, ".regoro", "auth.json"))).toBe(true);
+  });
+
+  test("--purge entfernt .git, wenn nur der Baseline-Commit existiert", () => {
+    makeSite(dir);
+    expect(runInit([], { cwd: dir }).code).toBe(0);
+
+    const r = runDisable(["--purge"]);
+
+    expect(r.code).toBe(0);
+    expect(existsSync(join(dir, ".git"))).toBe(false);
+    expect(existsSync(join(dir, "index.html"))).toBe(true);
+  });
+
+  test("--purge VERWEIGERT, sobald gespeicherte Bearbeitungen existieren", () => {
+    makeSite(dir);
+    expect(runInit([], { cwd: dir }).code).toBe(0);
+    makeEdit(dir); // zweiter Commit = Kundenarbeit
+
+    const r = runDisable(["--purge"]);
+
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("gespeicherte Bearbeitungen");
+    // NICHTS wurde gelöscht — auch die Auth-Datei nicht.
+    expect(existsSync(join(dir, ".git"))).toBe(true);
+    expect(existsSync(join(dir, ".regoro", "auth.json"))).toBe(true);
+  });
+
+  test("ohne --purge geht das Abschalten auch mit Bearbeitungen", () => {
+    makeSite(dir);
+    expect(runInit([], { cwd: dir }).code).toBe(0);
+    makeEdit(dir);
+
+    const r = runDisable();
+
+    expect(r.code).toBe(0);
+    expect(existsSync(join(dir, ".regoro"))).toBe(false);
+    expect(existsSync(join(dir, ".git"))).toBe(true);
+    expect(r.stdout).toContain("2 Versionen");
+  });
+
+  test("mit explizitem siteDir statt cwd", () => {
+    const site = join(dir, "site");
+    mkdirSync(site);
+    makeSite(site);
+    expect(runInit([site], { cwd: dir }).code).toBe(0);
+
+    const proc = Bun.spawnSync(["bun", CLI, "disable", site], { cwd: dir });
+
+    expect(proc.exitCode).toBe(0);
+    expect(existsSync(join(site, ".regoro"))).toBe(false);
+  });
+
+  // Fail-closed: Kann git die Historie nicht lesen (z.B. "dubious ownership"),
+  // ist UNBEKANNT, ob Kundenarbeit darin steckt. countCommits() gibt dann null.
+  // Ein früheres `return 0` hätte ein volles Repo für leer gehalten und --purge
+  // hätte es gelöscht.
+  describe("git verweigert die Auskunft", () => {
+    function withFakeGit(args: string[]) {
+      const bin = mkdtempSync(join(tmpdir(), "regoro-fg-"));
+      writeFileSync(
+        join(bin, "git"),
+        '#!/bin/sh\n>&2 echo "fatal: detected dubious ownership"\nexit 128\n',
+        { mode: 0o755 },
+      );
+      const proc = Bun.spawnSync(["bun", CLI, "disable", ...args], {
+        cwd: dir,
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
+      });
+      rmSync(bin, { recursive: true, force: true });
+      return { code: proc.exitCode, stdout: proc.stdout.toString(), stderr: proc.stderr.toString() };
+    }
+
+    test("--purge bricht ab und löscht NICHTS", () => {
+      makeSite(dir);
+      expect(runInit([], { cwd: dir }).code).toBe(0);
+      makeEdit(dir); // echte Kundenarbeit im Repo
+
+      const r = withFakeGit(["--purge"]);
+
+      expect(r.code).toBe(1);
+      expect(r.stderr).toContain("lässt sich nicht lesen");
+      expect(existsSync(join(dir, ".git"))).toBe(true); // Historie gerettet
+      expect(existsSync(join(dir, ".regoro", "auth.json"))).toBe(true);
+    });
+
+    test("ohne --purge funktioniert das Abschalten trotzdem", () => {
+      makeSite(dir);
+      expect(runInit([], { cwd: dir }).code).toBe(0);
+
+      const r = withFakeGit([]);
+
+      expect(r.code).toBe(0);
+      expect(existsSync(join(dir, ".regoro"))).toBe(false);
+      expect(existsSync(join(dir, ".git"))).toBe(true); // unangetastet
+      expect(r.stdout).toContain("nicht lesbar");
+    });
+  });
+});
+
 describe("regoro init", () => {
   test("ohne siteDir-Argument: initialisiert das aktuelle Verzeichnis", () => {
     makeSite(dir);

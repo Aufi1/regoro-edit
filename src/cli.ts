@@ -9,13 +9,16 @@
  *       Ohne siteDir: aktuelles Verzeichnis.
  *   regoro <siteDir>   bzw.   regoro run [siteDir]
  *       Startet den Editor-Host für <siteDir> (Auth aus <siteDir>/.regoro/auth.json).
+ *   regoro disable [siteDir] [--purge]
+ *       Entfernt .regoro/ → Editor aus (fail-closed). Site bleibt. --purge löscht
+ *       zusätzlich .git, aber nur ohne gespeicherte Bearbeitungen.
  *
  * Auth-Modell: gehashte Datei im Site-Root (fail-closed). KEIN Env-Passwort.
  */
-import { existsSync, statSync } from "node:fs";
-import { resolve } from "node:path";
-import { authFilePath, createAuthFile, ensureGitignore } from "./auth.ts";
-import { ensureRepo } from "./git.ts";
+import { existsSync, statSync, rmSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { AUTH_DIR_NAME, authFilePath, createAuthFile, ensureGitignore } from "./auth.ts";
+import { countCommits, ensureRepo, shellQuote } from "./git.ts";
 import { listPageFiles, startServer } from "./server.ts";
 
 /**
@@ -33,6 +36,8 @@ Verwendung:
                                   Auth-Datei + git-Repo anlegen
   regoro <siteDir>                Editor für <siteDir> starten
   regoro run [siteDir]            (identisch zu obigem)
+  regoro disable [siteDir] [--purge]
+                                  Editor abschalten (entfernt .regoro/)
   regoro --version                Version ausgeben
 
 siteDir ist optional und meint ohne Angabe das aktuelle Verzeichnis.
@@ -56,6 +61,31 @@ function fail(msg: string): never {
 function usageExit(): never {
   console.error(USAGE);
   process.exit(1);
+}
+
+/**
+ * Prüft die Optionen eines Unterbefehls, BEVOR er irgendetwas tut.
+ *
+ * Zwei Fallen, die das schließt:
+ *   - `regoro disable --help` filterte "--help" als unbekanntes Flag heraus,
+ *     siteDirArg fiel auf "." zurück — eine Hilfe-Anfrage löschte die Auth-Datei
+ *     der aktuellen Site. Dasselbe Muster ließ `regoro init --help` durchlaufen.
+ *   - Ein Tippfehler (`--purgee`) wurde stillschweigend ignoriert, der Befehl lief
+ *     mit anderem Verhalten als beabsichtigt.
+ */
+function checkFlags(cmd: string, args: string[], allowed: readonly string[]): void {
+  if (args.includes("--help") || args.includes("-h")) {
+    console.log(USAGE);
+    process.exit(0);
+  }
+  const unknown = args.filter((a) => a.startsWith("-") && !allowed.includes(a));
+  if (unknown.length > 0) {
+    fail(
+      `unbekannte Option für \`${cmd}\`: ${unknown.join(", ")}\n` +
+        `  Erlaubt: ${allowed.join(", ") || "(keine)"}\n` +
+        "  Hilfe: regoro --help",
+    );
+  }
 }
 
 /**
@@ -135,6 +165,7 @@ async function obtainPassword(passwordStdin: boolean): Promise<string> {
 }
 
 async function cmdInit(args: string[]): Promise<void> {
+  checkFlags("init", args, ["--password-stdin", "--force"]);
   const positional = args.filter((a) => !a.startsWith("--"));
   const passwordStdin = args.includes("--password-stdin");
   const force = args.includes("--force");
@@ -202,6 +233,81 @@ async function cmdInit(args: string[]): Promise<void> {
   console.log("Dann im Browser /edit (bzw. /edit/login) öffnen.");
 }
 
+/**
+ * `regoro disable [siteDir] [--purge]` — schaltet den Editor für eine Site ab.
+ *
+ * Entfernt NUR <siteDir>/.regoro/. Die Website bleibt unangetastet und wird
+ * weiter ausgeliefert; alle /edit*-Routen antworten danach mit 404 (fail-closed).
+ * Umkehrbar mit `regoro init`.
+ *
+ * `--purge` entfernt zusätzlich .git — aber nur, wenn dort höchstens der
+ * Baseline-Commit steht. Ab dem ersten echten Edit steckt im Repo Arbeit, die es
+ * nirgends sonst gibt: der Editor schreibt direkt in die ausgelieferten Dateien,
+ * die Website-Pipeline kennt diese Commits nicht. Die würde --purge vernichten,
+ * deshalb bricht es dann ab. Wer es trotzdem will, löscht .git von Hand.
+ */
+function cmdDisable(args: string[]): void {
+  checkFlags("disable", args, ["--purge"]);
+  const positional = args.filter((a) => !a.startsWith("--"));
+  const purge = args.includes("--purge");
+  const siteDirArg = positional[0] ?? ".";
+  const siteDir = requireDir(siteDirArg);
+
+  console.log(`Site-Verzeichnis: ${siteDir}`);
+
+  const authDir = join(siteDir, AUTH_DIR_NAME);
+  if (!existsSync(authDir)) {
+    fail(`nicht initialisiert: ${authDir} existiert nicht.\n  Es gibt nichts abzuschalten.`);
+  }
+
+  // null = git konnte die Historie nicht lesen. Dann NIEMALS löschen (fail-closed):
+  // ein Repo voller Kundenarbeit sähe sonst aus wie ein leeres.
+  const commits = countCommits(siteDir);
+  const disableCmd = siteDirArg === "." ? "regoro disable" : `regoro disable ${siteDirArg}`;
+
+  if (purge && commits === null) {
+    fail(
+      "die Versionshistorie lässt sich nicht lesen — git verweigert die Auskunft.\n" +
+        "  Ob darin gespeicherte Bearbeitungen stecken, ist damit unbekannt, und\n" +
+        "  --purge würde sie unwiederbringlich löschen. Abgebrochen.\n\n" +
+        "  Nachsehen, woran es liegt:\n" +
+        `    git -C ${shellQuote(siteDir)} log --oneline\n\n` +
+        "  Nur den Editor abschalten (rührt .git nicht an):\n" +
+        `    ${disableCmd}`,
+    );
+  }
+
+  if (purge && commits !== null && commits > 1) {
+    fail(
+      `${commits} Commits im Site-Repo — darin stecken gespeicherte Bearbeitungen.\n` +
+        "  Der Editor ist die einzige Quelle dieser Änderungen; --purge würde sie\n" +
+        "  unwiederbringlich löschen. Abgebrochen.\n\n" +
+        "  Nur den Editor abschalten (Historie bleibt):\n" +
+        `    ${disableCmd}\n\n` +
+        "  Historie ansehen:\n" +
+        `    git -C ${shellQuote(siteDir)} log --oneline`,
+    );
+  }
+
+  rmSync(authDir, { recursive: true, force: true });
+  console.log("");
+  console.log("Auth-Datei entfernt — der Editor ist für diese Site aus.");
+  console.log("  Die Website wird weiter ausgeliefert; /edit* antwortet mit 404.");
+
+  if (purge) {
+    rmSync(join(siteDir, ".git"), { recursive: true, force: true });
+    console.log("  git-Repo entfernt (enthielt keine gespeicherten Bearbeitungen).");
+  } else if (commits === null) {
+    console.log("  git-Repo bleibt erhalten (Historie nicht lesbar — unangetastet).");
+  } else if (commits > 0) {
+    console.log(`  git-Repo bleibt erhalten (${commits} Version${commits === 1 ? "" : "en"}).`);
+  }
+
+  console.log("");
+  console.log("Wieder einschalten:");
+  console.log(siteDirArg === "." ? "  regoro init" : `  regoro init ${siteDirArg}`);
+}
+
 function cmdRun(siteDirArg?: string): void {
   const siteDir = requireDir(siteDirArg);
   const port = Number(process.env.PORT ?? 8788);
@@ -236,6 +342,10 @@ async function main(): Promise<void> {
   }
   if (cmd === "run") {
     cmdRun(rest[0]); // ohne Pfad: cwd
+    return;
+  }
+  if (cmd === "disable") {
+    cmdDisable(rest);
     return;
   }
   // Bare-Form: `regoro <siteDir>` (kein bekannter Sub-Befehl).
