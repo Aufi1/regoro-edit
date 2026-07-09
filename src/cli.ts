@@ -20,7 +20,14 @@ import { basename, join, resolve } from "node:path";
 import { AUTH_DIR_NAME, authFilePath, createAuthFile, ensureGitignore } from "./auth.ts";
 import { countCommits, ensureRepo, shellQuote } from "./git.ts";
 import { listPageFiles, startServer } from "./server.ts";
-import { activationSteps, caddyBlock, servicePort, serviceSlug, systemdUnit } from "./service.ts";
+import {
+  activationSteps,
+  caddyBlock,
+  DOMAIN_RE,
+  servicePort,
+  serviceSlug,
+  systemdUnit,
+} from "./service.ts";
 
 /**
  * Muss der `version` in package.json entsprechen — festgehalten durch einen Test
@@ -359,13 +366,22 @@ function cmdService(args: string[]): void {
     );
   }
 
+  const domain = flagValue("--domain");
+  if (domain !== undefined && !DOMAIN_RE.test(domain)) {
+    fail(
+      `ungültige Domain: ${domain}\n` +
+        "  Erlaubt sind Hostnamen, Wildcards (*.example.com) und :PORT.\n" +
+        "  Der Wert landet im Caddyfile und in angezeigten Shell-Befehlen.",
+    );
+  }
+
   const opts = {
     siteDir,
     execPath,
     slug,
     port,
     user: flagValue("--user") ?? (process.env.SUDO_USER || process.env.USER || "www-data"),
-    domain: flagValue("--domain"),
+    domain,
   };
 
   const onlySystemd = args.includes("--systemd");

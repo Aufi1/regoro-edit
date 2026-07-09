@@ -5,10 +5,16 @@
  *
  * Annahme (vom Betreiber bestätigt): Die Website unter <siteDir> ist bereits
  * über ihre Domain erreichbar, idealerweise per HTTPS. Der Editor kommt daneben
- * — ein lokaler Prozess, an den der Proxy nur `/edit*` weiterreicht.
+ * — ein lokaler Prozess, an den der Proxy die Editor-Routen weiterreicht.
  */
-import { basename } from "node:path";
 import { createHash } from "node:crypto";
+
+/**
+ * Erlaubte Zeichen für `--domain`. Der Wert landet im Caddyfile UND in
+ * angezeigten Shell-Befehlen; statt ihn dreifach zu quoten, wird er validiert.
+ * Deckt Hostnamen, Wildcards (*.example.com) und `:8099` für lokale Tests ab.
+ */
+export const DOMAIN_RE = /^[a-zA-Z0-9.*-]*(:\d{1,5})?$/;
 
 /** Ports, aus denen der Default gewählt wird. 8788 bleibt für `regoro run` frei. */
 const PORT_BASE = 8800;
@@ -61,6 +67,32 @@ export function siteIsUnderHome(siteDir: string): boolean {
     siteDir.startsWith("/home/") || siteDir.startsWith("/root/");
 }
 
+/**
+ * Quotet einen Pfad für systemd-Unit-Dateien.
+ *
+ * systemd zerlegt `ExecStart=`, `WorkingDirectory=` und `ReadWritePaths=` an
+ * Leerzeichen. Ein Ordner „/srv/sites/Meine Firma/site" startete sonst
+ * `regoro run /srv/sites/Meine` — der Dienst liefe auf dem falschen Pfad oder
+ * gar nicht. systemd akzeptiert doppelte Anführungszeichen, \\ und " werden
+ * darin escaped.
+ */
+export function sdQuote(s: string): string {
+  return `"${s.replace(/(["\\])/g, "\\$1")}"`;
+}
+
+/**
+ * Quotet einen Pfad für ein Caddyfile-Argument (`root * <pfad>`).
+ * Caddy trennt Argumente an Leerzeichen und kennt doppelte Anführungszeichen.
+ */
+export function caddyQuote(s: string): string {
+  return `"${s.replace(/(["\\])/g, "\\$1")}"`;
+}
+
+/** Quotet einen Pfad für POSIX-sh (angezeigte Copy-Paste-Befehle). */
+export function shQuote(s: string): string {
+  return `'${s.split("'").join(`'\\''`)}'`;
+}
+
 /** systemd-Unit. Bewusst schmal: kein Netzwerkzugriff nötig, nur der Site-Ordner. */
 export function systemdUnit(o: ServiceOpts): string {
   const protectHome = siteIsUnderHome(o.siteDir)
@@ -75,9 +107,9 @@ After=network.target
 [Service]
 Type=simple
 User=${o.user}
-WorkingDirectory=${o.siteDir}
+WorkingDirectory=${sdQuote(o.siteDir)}
 Environment=PORT=${o.port}
-ExecStart=${o.execPath} run ${o.siteDir}
+ExecStart=${sdQuote(o.execPath)} run ${sdQuote(o.siteDir)}
 Restart=on-failure
 RestartSec=2
 
@@ -86,7 +118,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ${protectHome}
-ReadWritePaths=${o.siteDir}
+ReadWritePaths=${sdQuote(o.siteDir)}
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
@@ -114,7 +146,10 @@ export function caddyBlock(o: ServiceOpts): string {
     }
 
     # Editor-Routen an den Bun-Prozess. Auth + Sessions laufen dort.
-    @editor path /edit*
+    # Muss isEditorPath() in host.ts spiegeln. \`/edit*\` allein reicht NICHT: es
+    # verfehlt die Suffix-Routen \`/impressum.html/edit\` und fängt zugleich
+    # öffentliche Seiten wie \`/edit-preise.html\` ein.
+    @editor path /edit /edit/* /edit-assets/* */edit
     handle @editor {
         reverse_proxy 127.0.0.1:${o.port}
     }
@@ -124,7 +159,7 @@ export function caddyBlock(o: ServiceOpts): string {
     # die per Extension-Allowlist, ein blankes file_server hier nicht.
     @allowed path / */ *.html *.css *.js *.png *.jpg *.jpeg *.webp *.gif *.ico *.woff *.woff2 *.txt *.xml
     handle @allowed {
-        root * ${o.siteDir}
+        root * ${caddyQuote(o.siteDir)}
         file_server
     }
 
@@ -143,12 +178,12 @@ export function activationSteps(o: ServiceOpts): string {
   const unit = `regoro-${o.slug}`;
   const domainFlag = o.domain ? ` --domain ${o.domain}` : "";
   return `# 1. Unit schreiben und starten
-regoro service ${o.siteDir} --systemd | sudo tee /etc/systemd/system/${unit}.service > /dev/null
+regoro service ${shQuote(o.siteDir)} --systemd | sudo tee /etc/systemd/system/${unit}.service > /dev/null
 sudo systemctl daemon-reload
 sudo systemctl enable --now ${unit}
 
 # 2. Caddy-Block anhängen (ersetzt einen bestehenden Block für die Domain!)
-regoro service ${o.siteDir} --caddy${domainFlag} | sudo tee -a /etc/caddy/Caddyfile > /dev/null
+regoro service ${shQuote(o.siteDir)} --caddy${domainFlag} | sudo tee -a /etc/caddy/Caddyfile > /dev/null
 sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 sudo systemctl reload caddy
 

@@ -15,6 +15,7 @@ import {
   caddyBlock,
   activationSteps,
   siteIsUnderHome,
+  DOMAIN_RE,
 } from "./service.ts";
 
 const base = {
@@ -72,10 +73,10 @@ describe("servicePort", () => {
 describe("systemdUnit", () => {
   test("ExecStart zeigt auf das Binary und den Site-Ordner", () => {
     const u = systemdUnit(base);
-    expect(u).toContain("ExecStart=/home/aufi/.local/bin/regoro run /srv/sites/mueller");
+    expect(u).toContain('ExecStart="/home/aufi/.local/bin/regoro" run "/srv/sites/mueller"');
     expect(u).toContain("Environment=PORT=8829");
     expect(u).toContain("User=www-data");
-    expect(u).toContain("ReadWritePaths=/srv/sites/mueller");
+    expect(u).toContain('ReadWritePaths="/srv/sites/mueller"');
   });
 
   test("außerhalb von /home: ProtectHome=yes", () => {
@@ -88,7 +89,7 @@ describe("systemdUnit", () => {
     const u = systemdUnit({ ...base, siteDir: "/home/aufi/repos/kunde/site" });
     expect(u).not.toContain("ProtectHome=yes");
     expect(u).toContain("ProtectHome bewusst NICHT gesetzt");
-    expect(u).toContain("ReadWritePaths=/home/aufi/repos/kunde/site");
+    expect(u).toContain('ReadWritePaths="/home/aufi/repos/kunde/site"');
   });
 
   test("siteIsUnderHome erkennt /home und /root, nicht /homer", () => {
@@ -105,7 +106,7 @@ describe("caddyBlock", () => {
     const c = caddyBlock(base);
     expect(c).toContain("mueller-sanitaer.de {");
     expect(c).toContain("reverse_proxy 127.0.0.1:8829");
-    expect(c).toContain("root * /srv/sites/mueller");
+    expect(c).toContain('root * "/srv/sites/mueller"');
   });
 
   test("blockt Dotfiles in jeder Tiefe und führt eine Extension-Allowlist", () => {
@@ -123,31 +124,87 @@ describe("caddyBlock", () => {
 describe("activationSteps", () => {
   test("die Unit entsteht aus `--systemd`, nicht durch Abtippen", () => {
     const s = activationSteps(base);
-    expect(s).toContain("regoro service /srv/sites/mueller --systemd | sudo tee");
+    expect(s).toContain("regoro service '/srv/sites/mueller' --systemd | sudo tee");
     expect(s).not.toContain("< /dev/null"); // hätte die Datei geleert
     expect(s).toContain("systemctl enable --now regoro-mueller");
     expect(s).toContain("caddy validate");
   });
 });
 
-describe("der erzeugte Caddy-Block ist gültiges Caddyfile", () => {
-  test("caddy validate akzeptiert ihn", () => {
-    const probe = Bun.spawnSync(["caddy", "version"]);
-    if (probe.exitCode !== 0) {
-      console.log("  (caddy nicht installiert — Validierung übersprungen)");
-      return;
+// Der Editor kennt vier Routen-Formen (isEditorPath in host.ts). `path /edit*`
+// verfehlte die Suffix-Route `/impressum.html/edit` — in Produktion war der
+// Editor damit für JEDE Unterseite unerreichbar (404) — und fing zugleich
+// öffentliche Seiten wie `/edit-preise.html` ein.
+describe("Caddy-Matcher deckt alle Editor-Routen ab", () => {
+  test("Suffix-Routen und Editor-Assets sind im Matcher", () => {
+    const c = caddyBlock(base);
+    expect(c).toContain("@editor path /edit /edit/* /edit-assets/* */edit");
+    expect(c).not.toContain("@editor path /edit*\n");
+  });
+});
+
+// Die Domain landet im Caddyfile UND in angezeigten Shell-Befehlen. Statt sie
+// dreifach zu quoten, wird sie validiert.
+describe("DOMAIN_RE", () => {
+  test("akzeptiert Hostnamen, Wildcards und :PORT", () => {
+    for (const d of ["kunde.de", "www.kunde.de", "*.site.aufi.de", ":8099", "localhost:8788"]) {
+      expect(DOMAIN_RE.test(d)).toBe(true);
     }
+  });
+
+  test("lehnt Shell-Metazeichen und Leerzeichen ab", () => {
+    for (const d of ["kunde.de; rm -rf /", "a b", "$(whoami)", "a`id`", "a|b", "a\nb"]) {
+      expect(DOMAIN_RE.test(d)).toBe(false);
+    }
+  });
+});
+
+describe("Pfade mit Leerzeichen", () => {
+  const spaced = { ...base, siteDir: "/srv/sites/Meine Firma/site", execPath: "/opt/my tools/regoro" };
+
+  test("systemd: ExecStart, WorkingDirectory, ReadWritePaths sind gequotet", () => {
+    const u = systemdUnit(spaced);
+    // Ohne Quoting startete systemd `regoro run /srv/sites/Meine`.
+    expect(u).toContain('ExecStart="/opt/my tools/regoro" run "/srv/sites/Meine Firma/site"');
+    expect(u).toContain('WorkingDirectory="/srv/sites/Meine Firma/site"');
+    expect(u).toContain('ReadWritePaths="/srv/sites/Meine Firma/site"');
+  });
+
+  test("Caddy: root-Pfad ist gequotet", () => {
+    expect(caddyBlock(spaced)).toContain('root * "/srv/sites/Meine Firma/site"');
+  });
+
+  test("Shell-Befehle: siteDir ist einfach-gequotet", () => {
+    const s = activationSteps(spaced);
+    expect(s).toContain(`regoro service '/srv/sites/Meine Firma/site' --systemd`);
+    expect(s).toContain(`regoro service '/srv/sites/Meine Firma/site' --caddy`);
+  });
+
+  test("Anführungszeichen im Pfad werden escaped", () => {
+    const evil = { ...base, siteDir: '/srv/a"b' };
+    expect(systemdUnit(evil)).toContain('ReadWritePaths="/srv/a\\"b"');
+  });
+});
+
+describe("der erzeugte Caddy-Block ist gültiges Caddyfile", () => {
+  function validate(block: string): string {
     const dir = mkdtempSync(join(tmpdir(), "regoro-caddy-"));
     const file = join(dir, "Caddyfile");
-    // auto_https off + Port statt Domain, damit caddy kein ACME versucht.
-    const block = caddyBlock({ ...base, domain: ":8099" });
     writeFileSync(file, `{\n auto_https off\n admin off\n}\n${block}`);
-
     const res = Bun.spawnSync(["caddy", "validate", "--config", file, "--adapter", "caddyfile"]);
-    const out = new TextDecoder().decode(res.stderr) + new TextDecoder().decode(res.stdout);
-
     rmSync(dir, { recursive: true, force: true });
-    expect(out).toContain("Valid configuration");
-    expect(res.exitCode).toBe(0);
+    return new TextDecoder().decode(res.stderr) + new TextDecoder().decode(res.stdout);
+  }
+
+  test("caddy validate akzeptiert ihn", () => {
+    if (Bun.spawnSync(["caddy", "version"]).exitCode !== 0) return; // caddy fehlt
+    // Port statt Domain, damit caddy kein ACME versucht.
+    expect(validate(caddyBlock({ ...base, domain: ":8099" }))).toContain("Valid configuration");
+  });
+
+  test("auch mit einem Site-Pfad voller Leerzeichen", () => {
+    if (Bun.spawnSync(["caddy", "version"]).exitCode !== 0) return;
+    const block = caddyBlock({ ...base, domain: ":8099", siteDir: "/srv/Meine Firma/site" });
+    expect(validate(block)).toContain("Valid configuration");
   });
 });
