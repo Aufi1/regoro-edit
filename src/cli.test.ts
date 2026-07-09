@@ -85,6 +85,51 @@ describe("regoro — CLI-Grundgerüst", () => {
   });
 });
 
+describe("Flag-Prüfung (vor jeder Wirkung)", () => {
+  test("`disable --help` druckt Usage und löscht NICHTS", () => {
+    makeSite(dir);
+    expect(runInit([], { cwd: dir }).code).toBe(0);
+
+    const proc = Bun.spawnSync(["bun", CLI, "disable", "--help"], { cwd: dir });
+
+    expect(proc.exitCode).toBe(0);
+    expect(proc.stdout.toString()).toContain("Verwendung:");
+    expect(existsSync(join(dir, ".regoro", "auth.json"))).toBe(true); // unangetastet
+  });
+
+  test("`init --help` druckt Usage und initialisiert NICHT", () => {
+    makeSite(dir);
+
+    const proc = Bun.spawnSync(["bun", CLI, "init", "--help"], { cwd: dir });
+
+    expect(proc.exitCode).toBe(0);
+    expect(proc.stdout.toString()).toContain("Verwendung:");
+    expect(existsSync(join(dir, ".regoro"))).toBe(false);
+    expect(existsSync(join(dir, ".git"))).toBe(false);
+  });
+
+  test("unbekannte Option wird abgelehnt statt still ignoriert", () => {
+    makeSite(dir);
+    expect(runInit([], { cwd: dir }).code).toBe(0);
+
+    const proc = Bun.spawnSync(["bun", CLI, "disable", "--purgee"], { cwd: dir });
+
+    expect(proc.exitCode).toBe(1);
+    expect(proc.stderr.toString()).toContain("unbekannte Option");
+    expect(existsSync(join(dir, ".regoro", "auth.json"))).toBe(true); // nichts passiert
+  });
+
+  test("unbekannte Option bei init wird abgelehnt", () => {
+    makeSite(dir);
+
+    const proc = Bun.spawnSync(["bun", CLI, "init", "--forse"], { cwd: dir });
+
+    expect(proc.exitCode).toBe(1);
+    expect(proc.stderr.toString()).toContain("unbekannte Option");
+    expect(existsSync(join(dir, ".regoro"))).toBe(false);
+  });
+});
+
 describe("regoro disable", () => {
   function runDisable(args: string[] = [], cwd = dir) {
     const proc = Bun.spawnSync(["bun", CLI, "disable", ...args], { cwd });

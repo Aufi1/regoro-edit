@@ -6,9 +6,9 @@
  * Setup: `regoro-edit init <dir>`.
  */
 import { join, relative, sep } from "node:path";
-import { readdirSync } from "node:fs";
-import { handleEditorRequest, type HostCtx } from "./host.ts";
-import { loadAuthFile } from "./auth.ts";
+import { readdirSync, existsSync } from "node:fs";
+import { handleEditorRequest, isEditorPath, type HostCtx } from "./host.ts";
+import { authFilePath, loadAuthFile } from "./auth.ts";
 
 const PAGE_RE = /^[a-z0-9-]+\.html$/;
 
@@ -76,7 +76,20 @@ export function startServer(opts: ServerOptions): { port: number } {
     // Editor sie via req.formData() puffert → Schutz gegen Memory-DoS.
     maxRequestBodySize: 6 * 1024 * 1024,
     fetch(req) {
-      return handleEditorRequest(req, new URL(req.url), ctx);
+      const url = new URL(req.url);
+      // `ctx.auth` wurde beim Start geladen. Verschwindet die Auth-Datei danach
+      // (`regoro disable`), muss der Editor SOFORT aus sein — sonst editieren
+      // gültige Cookies weiter, obwohl der Betreiber den Zugang entzogen hat.
+      // Nur auf Editor-Routen geprüft; die öffentliche Site kostet es nichts.
+      // Der Check sitzt hier statt im Router: host.ts ist eine reine HTTP-Schicht
+      // über einem übergebenen ctx und soll den Plattenzustand nicht befragen.
+      if (ctx.auth !== null && isEditorPath(url.pathname) && !existsSync(authFilePath(opts.siteDir))) {
+        return new Response("Not Found", {
+          status: 404,
+          headers: { "X-Robots-Tag": "noindex, nofollow", "Cache-Control": "no-store" },
+        });
+      }
+      return handleEditorRequest(req, url, ctx);
     },
   });
 

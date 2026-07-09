@@ -64,6 +64,31 @@ function usageExit(): never {
 }
 
 /**
+ * Prüft die Optionen eines Unterbefehls, BEVOR er irgendetwas tut.
+ *
+ * Zwei Fallen, die das schließt:
+ *   - `regoro disable --help` filterte "--help" als unbekanntes Flag heraus,
+ *     siteDirArg fiel auf "." zurück — eine Hilfe-Anfrage löschte die Auth-Datei
+ *     der aktuellen Site. Dasselbe Muster ließ `regoro init --help` durchlaufen.
+ *   - Ein Tippfehler (`--purgee`) wurde stillschweigend ignoriert, der Befehl lief
+ *     mit anderem Verhalten als beabsichtigt.
+ */
+function checkFlags(cmd: string, args: string[], allowed: readonly string[]): void {
+  if (args.includes("--help") || args.includes("-h")) {
+    console.log(USAGE);
+    process.exit(0);
+  }
+  const unknown = args.filter((a) => a.startsWith("-") && !allowed.includes(a));
+  if (unknown.length > 0) {
+    fail(
+      `unbekannte Option für \`${cmd}\`: ${unknown.join(", ")}\n` +
+        `  Erlaubt: ${allowed.join(", ") || "(keine)"}\n` +
+        "  Hilfe: regoro --help",
+    );
+  }
+}
+
+/**
  * Prüft, dass siteDir existiert und ein Verzeichnis ist; gibt den absoluten Pfad.
  * Ohne Argument gilt das aktuelle Verzeichnis.
  */
@@ -140,6 +165,7 @@ async function obtainPassword(passwordStdin: boolean): Promise<string> {
 }
 
 async function cmdInit(args: string[]): Promise<void> {
+  checkFlags("init", args, ["--password-stdin", "--force"]);
   const positional = args.filter((a) => !a.startsWith("--"));
   const passwordStdin = args.includes("--password-stdin");
   const force = args.includes("--force");
@@ -221,6 +247,7 @@ async function cmdInit(args: string[]): Promise<void> {
  * deshalb bricht es dann ab. Wer es trotzdem will, löscht .git von Hand.
  */
 function cmdDisable(args: string[]): void {
+  checkFlags("disable", args, ["--purge"]);
   const positional = args.filter((a) => !a.startsWith("--"));
   const purge = args.includes("--purge");
   const siteDirArg = positional[0] ?? ".";

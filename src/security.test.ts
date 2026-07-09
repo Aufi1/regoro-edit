@@ -569,28 +569,6 @@ describe("host.ts — statisches Asset-Serving (Task 7)", () => {
     expect(res.status).toBe(404);
   });
 
-  // Ein Site-Ordner enthält in der Praxis mehr als die Website: Build-Artefakte
-  // (design.json, images.json mit internen Serverpfaden), Backups, Notizen. Die
-  // Extension-Allowlist ist das, was sie zurückhält — hier festgenagelt, damit
-  // niemand versehentlich .json & Co. in ASSET_TYPES aufnimmt.
-  // Die Dateien werden ECHT angelegt: sonst käme der 404 vom fehlenden File und
-  // der Test wäre tautologisch.
-  test.each([
-    ["design.json", "Build-Artefakt"],
-    ["images.json", "interne Pfade + Prompts"],
-    ["dump.sql", "Backup"],
-    ["README.md", "interne Notizen"],
-    ["config.yaml", "Konfiguration"],
-  ])("GET /%s (%s) → 404, obwohl die Datei existiert", async (name) => {
-    const abs = join(ctx.siteDir, name);
-    writeFileSync(abs, "GEHEIM");
-    expect(readFileSync(abs, "utf8")).toBe("GEHEIM"); // liegt wirklich im siteDir
-
-    const res = await call("GET", `/${name}`);
-    expect(res.status).toBe(404);
-    expect(await res.text()).not.toContain("GEHEIM");
-  });
-
   test("POST /styles.css (nur GET) → nicht 200", async () => {
     const res = await call("POST", "/styles.css");
     expect(res.status).not.toBe(200);

@@ -47,6 +47,19 @@ function pagePathFor(ctx: HostCtx, page: string): string {
 }
 
 /**
+ * Ist der Pfad eine Editor-Route? Exakt matchen, nicht startsWith("/edit"):
+ * eine öffentliche Seite darf "edit-preise.html" heißen.
+ */
+export function isEditorPath(path: string): boolean {
+  return (
+    path === "/edit" ||
+    path.startsWith("/edit/") ||
+    path.startsWith("/edit-assets/") ||
+    path.endsWith(".html/edit")
+  );
+}
+
+/**
  * Lehnt jeden Pfad ab, dessen dekodiertes Pfad-Segment mit "." beginnt
  * (.regoro/, .git/, .env, alle Dotfiles). rel ist der bereits dekodierte
  * rel-Pfad ohne führenden Slash. true = blockieren.
@@ -288,6 +301,7 @@ export function handleEditorRequest(req: Request, url: URL, ctx: HostCtx): Promi
 async function route(req: Request, url: URL, ctx: HostCtx): Promise<Response> {
   const path = url.pathname;
   const method = req.method.toUpperCase();
+
 
   // === Präzedenz (1): /edit/login (exakt) — einzige Route ohne Auth-Wall. ===
   if (path === "/edit/login") {

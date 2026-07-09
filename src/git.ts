@@ -92,7 +92,10 @@ const EMPTY_REPO_RE = /unknown revision|ambiguous argument|Needed a single revis
  */
 export function countCommits(repoRoot: string): number | null {
   if (!existsSync(join(repoRoot, ".git"))) return 0;
-  const res = Bun.spawnSync(["git", "-C", repoRoot, "rev-list", "--count", "HEAD"]);
+  // --all statt HEAD: zählt jeden Commit, der von IRGENDEINER Ref erreichbar ist.
+  // Sonst bliebe Arbeit auf einem anderen Branch unsichtbar und --purge löschte sie.
+  // In einem Repo ganz ohne Commit liefert --all sauber "0" mit Exit 0.
+  const res = Bun.spawnSync(["git", "-C", repoRoot, "rev-list", "--count", "--all"]);
   if (res.exitCode === 0) {
     const n = Number(new TextDecoder().decode(res.stdout).trim());
     return Number.isFinite(n) ? n : null;
