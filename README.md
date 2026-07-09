@@ -104,6 +104,7 @@ Bist du nicht angemeldet, leitet der Editor auf den **Login** um und danach zur�
 - **Fail-closed:** fehlt/ungültig die Datei → `/edit` ist komplett aus (alle Editor-Routen → 404).
 - **Pro Site ein eigenes Passwort:** Betreibst du mehrere Sites, hat jede ihre eigene `.regoro/auth.json`.
 - **Die Auth-Datei ist nie über das Web erreichbar:** Anfragen auf `.regoro/` bzw. jeden Dotfile werden hart mit 404 beantwortet (zusätzlich blockt die Reverse-Proxy-Vorlage sie).
+- **Das Session-Cookie heißt `__Host-regoro_edit`** (in Prod, mit TLS). Der `__Host-`-Präfix sorgt dafür, dass der Browser es nur mit `Secure`, `Path=/` und ohne `Domain`-Attribut akzeptiert. Relevant, wenn mehrere Sites unter Subdomains derselben Domain laufen (`kunde1.example.de`, `kunde2.example.de`): Ohne das Präfix könnte eine Subdomain den anderen ein gleichnamiges Cookie unterschieben und sie damit aussperren.
 
 ## Versionen
 
