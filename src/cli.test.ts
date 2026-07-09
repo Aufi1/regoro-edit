@@ -2,7 +2,9 @@
  * CLI-Ebene (`regoro-edit init`) — bewusst als Subprozess, weil hier genau die
  * Verdrahtung geprüft wird, die reine Unit-Tests von createAuthFile/ensureRepo
  * nicht abdecken: Argument-Defaults (cwd), Guards und vor allem die Reihenfolge
- * createAuthFile → ensureRepo, die das HMAC-Secret aus dem Baseline-Commit hält.
+ * ensureGitignore → ensureRepo → createAuthFile. Sie hält das HMAC-Secret aus dem
+ * Baseline-Commit (auth.json existiert beim Commit noch nicht) UND sorgt dafür,
+ * dass ein fehlschlagendes git kein nutzloses Passwort hinterlässt.
  */
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync, statSync } from "node:fs";
@@ -171,6 +173,75 @@ describe("regoro init", () => {
     expect(tracked).toContain("index.html");
     expect(tracked.some((f) => f.includes(".regoro"))).toBe(false);
     expect(tracked).toContain(".gitignore");
+  });
+
+  // Regression: `git` schlug fehl (z.B. "dubious ownership", wenn der Site-Ordner
+  // einem anderen User gehört). Früher lief createAuthFile ZUERST — es blieb ein
+  // nutzloses Passwort liegen, und der "bereits initialisiert"-Guard blockierte
+  // den zweiten Anlauf. Jetzt scheitert init, bevor der Nutzer tippt.
+  describe("git schlägt fehl", () => {
+    /** Legt ein fake `git` an, das immer mit der echten Meldung fehlschlägt. */
+    function fakeGitDir(stderr: string, code = 128): string {
+      const bin = mkdtempSync(join(tmpdir(), "regoro-fakegit-"));
+      writeFileSync(
+        join(bin, "git"),
+        `#!/bin/sh\n>&2 printf '%s\\n' ${JSON.stringify(stderr)}\nexit ${code}\n`,
+        { mode: 0o755 },
+      );
+      return bin;
+    }
+
+    function runInitWithFakeGit(bin: string) {
+      const proc = Bun.spawnSync(["bun", CLI, "init", "--password-stdin"], {
+        cwd: dir,
+        stdin: new TextEncoder().encode("geheim123"),
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
+      });
+      return {
+        code: proc.exitCode,
+        stdout: proc.stdout.toString(),
+        stderr: proc.stderr.toString(),
+      };
+    }
+
+    test("hinterlässt KEINE auth.json (Passwort nicht verloren, init wiederholbar)", () => {
+      makeSite(dir);
+      const bin = fakeGitDir("fatal: not a git repository");
+
+      const r = runInitWithFakeGit(bin);
+
+      expect(r.code).toBe(1);
+      expect(existsSync(join(dir, ".regoro", "auth.json"))).toBe(false);
+      rmSync(bin, { recursive: true, force: true });
+    });
+
+    test("'dubious ownership' wird übersetzt und nennt beide Auswege", () => {
+      makeSite(dir);
+      const bin = fakeGitDir(`fatal: detected dubious ownership in repository at '${dir}'`);
+
+      const r = runInitWithFakeGit(bin);
+
+      expect(r.code).toBe(1);
+      expect(r.stderr).toContain("gehört einem anderen Benutzer");
+      expect(r.stderr).toContain("safe.directory");
+      expect(r.stderr).toContain("chown");
+      expect(existsSync(join(dir, ".regoro", "auth.json"))).toBe(false);
+      rmSync(bin, { recursive: true, force: true });
+    });
+
+    test("nach behobenem git-Problem läuft init durch (kein Guard blockiert)", () => {
+      makeSite(dir);
+      const bin = fakeGitDir("fatal: irgendwas");
+      expect(runInitWithFakeGit(bin).code).toBe(1);
+      rmSync(bin, { recursive: true, force: true });
+
+      // Zweiter Anlauf mit echtem git — darf NICHT an "bereits initialisiert" scheitern.
+      const r = runInit([], { cwd: dir });
+
+      expect(r.code).toBe(0);
+      expect(existsSync(join(dir, ".regoro", "auth.json"))).toBe(true);
+      expect(gitTracked(dir)).toContain("index.html");
+    });
   });
 
   test("leeres Passwort über stdin wird abgelehnt", () => {

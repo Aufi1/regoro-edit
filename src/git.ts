@@ -23,6 +23,19 @@ export function git(repoRoot: string, ...args: string[]): string {
   ]);
   if (res.exitCode !== 0) {
     const stderr = new TextDecoder().decode(res.stderr);
+    // Häufigster Stolperstein: Der Site-Ordner gehört einem anderen User als dem,
+    // der regoro ausführt (z.B. von einem Build-Prozess erzeugt). git verweigert
+    // dann jede Arbeit im Worktree. Die Roh-Meldung erklärt das schlecht.
+    if (stderr.includes("dubious ownership")) {
+      throw new Error(
+        `Der Ordner ${repoRoot} gehört einem anderen Benutzer — git verweigert die Arbeit darin.\n\n` +
+          "  Entweder den Ordner übereignen:\n" +
+          `    sudo chown -R "$(id -un)" ${repoRoot}\n\n` +
+          "  Oder git eine Ausnahme erlauben (nur bei eigenen, vertrauenswürdigen Daten):\n" +
+          `    git config --global --add safe.directory ${repoRoot}\n\n` +
+          "  Danach erneut ausführen.",
+      );
+    }
     throw new Error(`git ${args.join(" ")} fehlgeschlagen (${res.exitCode}): ${stderr}`);
   }
   return new TextDecoder().decode(res.stdout);
