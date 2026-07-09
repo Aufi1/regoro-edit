@@ -39,8 +39,16 @@ jede Speicherung ist ein Commit. Fehlt es, nennt dir der Installer den passenden
 Installationsbefehl für dein System (er führt ihn nicht selbst aus — kein `sudo` aus
 einem `curl | sh`-Skript).
 
+Zum Aktualisieren einfach erneut ausführen.
+
 Der Installer versteht `REGORO_VERSION` (statt `latest`) und `REGORO_INSTALL_DIR`
-(statt `~/.local/bin`). Zum Aktualisieren einfach erneut ausführen.
+(statt `~/.local/bin`). Bei der Pipe müssen die Variablen **hinter** dem `|` stehen —
+davor gälten sie für `curl`, nicht für `sh`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Aufi1/regoro-edit/main/install.sh \
+  | REGORO_INSTALL_DIR=/usr/local/bin REGORO_VERSION=v0.1.0 sh
+```
 
 ## Schnellstart (2 Schritte)
 
