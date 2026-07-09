@@ -229,6 +229,37 @@ describe("regoro init", () => {
       rmSync(bin, { recursive: true, force: true });
     });
 
+    test("Pfad in der Reparatur-Anweisung ist shell-gequotet", async () => {
+      // Der Nutzer kopiert diese Befehle in seine Shell. Ein Pfad mit Leerzeichen
+      // oder Metazeichen darf dort nicht zerfallen oder Fremdes ausführen.
+      const { shellQuote } = await import("./git.ts");
+
+      expect(shellQuote("/tmp/mein ordner")).toBe("'/tmp/mein ordner'");
+      expect(shellQuote("/tmp/a;rm -rf b")).toBe("'/tmp/a;rm -rf b'");
+      expect(shellQuote("/tmp/$(whoami)")).toBe("'/tmp/$(whoami)'");
+      expect(shellQuote("/tmp/it's")).toBe(`'/tmp/it'\\''s'`);
+    });
+
+    test("dubious-ownership-Meldung quotet einen Pfad mit Leerzeichen", () => {
+      const spaced = mkdtempSync(join(tmpdir(), "regoro cli space-"));
+      makeSite(spaced);
+      const bin = fakeGitDir("fatal: detected dubious ownership in repository at '/x'");
+
+      const proc = Bun.spawnSync(["bun", CLI, "init", "--password-stdin"], {
+        cwd: spaced,
+        stdin: new TextEncoder().encode("geheim123"),
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
+      });
+      const stderr = proc.stderr.toString();
+
+      expect(proc.exitCode).toBe(1);
+      expect(stderr).toContain(`safe.directory '${spaced}'`);
+      expect(stderr).toContain(`chown -R "$(id -un)" '${spaced}'`);
+
+      rmSync(bin, { recursive: true, force: true });
+      rmSync(spaced, { recursive: true, force: true });
+    });
+
     test("nach behobenem git-Problem läuft init durch (kein Guard blockiert)", () => {
       makeSite(dir);
       const bin = fakeGitDir("fatal: irgendwas");
