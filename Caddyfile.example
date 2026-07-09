@@ -16,9 +16,12 @@ example.com {
     encode gzip
 
     # --- Harte Block-Regel: Auth-Datei + Dotfiles nie ausliefern ---------------
-    # Greift VOR allem anderen. Deckt /.regoro/... und beliebige versteckte
-    # Dateien/Verzeichnisse (/.git, /.env, ...) ab.
-    @hidden path /.regoro/* /.*
+    # Greift VOR allem anderen. Jedes Pfad-SEGMENT, das mit "." beginnt — also
+    # /.regoro/auth.json ebenso wie /assets/.private.html oder /a/.git/config.
+    # Muss regexp sein: ein `path /.*`-Matcher deckt nur führende Punkte, und
+    # eine verschachtelte Dot-Datei mit erlaubter Endung käme sonst durch die
+    # Asset-Allowlist unten hindurch. Spiegelt hasDotSegment() in host.ts.
+    @hidden path_regexp (^|/)\.
     handle @hidden {
         respond 404
     }
@@ -36,6 +39,14 @@ example.com {
     # Bun-Host liefert die dank Extension-Allowlist nie aus; ein blankes
     # `file_server` hier schon. Ohne diese Regel divergieren die beiden Pfade,
     # und der Proxy wird zum Leck. Kein .svg (script-fähig → Stored-XSS).
+    #
+    # `*.html` ist hier BEWUSST breiter als die pageWhitelist des Bun-Hosts: die
+    # bestimmt, welche Seiten EDITIERBAR sind (top-level, [a-z0-9-]+.html), nicht
+    # welche öffentlich sind. Caddy ist der Prod-Auslieferer und muss auch
+    # Unterordner-Seiten bedienen (siehe README). Wer nur bestimmte Seiten
+    # veröffentlichen will, ersetzt `*.html` durch eine explizite Liste:
+    #     @allowed path / /index.html /impressum.html /datenschutz.html *.css …
+    # Und legt Entwürfe/Backups grundsätzlich nicht in den Webroot.
     @allowed path / */ *.html *.css *.js *.png *.jpg *.jpeg *.webp *.gif *.ico *.woff *.woff2 *.txt *.xml
     handle @allowed {
         # WICHTIG: derselbe Ordner, den `regoro-edit <dir>` bearbeitet, sonst
