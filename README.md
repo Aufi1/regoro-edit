@@ -112,13 +112,27 @@ Jede Speicherung und jede Wiederherstellung ist ein Git-Commit im Site-Ordner. I
 
 ## Produktion (TLS, öffentliche Domain)
 
-Für lokales Dogfooding reicht der eingebaute Server. Für den Live-Betrieb stellst du einen Reverse-Proxy mit TLS davor. Die Vorlage `Caddyfile.example` liefert die statische Site aus, leitet `/edit*` an den Editor weiter und **blockt `.regoro/`/Dotfiles**:
+Annahme: Deine Website ist unter ihrer Domain bereits erreichbar, per HTTPS. Der Editor kommt daneben — ein lokaler Prozess, an den der Proxy nur `/edit*` weiterreicht.
+
+`regoro service` erzeugt beides, was du dafür brauchst, und sucht sich die Pfade selbst zusammen:
 
 ```bash
-# Beispiel: Editor lokal, Caddy als HTTPS-Proxy davor
-regoro run ./meine-website               # lauscht auf :8788
-caddy run --config Caddyfile.example     # TLS + Routing
+cd /pfad/zu/deiner/site
+regoro service --domain deine-domain.de
 ```
+
+Das druckt eine fertige **systemd-Unit** (mit Site-Ordner, Binary-Pfad und einem aus dem Ordnernamen abgeleiteten Port) und den passenden **Caddy-Block** (Dotfile-Block, `/edit*` an den Editor, Extension-Allowlist für die statische Site). Direkt weiterleiten:
+
+```bash
+regoro service --systemd | sudo tee /etc/systemd/system/regoro-<slug>.service > /dev/null
+sudo systemctl enable --now regoro-<slug>
+
+regoro service --caddy --domain deine-domain.de | sudo tee -a /etc/caddy/Caddyfile > /dev/null
+sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+sudo systemctl reload caddy
+```
+
+Der Caddy-Block **ersetzt** einen bestehenden Block für dieselbe Domain — er liefert die Site selbst aus, weil die Allowlist vor dem `file_server` greifen muss. Wer lieber von Hand baut, findet dieselbe Konfiguration in `Caddyfile.example`.
 
 Alternativ per Docker – siehe `Dockerfile` (Site als Volume mounten; `init` einmalig im gemounteten Ordner ausführen, damit die Auth-Datei zur Laufzeit vorliegt und **nicht** ins Image gebacken wird).
 
@@ -127,7 +141,11 @@ Alternativ per Docker – siehe `Dockerfile` (Site als Volume mounten; `init` ei
 | Variable | Default | Zweck |
 |---|---|---|
 | `PORT` | `8788` | Port des Editor-Servers |
-| `EDITOR_INSECURE_COOKIE` | *(nicht gesetzt)* | `=1` lässt das `Secure`-Cookie-Flag weg – **nur für lokales HTTP** (Dogfooding), **nie in Produktion**. |
+| `EDITOR_INSECURE_COOKIE` | *(nicht gesetzt)* | `=1` lässt das `Secure`-Cookie-Flag weg. Nur nötig, wenn du den Editor über **HTTP unter einem anderen Namen als `localhost`** erreichst (LAN-IP, Hostname). **Nie in Produktion.** |
+
+> **`http://localhost` braucht das nicht.** Browser behandeln `localhost` als vertrauenswürdigen Kontext und akzeptieren `Secure`-Cookies auch über HTTP. `regoro run` genügt.
+>
+> Über einen anderen Hostnamen ohne TLS verwirft der Browser das Cookie dagegen **stumm** — man meldet sich an und landet wieder auf dem Login. Die Login-Seite warnt in diesem Fall vor und nennt beide Auswege.
 
 ## Editor wieder abschalten
 

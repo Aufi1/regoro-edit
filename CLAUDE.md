@@ -8,6 +8,7 @@ Ein einzelner Bun-Prozess, der eine **bestehende statische Website** ausliefert 
 ## Layout
 - `src/` — Code **und** Tests (`*.test.ts`). Kern infra-agnostisch: `contract.ts` (HTML-Enumeration/Validierung), `serve.ts` (renderEditView), `apply.ts` (Edits anwenden), `git.ts` (Versionen). HTTP-/Setup-Schicht: `auth.ts`, `host.ts` (Router), `server.ts` (startServer), `cli.ts` (bin, heißt installiert **`regoro`**).
 - `src/overlay.client.js` — Browser-Overlay (Vanilla-JS-IIFE). `host.ts` importiert es als `with { type: "file" }` und liest den Pfad je Request: in dev die echte Datei (Live-Reload), im `--compile`-Binary die eingebettete Kopie. **Nicht** auf `import.meta.url` zurückbauen — im Binary zeigt das ins Leere, `/edit-assets/overlay.js` gäbe 404 und der Editor wäre stumm funktionslos. Deklaration dafür: `src/assets.d.ts`.
+- `src/service.ts` — reine Textgenerierung für `regoro service` (systemd-Unit + Caddy-Block). Kein Dateisystem-Zugriff; `cmdService` druckt nur. **Ändert sich `ASSET_TYPES` in `host.ts`, muss `caddyBlock()` mit** — und `Caddyfile.example` ebenso. `ProtectHome=yes` wird weggelassen, wenn die Site unter `/home`/`/root` liegt (systemd leert das Verzeichnis sonst, der Dienst käme nicht hoch).
 - `install.sh` — Installer (POSIX sh): lädt Binary + `SHA256SUMS` vom GitHub-Release, verifiziert, legt nach `~/.local/bin/regoro`. Bricht ohne `git` oder ohne Prüfsumme ab.
 - `.github/workflows/release.yml` — baut auf Tag `v*` vier Binaries (`bun build --compile --target=bun-{linux,darwin}-{x64,arm64}`), erzeugt `SHA256SUMS`, hängt beides ans Release. **Asset-Namen müssen zu `install.sh` passen** (`regoro-<os>-<arch>`).
 - `examples/site/` — Beispiel-Website, die die Tests als Fixture nutzen (`REAL_SITE`).
@@ -48,7 +49,7 @@ bun build --compile src/cli.ts --outfile /tmp/regoro           # Binary — bric
 
 ## Fallstricke
 - **Server nicht mit `repoRoot` = diesem Repo starten** für Dogfooding: der Save committet dann in genau dieses Repo. Immer auf einen **separaten Site-Ordner** zeigen (`cli.ts <site>` setzt `repoRoot = siteDir`).
-- `EDITOR_INSECURE_COOKIE=1` nur für lokales HTTP (Cookie ohne `Secure`) — nie Prod.
+- `EDITOR_INSECURE_COOKIE=1` (Cookie ohne `Secure`) wird **nicht** für `http://localhost` gebraucht — Browser akzeptieren dort `Secure`/`__Host-`-Cookies (in Chromium verifiziert). Nötig nur bei HTTP unter fremdem Hostnamen/LAN-IP; dort verwirft der Browser das Cookie sonst **stumm** (Login-Schleife ohne Fehlermeldung). `insecureOriginWarning()` in `host.ts` warnt auf der Login-Seite vor. Nie in Prod.
 - Beim Ausprobieren `examples/site` nicht direkt bespielen (sonst nested `.git`/`.regoro` im Repo) — auf eine Kopie in `/tmp` arbeiten.
 - Änderungen werden **nicht** automatisch mit dem alten `regoro-de/editor/` synchronisiert — dieses Repo pflegen.
 
