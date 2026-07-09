@@ -27,7 +27,10 @@ example.com {
     }
 
     # --- Editor-Routen an den Bun-Host (Auth + Sessions laufen dort) -----------
-    @editor path /edit*
+    # Muss isEditorPath() in host.ts spiegeln. `/edit*` allein reicht NICHT:
+    #   - es verfehlt die Suffix-Routen `/impressum.html/edit` (Editor pro Seite),
+    #   - und es fängt zugleich öffentliche Seiten wie `/edit-preise.html` ein.
+    @editor path /edit /edit/* /edit-assets/* */edit
     handle @editor {
         reverse_proxy localhost:8788
     }

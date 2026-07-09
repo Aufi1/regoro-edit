@@ -108,6 +108,56 @@ describe("auth.ts — readCookieTokens liest ALLE gleichnamigen Cookies", () => 
   });
 });
 
+/**
+ * Über einen nicht vertrauenswürdigen Origin (HTTP + kein localhost) verwirft der
+ * Browser das Secure-Cookie STUMM: man meldet sich an und landet wieder auf der
+ * Login-Seite. Empirisch in Chromium bestätigt. Die Login-Seite warnt deshalb vor,
+ * statt den Nutzer raten zu lassen.
+ */
+describe("host.ts — Warnung vor unsicherem Origin auf der Login-Seite", () => {
+  async function loginPage(host: string, headers: Record<string, string> = {}) {
+    const auth: AuthConfig = { hash: await hashPassword(TEST_PASSWORD), secret: TEST_SECRET };
+    const ctx: HostCtx = {
+      repoRoot: REPO_ROOT,
+      siteDir: REAL_SITE,
+      pageWhitelist: ["index.html"],
+      auth,
+    };
+    const url = new URL(`http://${host}/edit/login`);
+    const req = new Request(url, { headers });
+    const res = await handleEditorRequest(req, url, ctx);
+    return res.text();
+  }
+
+  test("localhost: keine Warnung — Browser akzeptiert Secure-Cookies dort", async () => {
+    expect(await loginPage("localhost:8788")).not.toContain("Anmeldung wird fehlschlagen");
+  });
+
+  test("127.0.0.1: ebenfalls keine Warnung", async () => {
+    expect(await loginPage("127.0.0.1:8788")).not.toContain("Anmeldung wird fehlschlagen");
+  });
+
+  test("fremder Hostname über HTTP: Warnung samt Auswegen", async () => {
+    const html = await loginPage("kunde.test:8788");
+    expect(html).toContain("Anmeldung wird fehlschlagen");
+    expect(html).toContain("EDITOR_INSECURE_COOKIE=1");
+    expect(html).toContain("HTTPS");
+  });
+
+  test("hinter TLS-Proxy (X-Forwarded-Proto: https): keine Warnung", async () => {
+    const html = await loginPage("kunde.de", { "x-forwarded-proto": "https" });
+    expect(html).not.toContain("Anmeldung wird fehlschlagen");
+  });
+
+  // Der Host landet im HTML. `new URL()` lässt zwar kein `<` im Hostnamen zu, der
+  // Wert läuft trotzdem durch escapeAttr — hier festgenagelt, damit das so bleibt.
+  test("der Host erscheint in der Warnung und läuft durch escapeAttr", async () => {
+    const html = await loginPage("kunde.test:8788");
+    expect(html).toContain("http://kunde.test:8788");
+    expect(html).not.toContain("<script");
+  });
+});
+
 describe("host.ts — untergeschobenes Cookie sperrt die echte Session nicht aus", () => {
   let auth: AuthConfig;
   let ctx: HostCtx;

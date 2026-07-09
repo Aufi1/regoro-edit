@@ -11,6 +11,8 @@ import { parseHTML } from "linkedom";
 // Bun-"file"-Import: liefert einen Pfad, den bun build --compile mit einbettet.
 import overlayAsset from "./overlay.client.js" with { type: "file" };
 import {
+  useSecureCookie,
+  isTrustworthyOrigin,
   verifyPassword,
   issueCookie,
   checkCookie,
@@ -244,7 +246,26 @@ function escapeAttr(s: string): string {
     .replace(/>/g, "&gt;");
 }
 
-function loginForm(error?: string, returnTo?: string | null): string {
+/**
+ * Warnt, wenn der Browser das Session-Cookie garantiert verwerfen wird: `Secure`
+ * ist gesetzt, aber der Origin ist nicht vertrauenswürdig (HTTP auf einer LAN-IP
+ * oder einem Hostnamen). Ohne diesen Hinweis landet man nach dem Login wieder auf
+ * der Login-Seite — stumm, ohne Fehler, und hält das Passwort für falsch.
+ */
+function insecureOriginWarning(req: Request, url: URL): string {
+  if (!useSecureCookie()) return "";
+  const proto = (req.headers.get("x-forwarded-proto") ?? url.protocol.replace(":", "")).toLowerCase();
+  if (isTrustworthyOrigin(url.hostname, proto)) return "";
+  return `<div class="warn"><strong>Anmeldung wird fehlschlagen.</strong>
+Diese Seite läuft über <code>http://${escapeAttr(url.host)}</code>. Das Sitzungs-Cookie ist
+als <code>Secure</code> markiert, und dein Browser verwirft es über eine unverschlüsselte
+Verbindung — du landest nach dem Anmelden wieder hier.<br><br>
+Nutze <strong>HTTPS</strong> (Reverse-Proxy davor), oder für einen kurzen Test:
+<code>EDITOR_INSECURE_COOKIE=1 regoro run</code>.<br>
+Über <code>http://localhost</code> funktioniert es ohne Zutun.</div>`;
+}
+
+function loginForm(error?: string, returnTo?: string | null, warning = ""): string {
   const returnInput = returnTo
     ? `<input type="hidden" name="return" value="${escapeAttr(returnTo)}">`
     : "";
@@ -252,14 +273,18 @@ function loginForm(error?: string, returnTo?: string | null): string {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Regoro Editor — Login</title>
 <style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;
-background:#14324f;color:#fff;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}
+background:#14324f;color:#fff;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:16px}
 form{background:#fff;color:#16222e;padding:28px;border-radius:10px;width:300px;box-shadow:0 8px 28px rgba(0,0,0,.3)}
 h1{font-size:18px;margin:0 0 16px}label{display:block;font-size:13px;margin-bottom:6px}
 input{width:100%;padding:9px;border:1px solid #cbd5dc;border-radius:6px;box-sizing:border-box;font:inherit}
 button{margin-top:14px;width:100%;padding:10px;border:0;border-radius:6px;background:#e2571e;color:#fff;
-font:inherit;font-weight:600;cursor:pointer}.err{color:#c0392b;font-size:13px;margin-top:10px}</style></head>
+font:inherit;font-weight:600;cursor:pointer}.err{color:#c0392b;font-size:13px;margin-top:10px}
+.warn{background:#fff4e5;border:1px solid #f0b37e;color:#663c00;font-size:12.5px;line-height:1.45;
+padding:10px 12px;border-radius:6px;margin-bottom:14px}
+.warn code{background:#00000010;padding:1px 4px;border-radius:3px;font-size:12px}</style></head>
 <body><form method="POST" action="/edit/login">
 <h1>Regoro Editor</h1>
+${warning}
 <label for="password">Passwort</label>
 <input id="password" name="password" type="password" autocomplete="current-password" autofocus>
 ${returnInput}
@@ -310,7 +335,7 @@ async function route(req: Request, url: URL, ctx: HostCtx): Promise<Response> {
     if (method === "GET") {
       // return-Query validieren (Open-Redirect-Schutz); nur gültige Ziele in die Form.
       const returnTo = validateReturn(url.searchParams.get("return"));
-      return html(loginForm(undefined, returnTo));
+      return html(loginForm(undefined, returnTo, insecureOriginWarning(req, url)));
     }
     if (method === "POST") {
       const body = await parseBody(req);
@@ -330,7 +355,7 @@ async function route(req: Request, url: URL, ctx: HostCtx): Promise<Response> {
           }),
         });
       }
-      return html(loginForm("Falsches Passwort.", returnTo), 401);
+      return html(loginForm("Falsches Passwort.", returnTo, insecureOriginWarning(req, url)), 401);
     }
     return notFound();
   }

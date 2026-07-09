@@ -13,8 +13,27 @@ const COOKIE_BASE = "regoro_edit";
 const DEFAULT_MAX_AGE_SEC = 60 * 60 * 8; // 8 Stunden
 
 /** true = Cookie bekommt das Secure-Flag (Prod). Nur EDITOR_INSECURE_COOKIE=1 schaltet es ab. */
-function useSecureCookie(): boolean {
+export function useSecureCookie(): boolean {
   return process.env.EDITOR_INSECURE_COOKIE !== "1";
+}
+
+/**
+ * Akzeptiert der Browser hier ein `Secure`-Cookie?
+ *
+ * Nur „potentially trustworthy origins" (HTML-Spec): HTTPS, sowie localhost/
+ * 127.0.0.1/[::1] auch über HTTP. Alles andere — LAN-IP, Hostname, kunde.test —
+ * bekommt das Cookie zwar geschickt, aber der Browser verwirft es **stumm**:
+ * der Nutzer landet nach dem Login wieder auf der Login-Seite, ohne Fehlermeldung.
+ *
+ * Empirisch geprüft (Chromium): `http://localhost` akzeptiert `__Host-`-Cookies,
+ * `http://kunde.test` verwirft sie.
+ *
+ * `proto` kommt aus `X-Forwarded-Proto` (setzt jeder Reverse-Proxy), sonst aus
+ * der Request-URL.
+ */
+export function isTrustworthyOrigin(hostname: string, proto: string): boolean {
+  if (proto === "https") return true;
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1";
 }
 
 /**

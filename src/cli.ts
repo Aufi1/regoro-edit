@@ -16,10 +16,18 @@
  * Auth-Modell: gehashte Datei im Site-Root (fail-closed). KEIN Env-Passwort.
  */
 import { existsSync, statSync, rmSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { AUTH_DIR_NAME, authFilePath, createAuthFile, ensureGitignore } from "./auth.ts";
 import { countCommits, ensureRepo, shellQuote } from "./git.ts";
 import { listPageFiles, startServer } from "./server.ts";
+import {
+  activationSteps,
+  caddyBlock,
+  DOMAIN_RE,
+  servicePort,
+  serviceSlug,
+  systemdUnit,
+} from "./service.ts";
 
 /**
  * Muss der `version` in package.json entsprechen — festgehalten durch einen Test
@@ -38,6 +46,8 @@ Verwendung:
   regoro run [siteDir]            (identisch zu obigem)
   regoro disable [siteDir] [--purge]
                                   Editor abschalten (entfernt .regoro/)
+  regoro service [siteDir] [--domain d] [--port n] [--systemd|--caddy]
+                                  systemd-Unit + Caddy-Block ausgeben
   regoro --version                Version ausgeben
 
 siteDir ist optional und meint ohne Angabe das aktuelle Verzeichnis.
@@ -51,7 +61,11 @@ Beispiel:
 
 Umgebung:
   PORT                   Editor-Port (default 8788)
-  EDITOR_INSECURE_COOKIE =1 nur für lokales HTTP-Dogfooding (lässt Cookie-Secure-Flag weg)`;
+  EDITOR_INSECURE_COOKIE =1 lässt das Cookie-Secure-Flag weg. NUR nötig, wenn du
+                         den Editor über HTTP unter einem anderen Namen als
+                         localhost erreichst (LAN-IP, Hostname). Über
+                         http://localhost und über HTTPS braucht es das nicht.
+                         Nie in Produktion.`;
 
 function fail(msg: string): never {
   console.error(`Fehler: ${msg}`);
@@ -308,6 +322,98 @@ function cmdDisable(args: string[]): void {
   console.log(siteDirArg === "." ? "  regoro init" : `  regoro init ${siteDirArg}`);
 }
 
+/**
+ * `regoro service [siteDir] [--domain d] [--port n] [--user u] [--systemd|--caddy]`
+ *
+ * Druckt die Betriebs-Dateien. Schreibt nichts — der Mensch leitet um, wohin er will.
+ * Ohne --systemd/--caddy kommt beides plus die Aktivierungsschritte.
+ *
+ * Annahme: Die Website ist bereits unter ihrer Domain erreichbar (Caddy + TLS).
+ * Der Editor kommt daneben; der Proxy reicht nur /edit* an ihn weiter.
+ */
+function cmdService(args: string[]): void {
+  checkFlags("service", args, ["--domain", "--port", "--user", "--systemd", "--caddy"]);
+  const flagValue = (name: string): string | undefined => {
+    const i = args.indexOf(name);
+    return i >= 0 ? args[i + 1] : undefined;
+  };
+  // Werte von Flags sind keine Positionals.
+  const flagValues = new Set(
+    ["--domain", "--port", "--user"].map((f) => flagValue(f)).filter((v): v is string => !!v),
+  );
+  const positional = args.filter((a) => !a.startsWith("--") && !flagValues.has(a));
+
+  const siteDir = requireDir(positional[0] ?? ".");
+  const slug = serviceSlug(siteDir);
+  const portRaw = flagValue("--port");
+  const port = portRaw ? Number(portRaw) : servicePort(slug);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    fail(`ungültiger Port: ${portRaw}`);
+  }
+
+  // process.execPath ist im --compile-Binary der Pfad zum Binary selbst. Startet
+  // man über `bun src/cli.ts`, zeigt er auf bun — ExecStart würde dann `bun run …`
+  // heißen und die Unit wäre unbrauchbar. Der Name des Binaries ist egal (jemand
+  // darf es umbenennen), die Laufzeit nicht.
+  const execPath = process.execPath;
+  const runtime = basename(execPath).replace(/\.exe$/, "");
+  if (["bun", "bun-debug", "node", "deno"].includes(runtime)) {
+    fail(
+      `service braucht das kompilierte regoro-Binary, läuft aber gerade unter \`${runtime}\`.\n` +
+        "  ExecStart in der Unit zeigte sonst auf den Interpreter statt auf regoro.\n\n" +
+        "  Binary bauen:      bun run build:binary   → dist/regoro\n" +
+        "  Oder installieren: curl -fsSL https://raw.githubusercontent.com/Aufi1/regoro-edit/main/install.sh | sh",
+    );
+  }
+
+  const domain = flagValue("--domain");
+  if (domain !== undefined && !DOMAIN_RE.test(domain)) {
+    fail(
+      `ungültige Domain: ${domain}\n` +
+        "  Erlaubt sind Hostnamen, Wildcards (*.example.com) und :PORT.\n" +
+        "  Der Wert landet im Caddyfile und in angezeigten Shell-Befehlen.",
+    );
+  }
+
+  const opts = {
+    siteDir,
+    execPath,
+    slug,
+    port,
+    user: flagValue("--user") ?? (process.env.SUDO_USER || process.env.USER || "www-data"),
+    domain,
+  };
+
+  const onlySystemd = args.includes("--systemd");
+  const onlyCaddy = args.includes("--caddy");
+
+  if (onlySystemd && !onlyCaddy) {
+    process.stdout.write(systemdUnit(opts));
+    return;
+  }
+  if (onlyCaddy && !onlySystemd) {
+    process.stdout.write(caddyBlock(opts));
+    return;
+  }
+
+  if (!opts.domain) {
+    console.log("# Hinweis: ohne --domain steht example.com im Caddy-Block.\n");
+  }
+  console.log(`# Site:   ${siteDir}`);
+  console.log(`# Dienst: regoro-${slug}   Port: ${port}${portRaw ? "" : " (aus dem Ordnernamen abgeleitet)"}`);
+  console.log(`# Nutzer: ${opts.user}\n`);
+  console.log("# ── /etc/systemd/system/regoro-" + slug + ".service ──");
+  console.log(systemdUnit(opts));
+  console.log("# ── /etc/caddy/Caddyfile ──");
+  console.log(caddyBlock(opts));
+  console.log("# ── Aktivieren ──");
+  console.log(activationSteps(opts));
+  console.log("");
+  console.log("# Einzeln abgreifen:");
+  console.log(`#   regoro service --systemd | sudo tee /etc/systemd/system/regoro-${slug}.service`);
+  console.log(`#   regoro service --caddy --domain ${opts.domain ?? "deine-domain.de"} | sudo tee -a /etc/caddy/Caddyfile`);
+}
+
 function cmdRun(siteDirArg?: string): void {
   const siteDir = requireDir(siteDirArg);
   const port = Number(process.env.PORT ?? 8788);
@@ -346,6 +452,10 @@ async function main(): Promise<void> {
   }
   if (cmd === "disable") {
     cmdDisable(rest);
+    return;
+  }
+  if (cmd === "service") {
+    cmdService(rest);
     return;
   }
   // Bare-Form: `regoro <siteDir>` (kein bekannter Sub-Befehl).
