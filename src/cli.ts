@@ -27,7 +27,7 @@ import { listPageFiles, startServer } from "./server.ts";
  * Import würde `resolveJsonModule` erzwingen und im --compile-Binary die
  * package.json mitbündeln.
  */
-export const VERSION = "0.1.2";
+export const VERSION = "0.1.3";
 
 const USAGE = `regoro — Inline-Editor
 
