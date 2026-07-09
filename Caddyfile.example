@@ -7,7 +7,8 @@
 #   - TLS automatisch (Let's-Encrypt / ACME) — das Auth-Cookie ist `Secure`,
 #     setzt also HTTPS voraus,
 #   - .regoro/ und alle Dotfiles HART blocken (404) — die Auth-Datei darf
-#     niemals ausgeliefert werden.
+#     niemals ausgeliefert werden,
+#   - nur bekannte Dateitypen ausliefern (Allowlist, siehe unten).
 #
 # Anpassen: Domain, root-Pfad zur Site, ggf. Port.
 
@@ -28,11 +29,23 @@ example.com {
         reverse_proxy localhost:8788
     }
 
-    # --- Alles andere: statische Site direkt ausliefern -----------------------
-    # WICHTIG: derselbe Ordner, den `regoro-edit <dir>` bearbeitet, sonst
-    # divergieren öffentliche Seite und Editier-Ziel.
-    handle {
+    # --- Statische Site: NUR erlaubte Dateitypen -------------------------------
+    # Positive Allowlist, spiegelt ASSET_TYPES in src/host.ts (+ .html für Seiten).
+    # Grund: Ein Site-Ordner enthält oft mehr als die Website — Build-Artefakte
+    # (design.json, images.json), Backups (dump.sql), Notizen (README.md). Der
+    # Bun-Host liefert die dank Extension-Allowlist nie aus; ein blankes
+    # `file_server` hier schon. Ohne diese Regel divergieren die beiden Pfade,
+    # und der Proxy wird zum Leck. Kein .svg (script-fähig → Stored-XSS).
+    @allowed path / */ *.html *.css *.js *.png *.jpg *.jpeg *.webp *.gif *.ico *.woff *.woff2 *.txt *.xml
+    handle @allowed {
+        # WICHTIG: derselbe Ordner, den `regoro-edit <dir>` bearbeitet, sonst
+        # divergieren öffentliche Seite und Editier-Ziel.
         root * /srv/site
         file_server
+    }
+
+    # --- Alles andere: existiert für die Öffentlichkeit nicht ------------------
+    handle {
+        respond 404
     }
 }
