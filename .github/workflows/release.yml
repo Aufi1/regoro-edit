@@ -27,6 +27,17 @@ jobs:
 
       - run: bun install --frozen-lockfile
 
+      # Ohne caddy überspringt service.test.ts die Validierung des generierten
+      # Caddy-Blocks — und genau der trägt die Dotfile-Sperre und die
+      # Extension-Allowlist. Der Test soll im Release-Lauf echt laufen.
+      - name: caddy installieren
+        run: |
+          CADDY_VERSION=2.8.4
+          curl -fsSL "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_amd64.tar.gz" \
+            | tar -xz caddy
+          sudo install -m 0755 caddy /usr/local/bin/caddy
+          caddy version
+
       # Die Checks aus CLAUDE.md. Ein Release, das die Suite nicht besteht,
       # soll gar nicht erst entstehen.
       - name: Checks
@@ -34,6 +45,7 @@ jobs:
           bun test
           bun x tsc --noEmit
           bun build src/overlay.client.js --target=browser > /dev/null
+          caddy validate --config Caddyfile.example --adapter caddyfile
 
       # Cross-Compile aus einem Runner: bun bringt die Ziel-Runtimes selbst mit.
       # Die Asset-Namen müssen exakt zu install.sh passen (regoro-<os>-<arch>).

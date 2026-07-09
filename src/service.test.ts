@@ -186,6 +186,15 @@ describe("Pfade mit Leerzeichen", () => {
   });
 });
 
+/** Bun.spawnSync WIRFT, wenn die Binary fehlt (kein Exit-Code). Deshalb try/catch. */
+function haveCaddy(): boolean {
+  try {
+    return Bun.spawnSync(["caddy", "version"]).exitCode === 0;
+  } catch {
+    return false;
+  }
+}
+
 describe("der erzeugte Caddy-Block ist gültiges Caddyfile", () => {
   function validate(block: string): string {
     const dir = mkdtempSync(join(tmpdir(), "regoro-caddy-"));
@@ -196,14 +205,15 @@ describe("der erzeugte Caddy-Block ist gültiges Caddyfile", () => {
     return new TextDecoder().decode(res.stderr) + new TextDecoder().decode(res.stdout);
   }
 
-  test("caddy validate akzeptiert ihn", () => {
-    if (Bun.spawnSync(["caddy", "version"]).exitCode !== 0) return; // caddy fehlt
+  // skipIf statt eines stillen `return`: ein übersprungener Test soll sichtbar
+  // übersprungen sein, nicht wie ein bestandener aussehen. Der Release-Workflow
+  // installiert caddy, dort läuft die Validierung also wirklich.
+  test.skipIf(!haveCaddy())("caddy validate akzeptiert ihn", () => {
     // Port statt Domain, damit caddy kein ACME versucht.
     expect(validate(caddyBlock({ ...base, domain: ":8099" }))).toContain("Valid configuration");
   });
 
-  test("auch mit einem Site-Pfad voller Leerzeichen", () => {
-    if (Bun.spawnSync(["caddy", "version"]).exitCode !== 0) return;
+  test.skipIf(!haveCaddy())("auch mit einem Site-Pfad voller Leerzeichen", () => {
     const block = caddyBlock({ ...base, domain: ":8099", siteDir: "/srv/Meine Firma/site" });
     expect(validate(block)).toContain("Valid configuration");
   });
