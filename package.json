@@ -4,12 +4,13 @@
   "description": "Inline-WYSIWYG-Editor für bestehende statische HTML-Websites. Installieren, Passwort setzen, an jede Seite /edit anhängen.",
   "type": "module",
   "bin": {
-    "regoro-edit": "src/cli.ts"
+    "regoro": "src/cli.ts"
   },
   "scripts": {
     "start": "bun src/cli.ts",
     "test": "bun test",
-    "typecheck": "bun x tsc --noEmit"
+    "typecheck": "bun x tsc --noEmit",
+    "build:binary": "bun build --compile src/cli.ts --outfile dist/regoro"
   },
   "engines": {
     "bun": ">=1.3"

@@ -1,0 +1,81 @@
+name: Release
+
+# Baut die Standalone-Binaries und hängt sie samt SHA256SUMS an das Release.
+# install.sh lädt sie von hier — die Prüfsummen-Datei ist nicht optional, der
+# Installer bricht ohne sie ab.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag, an den die Assets gehängt werden (z.B. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write # Release anlegen + Assets hochladen
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - run: bun install --frozen-lockfile
+
+      # Die Checks aus CLAUDE.md. Ein Release, das die Suite nicht besteht,
+      # soll gar nicht erst entstehen.
+      - name: Checks
+        run: |
+          bun test
+          bun x tsc --noEmit
+          bun build src/overlay.client.js --target=browser > /dev/null
+
+      # Cross-Compile aus einem Runner: bun bringt die Ziel-Runtimes selbst mit.
+      # Die Asset-Namen müssen exakt zu install.sh passen (regoro-<os>-<arch>).
+      - name: Binaries bauen
+        run: |
+          mkdir -p dist
+          for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
+            echo "::group::$target"
+            bun build --compile --target="bun-${target}" src/cli.ts \
+              --outfile "dist/regoro-${target}"
+            echo "::endgroup::"
+          done
+          ls -lh dist/
+
+      # Rauchtest: nur das native Artefakt lässt sich hier ausführen.
+      - name: Linux-x64-Binary rauchtesten
+        run: |
+          chmod +x dist/regoro-linux-x64
+          actual="$(./dist/regoro-linux-x64 --version)"
+          expected="$(bun --print 'require("./package.json").version')"
+          echo "binary=$actual package.json=$expected"
+          test "$actual" = "$expected"
+
+      - name: SHA256SUMS
+        working-directory: dist
+        run: |
+          sha256sum regoro-* > SHA256SUMS
+          cat SHA256SUMS
+
+      # Tag stammt entweder vom push-Trigger oder aus der manuellen Eingabe.
+      - name: Tag bestimmen
+        id: tag
+        run: echo "value=${{ inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Release anlegen/aktualisieren
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.tag.outputs.value }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/regoro-* dist/SHA256SUMS --clobber
+          else
+            gh release create "$tag" dist/regoro-* dist/SHA256SUMS \
+              --title "$tag" --generate-notes
+          fi

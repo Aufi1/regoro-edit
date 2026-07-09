@@ -22,30 +22,44 @@ Bearbeitet werden **Text, Formatierung** (fett/kursiv/unterstrichen, Farbe, Link
 
 ## Voraussetzungen
 
-- [Bun](https://bun.sh) ≥ 1.3
-- `git` (für die Versionierung)
+- `git` (für die Versionierung — jede Speicherung ist ein Commit)
+- Linux oder macOS, x86_64 oder arm64
 
-## Schnellstart (3 Schritte)
+Bun brauchst du nur zum **Entwickeln** (siehe unten), nicht zum Benutzen.
+
+## Installation
 
 ```bash
-# 1. Holen
-git clone https://github.com/<user>/regoro-edit.git && cd regoro-edit
-bun install
-
-# 2. Passwort für deine Site setzen (legt <site>/.regoro/auth.json an)
-bun src/cli.ts init /pfad/zu/deiner/site
-
-# 3. Starten
-bun src/cli.ts /pfad/zu/deiner/site
+curl -fsSL https://raw.githubusercontent.com/Aufi1/regoro-edit/main/install.sh | sh
 ```
+
+Das lädt ein Standalone-Binary nach `~/.local/bin/regoro`, prüft dessen SHA256-Summe
+und ist fertig. **Bun wird nicht benötigt** — die Runtime steckt im Binary. `git` schon:
+jede Speicherung ist ein Commit. Fehlt es, nennt dir der Installer den passenden
+Installationsbefehl für dein System (er führt ihn nicht selbst aus — kein `sudo` aus
+einem `curl | sh`-Skript).
+
+Der Installer versteht `REGORO_VERSION` (statt `latest`) und `REGORO_INSTALL_DIR`
+(statt `~/.local/bin`). Zum Aktualisieren einfach erneut ausführen.
+
+## Schnellstart (2 Schritte)
+
+```bash
+cd /pfad/zu/deiner/site
+regoro init      # Passwort setzen (legt <site>/.regoro/auth.json an)
+regoro run       # Editor starten
+```
+
+Beide Befehle nehmen den Site-Ordner aus dem aktuellen Verzeichnis; `regoro init /pfad/zu/site`
+geht genauso.
 
 Dann im Browser `http://localhost:8788/` öffnen (deine Site) und an eine beliebige Seite `/edit` anhängen → Login → bearbeiten.
 
 > **Ausprobieren ohne eigene Site:** In diesem Repo liegt eine Beispiel-Site unter `examples/site`:
 > ```bash
 > cp -r examples/site /tmp/meine-site
-> bun src/cli.ts init /tmp/meine-site
-> bun src/cli.ts /tmp/meine-site
+> regoro init /tmp/meine-site
+> regoro run /tmp/meine-site
 > # -> http://localhost:8788/  und  http://localhost:8788/edit
 > ```
 
@@ -62,8 +76,8 @@ meine-website/            ← Site-Root (hier liegt index.html)
 └── .regoro/auth.json     ← von `init` angelegt (gehashtes Passwort + Secret, 0600, git-ignoriert)
 ```
 
-- `regoro-edit init ./meine-website` fragt ein Passwort ab, **hasht** es (argon2id) und legt es zusammen mit einem zufälligen Cookie-Secret in `.regoro/auth.json` ab. Zusätzlich wird ein Git-Repo im Site-Ordner initialisiert (Versionen) und `.regoro/` in eine `.gitignore` eingetragen – das Secret wird also nie mitversioniert.
-- `regoro-edit ./meine-website` startet den Server. Deine Seiten sind unter ihren normalen URLs erreichbar; `…/edit` öffnet den Editor.
+- `regoro init ./meine-website` fragt ein Passwort ab, **hasht** es (argon2id) und legt es zusammen mit einem zufälligen Cookie-Secret in `.regoro/auth.json` ab. Zusätzlich wird ein Git-Repo im Site-Ordner initialisiert (Versionen) und `.regoro/` in eine `.gitignore` eingetragen – das Secret wird also nie mitversioniert.
+- `regoro run ./meine-website` startet den Server. Deine Seiten sind unter ihren normalen URLs erreichbar; `…/edit` öffnet den Editor.
 - **Bearbeitbare Seiten** sind alle `*.html`-Dateien im Site-Root (Top-Level). Unterordner-Seiten sind in v1 nicht im Editor (werden aber normal ausgeliefert).
 
 ### Die „/edit anhängen"-Logik
@@ -93,7 +107,7 @@ Für lokales Dogfooding reicht der eingebaute Server. Für den Live-Betrieb stel
 
 ```bash
 # Beispiel: Editor lokal, Caddy als HTTPS-Proxy davor
-bun src/cli.ts ./meine-website           # lauscht auf :8788
+regoro run ./meine-website               # lauscht auf :8788
 caddy run --config Caddyfile.example     # TLS + Routing
 ```
 
@@ -106,7 +120,9 @@ Alternativ per Docker – siehe `Dockerfile` (Site als Volume mounten; `init` ei
 | `PORT` | `8788` | Port des Editor-Servers |
 | `EDITOR_INSECURE_COOKIE` | *(nicht gesetzt)* | `=1` lässt das `Secure`-Cookie-Flag weg – **nur für lokales HTTP** (Dogfooding), **nie in Produktion**. |
 
-Die CLI kennt außerdem `regoro-edit init <site> --password-stdin` (Passwort aus stdin, für Skripte/Docker).
+Die CLI kennt außerdem `regoro init <site> --password-stdin` (Passwort aus stdin, für Skripte/Docker) und `--force`.
+
+`init` bricht ab, wenn die Site bereits eine `.regoro/auth.json` hat oder der Ordner keine top-level `*.html` enthält — beides schützt davor, versehentlich den falschen Ordner zu initialisieren oder ein bestehendes Passwort zu überschreiben. `--force` hebt beide Guards auf; bei bestehender Auth-Datei setzt es das Passwort neu und macht **alle laufenden Sessions ungültig** (das Cookie-Secret wird mit erneuert).
 
 ## Sicherheit
 
@@ -123,10 +139,24 @@ Die CLI kennt außerdem `regoro-edit init <site> --password-stdin` (Passwort aus
 
 ## Entwicklung
 
+Braucht [Bun](https://bun.sh) ≥ 1.3.
+
 ```bash
-bun test               # Testsuite (357 Tests)
+git clone https://github.com/Aufi1/regoro-edit.git && cd regoro-edit
+bun install
+bun link               # `regoro` zeigt auf src/cli.ts — Änderungen wirken sofort
+
+bun test               # Testsuite
 bun x tsc --noEmit     # Typecheck
+bun run build:binary   # Standalone-Binary nach dist/regoro
 ```
+
+`bun link` macht `regoro` global aufrufbar; das setzt `~/.bun/bin` im `PATH` voraus.
+Rückgängig mit `bun unlink`. Ohne Link tut es auch `bun src/cli.ts init <site>`.
+
+Ein Release entsteht durch einen Tag (`v*`): `.github/workflows/release.yml` baut die
+vier Binaries, erzeugt `SHA256SUMS` und hängt beides ans Release — von dort lädt
+`install.sh`.
 
 Der Editor-Kern liegt unter `src/` (`contract`/`serve`/`apply`/`git` sind infrastruktur-agnostisch; `auth`/`host`/`server`/`cli` bilden die HTTP-/Setup-Schicht). Das Browser-Overlay ist `src/overlay.client.js`.
 
