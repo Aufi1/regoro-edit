@@ -9,8 +9,34 @@ import { createHmac, timingSafeEqual, randomBytes } from "node:crypto";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 
-const COOKIE_NAME = "regoro_edit";
+const COOKIE_BASE = "regoro_edit";
 const DEFAULT_MAX_AGE_SEC = 60 * 60 * 8; // 8 Stunden
+
+/** true = Cookie bekommt das Secure-Flag (Prod). Nur EDITOR_INSECURE_COOKIE=1 schaltet es ab. */
+function useSecureCookie(): boolean {
+  return process.env.EDITOR_INSECURE_COOKIE !== "1";
+}
+
+/**
+ * Cookie-Name. In Prod mit `__Host-`-Präfix.
+ *
+ * Grund: Läuft der Editor unter einer Subdomain (kunde.site.example.de), kann jede
+ * Geschwister-Subdomain ein Cookie `regoro_edit=…; Domain=.site.example.de` setzen.
+ * Der Browser sendet dann ZWEI gleichnamige Cookies, und der Server liest womöglich
+ * das untergeschobene — die echte Session wird nie gültig, der Kunde ist dauerhaft
+ * ausgesperrt (kein Auth-Bypass, die Signatur schlägt fehl; aber ein persistenter DoS,
+ * den ein Kunde gegen alle anderen fahren kann).
+ *
+ * `__Host-` verbietet dem Browser genau das: Cookies mit diesem Präfix werden nur
+ * akzeptiert, wenn sie `Secure` sind, `Path=/` haben und KEIN `Domain`-Attribut tragen.
+ * Damit ist Cookie-Tossing zwischen Subdomains unmöglich.
+ *
+ * Ohne Secure (lokales HTTP-Dogfooding) würde der Browser das Präfix-Cookie verwerfen —
+ * dort also der nackte Name.
+ */
+export function cookieName(): string {
+  return useSecureCookie() ? `__Host-${COOKIE_BASE}` : COOKIE_BASE;
+}
 
 export interface AuthConfig {
   hash: string;
@@ -137,11 +163,12 @@ export function issueCookie(auth: AuthConfig, maxAgeSec: number = DEFAULT_MAX_AG
   const payload = `v1.${exp}`;
   const token = `${payload}.${sign(payload, auth.secret)}`;
   return [
-    `${COOKIE_NAME}=${token}`,
+    `${cookieName()}=${token}`,
     "HttpOnly",
     // Secure standardmäßig gesetzt (Prod hinter TLS-Proxy). Nur für lokales
     // HTTP-Dogfooding via EDITOR_INSECURE_COOKIE=1 weglassen — NIE in Produktion.
-    ...(process.env.EDITOR_INSECURE_COOKIE === "1" ? [] : ["Secure"]),
+    // Hängt mit cookieName() zusammen: ohne Secure kein __Host--Präfix.
+    ...(useSecureCookie() ? ["Secure"] : []),
     "SameSite=Strict",
     // Path=/ (nicht /edit): M3-Suffix-Edit-Views liegen unter /<page>.html/edit,
     // was ein Cookie mit Path=/edit per RFC6265-Path-Match NICHT abdeckt (kein
@@ -172,14 +199,44 @@ export function checkCookie(auth: AuthConfig | null, token: string): boolean {
   return true;
 }
 
-/** Liest den Token-Wert des regoro_edit-Cookies aus einem Cookie-Header. */
-export function readCookieToken(cookieHeader: string | null): string | null {
-  if (!cookieHeader) return null;
+/**
+ * Obergrenze für gleichnamige Session-Cookies, die wir überhaupt prüfen.
+ *
+ * Legitim gibt es höchstens eines (`__Host-` verbietet dem Browser Duplikate).
+ * Selbst ohne Präfix wären es die Host-Cookies plus je eines pro Ancestor-Domain,
+ * also eine Handvoll. 8 wird im Normalbetrieb nie erreicht.
+ *
+ * Zweck: Ohne Grenze bestimmt der Angreifer, wie oft wir HMAC rechnen. Gemessen
+ * kostet ein 16-KB-Header voller Kandidaten ~1,6 ms (202 × ~7,8 µs) — weniger als
+ * ein /edit-Render, aber angreifergesteuerte, unbegrenzte Arbeit gehört begrenzt.
+ */
+const MAX_SESSION_COOKIES = 8;
+
+/**
+ * Liest die Token-Werte mit unserem Cookie-Namen aus einem Cookie-Header,
+ * höchstens MAX_SESSION_COOKIES viele.
+ *
+ * Bewusst eine Liste, nicht der erste Treffer: Ein Header kann denselben Namen
+ * mehrfach enthalten (Host-Cookie + untergeschobenes Domain-Cookie einer
+ * Geschwister-Subdomain). Wer nur den ersten nimmt, lässt sich damit aussperren.
+ * Der Aufrufer prüft jeden Kandidaten gegen checkCookie — nur einer muss stimmen,
+ * und fälschen kann ihn ohne das Site-Secret niemand. `__Host-` (siehe cookieName)
+ * verhindert den Fall bereits im Browser; das hier ist die zweite Verteidigungslinie.
+ */
+export function readCookieTokens(cookieHeader: string | null): string[] {
+  if (!cookieHeader) return [];
+  const wanted = cookieName();
+  const out: string[] = [];
   for (const part of cookieHeader.split(";")) {
     const [name, ...rest] = part.trim().split("=");
-    if (name === COOKIE_NAME) return rest.join("=");
+    if (name === wanted) {
+      out.push(rest.join("="));
+      if (out.length >= MAX_SESSION_COOKIES) break;
+    }
   }
-  return null;
+  return out;
 }
 
-export { COOKIE_NAME };
+export { MAX_SESSION_COOKIES };
+
+export { COOKIE_BASE };

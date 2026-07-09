@@ -14,7 +14,7 @@ import {
   verifyPassword,
   issueCookie,
   checkCookie,
-  readCookieToken,
+  readCookieTokens,
   type AuthConfig,
 } from "./auth.ts";
 import { renderEditView, renderVersionPreview } from "./serve.ts";
@@ -204,8 +204,11 @@ function serveStaticAsset(ctx: HostCtx, urlPath: string): Response | null {
 
 function isAuthed(req: Request, ctx: HostCtx): boolean {
   if (!ctx.auth) return false;
-  const token = readCookieToken(req.headers.get("cookie"));
-  return token != null && checkCookie(ctx.auth, token);
+  // Jeden gleichnamigen Cookie prüfen, nicht nur den ersten: ein untergeschobenes
+  // Domain-Cookie einer Geschwister-Subdomain darf die echte Session nicht
+  // verdecken. Ohne das Site-Secret ist keiner der Kandidaten fälschbar.
+  const auth = ctx.auth;
+  return readCookieTokens(req.headers.get("cookie")).some((t) => checkCookie(auth, t));
 }
 
 // Erlaubte return-Ziele nach Login: entweder /edit (Root) oder /<page>.html/edit.

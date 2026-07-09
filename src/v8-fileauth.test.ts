@@ -324,7 +324,8 @@ describe("host — mit gültiger Auth", () => {
   });
 
   test("GET /edit mit gültigem Cookie (issueCookie(TEST_AUTH)) → 200", async () => {
-    const cookie = "regoro_edit=" + auth.issueCookie(TEST_AUTH).split(";")[0]!.split("=").slice(1).join("=");
+    // Namen NICHT hartkodieren: er trägt in Prod den __Host--Präfix (auth.cookieName()).
+    const cookie = auth.issueCookie(TEST_AUTH).split(";")[0]!;
     const res = await call(ctx, "GET", "/edit", { headers: { cookie } });
     expect(res.status).toBe(200);
   });
