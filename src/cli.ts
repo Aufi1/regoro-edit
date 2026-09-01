@@ -19,10 +19,12 @@ import { existsSync, statSync, rmSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { AUTH_DIR_NAME, authFilePath, createAuthFile, ensureGitignore } from "./auth.ts";
 import { countCommits, ensureRepo, shellQuote } from "./git.ts";
-import { listPageFiles, startServer } from "./server.ts";
+import { startServer } from "./server.ts";
+import { listPageFiles, listSites } from "./sites.ts";
 import {
   activationSteps,
   caddyBlock,
+  caddyGlobalBlock,
   DOMAIN_RE,
   servicePort,
   serviceSlug,
@@ -44,10 +46,16 @@ Verwendung:
                                   Auth-Datei + git-Repo anlegen
   regoro <siteDir>                Editor für <siteDir> starten
   regoro run [siteDir]            (identisch zu obigem)
+  regoro serve <sitesRoot> [--port n]
+                                  Sammelbetrieb: alle Websites unter <sitesRoot>
+                                  in EINEM Prozess. Jeder Unterordner heißt wie
+                                  seine Domain; der Host-Header entscheidet.
   regoro disable [siteDir] [--purge]
                                   Editor abschalten (entfernt .regoro/)
   regoro service [siteDir] [--domain d] [--port n] [--systemd|--caddy]
                                   systemd-Unit + Caddy-Block ausgeben
+  regoro service <sitesRoot> --multi [--port n] [--systemd|--caddy]
+                                  dasselbe für den Sammelbetrieb
   regoro --version                Version ausgeben
 
 siteDir ist optional und meint ohne Angabe das aktuelle Verzeichnis.
@@ -58,6 +66,7 @@ Beispiel:
   cd ./site && regoro init      # im Site-Ordner
   regoro init ./site            # oder mit Pfad
   regoro ./site                 # → http://localhost:8788/edit/login
+  regoro serve /srv/sites       # alle Kundenwebsites in einem Prozess
 
 Umgebung:
   PORT                   Editor-Port (default 8788)
@@ -332,7 +341,7 @@ function cmdDisable(args: string[]): void {
  * Der Editor kommt daneben; der Proxy reicht nur /edit* an ihn weiter.
  */
 function cmdService(args: string[]): void {
-  checkFlags("service", args, ["--domain", "--port", "--user", "--systemd", "--caddy"]);
+  checkFlags("service", args, ["--domain", "--port", "--user", "--systemd", "--caddy", "--multi"]);
   const flagValue = (name: string): string | undefined => {
     const i = args.indexOf(name);
     return i >= 0 ? args[i + 1] : undefined;
@@ -366,7 +375,17 @@ function cmdService(args: string[]): void {
     );
   }
 
+  const multi = args.includes("--multi");
   const domain = flagValue("--domain");
+  // Im Sammelbetrieb bestimmt der Ordnername die Domain. Eine zusätzlich
+  // angegebene --domain würde stillschweigend ignoriert — lieber laut scheitern.
+  if (multi && domain !== undefined) {
+    fail(
+      "--domain und --multi schließen sich aus.\n" +
+        "  Im Sammelbetrieb entscheidet der Ordnername unter dem Sammelverzeichnis,\n" +
+        "  welche Domain zu welcher Website gehört. Zertifikate holt Caddy on demand.",
+    );
+  }
   if (domain !== undefined && !DOMAIN_RE.test(domain)) {
     fail(
       `ungültige Domain: ${domain}\n` +
@@ -382,6 +401,7 @@ function cmdService(args: string[]): void {
     port,
     user: flagValue("--user") ?? (process.env.SUDO_USER || process.env.USER || "www-data"),
     domain,
+    multi,
   };
 
   const onlySystemd = args.includes("--systemd");
@@ -392,26 +412,131 @@ function cmdService(args: string[]): void {
     return;
   }
   if (onlyCaddy && !onlySystemd) {
+    process.stdout.write(caddyGlobalBlock(opts));
     process.stdout.write(caddyBlock(opts));
     return;
   }
 
-  if (!opts.domain) {
+  if (!opts.domain && !multi) {
     console.log("# Hinweis: ohne --domain steht example.com im Caddy-Block.\n");
   }
-  console.log(`# Site:   ${siteDir}`);
+  console.log(multi ? `# Sammelverzeichnis: ${siteDir}` : `# Site:   ${siteDir}`);
   console.log(`# Dienst: regoro-${slug}   Port: ${port}${portRaw ? "" : " (aus dem Ordnernamen abgeleitet)"}`);
   console.log(`# Nutzer: ${opts.user}\n`);
   console.log("# ── /etc/systemd/system/regoro-" + slug + ".service ──");
   console.log(systemdUnit(opts));
   console.log("# ── /etc/caddy/Caddyfile ──");
+  if (multi) {
+    console.log("# Dieser globale Block muss GANZ OBEN in der Caddyfile stehen:");
+    console.log(caddyGlobalBlock(opts));
+  }
   console.log(caddyBlock(opts));
   console.log("# ── Aktivieren ──");
   console.log(activationSteps(opts));
   console.log("");
   console.log("# Einzeln abgreifen:");
   console.log(`#   regoro service --systemd | sudo tee /etc/systemd/system/regoro-${slug}.service`);
-  console.log(`#   regoro service --caddy --domain ${opts.domain ?? "deine-domain.de"} | sudo tee -a /etc/caddy/Caddyfile`);
+  console.log(
+    multi
+      ? `#   regoro service ${shellQuote(siteDir)} --multi --caddy   # globalen Block oben einfügen!`
+      : `#   regoro service --caddy --domain ${opts.domain ?? "deine-domain.de"} | sudo tee -a /etc/caddy/Caddyfile`,
+  );
+}
+
+/**
+ * `regoro serve <sitesRoot> [--port n]`
+ *
+ * Sammelbetrieb: EIN Prozess für alle Websites unter <sitesRoot>. Der
+ * Ordnername IST die Zuordnung — `/srv/sites/kunde.de/` gehört zu `kunde.de`,
+ * der Host-Header entscheidet pro Anfrage (sites.ts).
+ *
+ * Eine Website aufnehmen: Ordner anlegen, `regoro init` darin. Kein Neustart.
+ * Eine Website abschalten: `regoro disable`. Ebenfalls kein Neustart.
+ */
+function cmdServe(args: string[]): void {
+  checkFlags("serve", args, ["--port"]);
+
+  // Flag und Wert PAARWEISE herausschneiden, nicht nach Textgleichheit filtern.
+  // Ein Filter `a !== portRaw` verschluckt sonst `serve 8080 --port 8080` — beide
+  // Argumente sind derselbe String, das Verzeichnis fiele mit weg. Und ein
+  // zweites `--port` landete unbemerkt in den Positionals.
+  const positional: string[] = [];
+  let portRaw: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg === "--port") {
+      if (portRaw !== undefined) fail("--port ist doppelt angegeben.");
+      const value = args[++i];
+      if (value === undefined) fail("--port braucht einen Wert, z.B. --port 8788");
+      portRaw = value;
+      continue;
+    }
+    positional.push(arg);
+  }
+
+  // Kein Rückfall auf die cwd wie bei `run`: ein Sammelverzeichnis ist nichts,
+  // worin man zufällig steht, und ein Vertippen soll sofort auffallen.
+  if (positional.length === 0) {
+    fail(
+      "serve braucht das Sammelverzeichnis.\n" +
+        "  Beispiel: regoro serve /srv/sites\n" +
+        "  Darin je ein Unterordner pro Domain: /srv/sites/kunde.de/",
+    );
+  }
+  if (positional.length > 1) {
+    fail(
+      `zu viele Argumente für \`serve\`: ${positional.join(", ")}\n` +
+        "  serve nimmt genau EIN Sammelverzeichnis — alle Websites darin.",
+    );
+  }
+  const sitesRoot = requireDir(positional[0]);
+
+  // 0 = freien Port wählen (Tests, lokale Experimente).
+  const port = portRaw !== undefined ? Number(portRaw) : Number(process.env.PORT ?? 8788);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    fail(`ungültiger Port: ${portRaw ?? process.env.PORT}`);
+  }
+
+  const entries = listSites(sitesRoot);
+  if (entries.length === 0) {
+    fail(
+      `keine Website-Ordner in ${sitesRoot}\n` +
+        "  Erwartet wird je ein Unterordner pro Domain, z.B. kunde.de/\n" +
+        "  Eine Website aufnehmen: Ordner anlegen und darin `regoro init` ausführen.",
+    );
+  }
+  const reachable = entries.filter((e) => e.host !== null);
+  if (reachable.length === 0) {
+    fail(
+      `keine erreichbaren Website-Ordner in ${sitesRoot}\n` +
+        "  Der Ordnername MUSS die Domain sein (kleingeschrieben, ohne www.):\n" +
+        entries.map((e) => `    ${e.name}`).join("\n"),
+    );
+  }
+
+  console.log(`Sammelverzeichnis: ${sitesRoot}`);
+  console.log(`Websites (${reachable.length}):`);
+  const width = Math.max(...reachable.map((e) => e.name.length));
+  for (const site of reachable) {
+    const pages = listPageFiles(site.siteDir).length;
+    const seiten = pages === 1 ? "1 Seite" : `${pages} Seiten`;
+    const editor = existsSync(authFilePath(site.siteDir))
+      ? "Editor aktiv"
+      : `Editor aus (regoro init ${site.siteDir})`;
+    console.log(`  ${site.name.padEnd(width)}  ${seiten.padStart(9)}  ${editor}`);
+  }
+  // Ordner ohne Seiten oder ohne Auth-Datei sind kein Fehler — eine Website kann
+  // legitim gerade erst angelegt sein. Genannt werden sie trotzdem.
+  const unerreichbar = entries.filter((e) => e.host === null);
+  if (unerreichbar.length > 0) {
+    console.log("Nicht erreichbar (Ordnername ist nicht die Domain):");
+    for (const e of unerreichbar) console.log(`  ${e.name}`);
+  }
+
+  const { port: actual } = startServer({ sitesRoot, port });
+  console.log(
+    `Regoro Editor läuft auf Port ${actual} — welche Website, entscheidet der Host-Header.`,
+  );
 }
 
 function cmdRun(siteDirArg?: string): void {
@@ -448,6 +573,10 @@ async function main(): Promise<void> {
   }
   if (cmd === "run") {
     cmdRun(rest[0]); // ohne Pfad: cwd
+    return;
+  }
+  if (cmd === "serve") {
+    cmdServe(rest);
     return;
   }
   if (cmd === "disable") {

@@ -11,6 +11,10 @@
 #   - nur bekannte Dateitypen ausliefern (Allowlist, siehe unten).
 #
 # Anpassen: Domain, root-Pfad zur Site, ggf. Port.
+#
+# Das hier ist der EINZELBETRIEB: ein Prozess, eine Website. Für den
+# Sammelbetrieb (ein Prozess, alle Kundenwebsites, Zuordnung über den
+# Host-Header) siehe Caddyfile.multi.example.
 
 example.com {
     encode gzip

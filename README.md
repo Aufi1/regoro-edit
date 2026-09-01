@@ -56,6 +56,7 @@ curl -fsSL https://raw.githubusercontent.com/Aufi1/regoro-edit/main/install.sh \
 |---|---|
 | `regoro init` | Passwort setzen, Git-Repo anlegen. Einmal pro Site. |
 | `regoro run` | Editor-Server starten. Läuft im Vordergrund, bis `Strg-C`. |
+| `regoro serve` | Sammelbetrieb: **alle** Websites unter einem Sammelverzeichnis in einem Prozess. |
 | `regoro service` | systemd-Unit + Caddy-Block für den Dauerbetrieb ausgeben. |
 | `regoro disable` | Editor wieder abschalten. |
 
@@ -153,6 +154,48 @@ sudo systemctl reload caddy
 
 Danach ist der Editor unter `https://deine-domain.de/edit` erreichbar, das `Secure`-Cookie funktioniert, und `EDITOR_INSECURE_COOKIE` brauchst du nie.
 
+### Sammelbetrieb: viele Websites, ein Prozess
+
+Ab einer Handvoll Kunden lohnt der umgekehrte Zuschnitt: **ein** Dienst für alle Websites. Unter einem Sammelverzeichnis liegt je ein Ordner pro Domain — **der Ordnername ist die Zuordnung**:
+
+```
+/srv/sites/
+  malerbetrieb-schoenbrunn.de/     ← Ordnername = Hostname
+    index.html
+    .regoro/auth.json
+  haustechnik-rossmeisl.de/
+```
+
+```bash
+regoro serve /srv/sites
+```
+
+Beim Start listet der Befehl, was er gefunden hat: je Website die Anzahl der Seiten und ob der Editor aktiv ist. Ordner, deren Name keine Domain ist (`backup_alt`, `www.kunde.de`, `Kunde.DE`), werden genannt — sie sind unter keinem Hostnamen erreichbar.
+
+Welche Website gemeint ist, entscheidet der `Host`-Header **pro Anfrage**. Das heißt:
+
+- **Eine Website aufnehmen:** Ordner ablegen, darin `regoro init`. Kein Neustart, kein Eintrag in einer Konfigurationsdatei.
+- **Eine Website abschalten:** `regoro disable <ordner>`. Wirkt sofort, nur für diese eine Website; Seite und Historie bleiben.
+- **Eine neue Unterseite** ist sofort editierbar, ohne Neustart.
+- **Unbekannter, fehlender oder manipulierter `Host` → 404.** Auf allen Routen.
+
+Ein Login bei Kunde A verschafft bei Kunde B keinen Zugang: jede `auth.json` trägt ihr eigenes HMAC-Geheimnis, ein fremdes Cookie ist dort nicht verifizierbar.
+
+Betriebsdateien wie im Einzelbetrieb, nur mit `--multi`:
+
+```bash
+regoro service /srv/sites --multi
+```
+
+Der Caddy-Block bedient dann **alle** Kundendomains auf einmal und holt Zertifikate on demand. Dazu gehört ein globaler Block, der **ganz oben** in der Caddyfile stehen muss (`tee -a` hängt ihn ans Ende, wo Caddy ihn nicht akzeptiert) — die Ausgabe sagt es dazu. Kommentiert steht dieselbe Konfiguration in `Caddyfile.multi.example`.
+
+**Der Proxy muss den `Host`-Header durchreichen.** Caddys `reverse_proxy` tut das von sich aus; wer etwas anderes davorsetzt, muss es sicherstellen — sonst landen alle Kunden auf derselben Website oder auf keiner.
+
+Zwei Dinge, die im Sammelbetrieb mehr wiegen als vorher:
+
+- **Der Editor-Port darf nicht aus dem Internet erreichbar sein.** Der Prozess lauscht auf allen Adressen; davor gehört der Reverse-Proxy und eine Firewall. Vorher hing an einem Port eine Website, jetzt hängen alle daran.
+- **Nie einen Site-Ordner samt `.regoro/` kopieren**, um eine neue Website anzulegen. Beide trügen dann dasselbe Passwort und dasselbe Sitzungs-Geheimnis — der eine Kunde könnte die Seite des anderen bearbeiten. `regoro serve` erkennt das und schaltet den Editor **beider** Seiten ab, mit einer Meldung im Log; die Websites bleiben online. Richtig ist: Ordner ohne `.regoro/` anlegen und `regoro init` darin ausführen.
+
 Alternativ per Docker – siehe `Dockerfile` (Site als Volume mounten; `init` einmalig im gemounteten Ordner ausführen, damit die Auth-Datei zur Laufzeit vorliegt und **nicht** ins Image gebacken wird).
 
 ## Konfiguration
@@ -193,7 +236,7 @@ Die CLI kennt außerdem `regoro init <site> --password-stdin` (Passwort aus stdi
 
 - Nur Top-Level-`*.html` sind editierbar (keine verschachtelten Pfade).
 - Kein Layout-/Strukturbau, keine neuen Seiten, keine Benutzer-/Rollenverwaltung.
-- Multi-Site (mehrere Domains in einem Prozess mit Host-Routing) ist als Ausbaustufe vorgesehen, in v1 aber nicht enthalten – ein Prozess bedient einen Site-Ordner.
+- Keine Benutzerverwaltung im Sammelbetrieb: jede Website behält ihr eigenes Passwort in ihrem eigenen Ordner.
 
 ## Entwicklung
 
