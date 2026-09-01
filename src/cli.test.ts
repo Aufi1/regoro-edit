@@ -4,10 +4,10 @@
  * nicht abdecken: Argument-Defaults (cwd), Guards und vor allem die Reihenfolge
  * ensureGitignore → ensureRepo → createAuthFile. Sie hält das HMAC-Secret aus dem
  * Baseline-Commit (auth.json existiert beim Commit noch nicht) UND sorgt dafür,
- * dass ein fehlschlagendes git kein nutzloses Passwort hinterlässt.
+ * dass ein fehlschlagendes git keine nutzlose Auth-Datei hinterlässt.
  */
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync, statSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -22,11 +22,13 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-/** Führt `bun cli.ts <args>` mit cwd aus und füttert das Passwort über stdin. */
-function runInit(args: string[], opts: { cwd?: string; password?: string } = {}) {
-  const proc = Bun.spawnSync(["bun", CLI, "init", ...args, "--password-stdin"], {
+const TEST_NUMMER = "+4915120464812";
+
+/** Führt `bun cli.ts init <args>` mit cwd aus; die Kennung kommt über stdin. */
+function runInit(args: string[], opts: { cwd?: string; kennung?: string } = {}) {
+  const proc = Bun.spawnSync(["bun", CLI, "init", ...args, "--stdin"], {
     cwd: opts.cwd ?? dir,
-    stdin: new TextEncoder().encode(opts.password ?? "geheim123"),
+    stdin: new TextEncoder().encode(`${opts.kennung ?? TEST_NUMMER}\n`),
   });
   return {
     code: proc.exitCode,
@@ -286,12 +288,12 @@ describe("regoro init", () => {
 
     expect(r.code).toBe(0);
     expect(existsSync(join(dir, ".regoro", "auth.json"))).toBe(true);
-    // Der Zielpfad muss sichtbar sein — sonst tippt man ein Passwort ins Blinde.
+    // Der Zielpfad muss sichtbar sein — sonst richtet man den falschen Ordner ein.
     expect(r.stdout).toContain("Site-Verzeichnis:");
     expect(r.stdout).toContain(dir);
   });
 
-  test("nennt die gefundenen Seiten vor der Passwortabfrage", () => {
+  test("nennt die gefundenen Seiten und die hinterlegten Kontaktwege", () => {
     makeSite(dir);
     writeFileSync(join(dir, "impressum.html"), "<html><body><p>Impressum</p></body></html>");
     const r = runInit([], { cwd: dir });
@@ -336,7 +338,7 @@ describe("regoro init", () => {
     const before = Bun.file(join(dir, ".regoro", "auth.json")).size;
     const firstHash = Bun.spawnSync(["cat", join(dir, ".regoro", "auth.json")]).stdout.toString();
 
-    const r = runInit([], { cwd: dir, password: "anderes-passwort" });
+    const r = runInit([], { cwd: dir, kennung: "+4917000000000" });
 
     expect(r.code).toBe(1);
     expect(r.stderr).toContain("bereits initialisiert");
@@ -345,12 +347,12 @@ describe("regoro init", () => {
     expect(Bun.file(join(dir, ".regoro", "auth.json")).size).toBe(before);
   });
 
-  test("--force überschreibt die Auth-Datei (Passwort neu setzen)", () => {
+  test("--force überschreibt die Auth-Datei (neues Secret, Sitzungen ungültig)", () => {
     makeSite(dir);
     expect(runInit([], { cwd: dir }).code).toBe(0);
     const before = Bun.spawnSync(["cat", join(dir, ".regoro", "auth.json")]).stdout.toString();
 
-    const r = runInit(["--force"], { cwd: dir, password: "neues-passwort" });
+    const r = runInit(["--force"], { cwd: dir, kennung: "+4917000000000" });
 
     expect(r.code).toBe(0);
     const after = Bun.spawnSync(["cat", join(dir, ".regoro", "auth.json")]).stdout.toString();
@@ -371,7 +373,7 @@ describe("regoro init", () => {
 
   // Regression: `git` schlug fehl (z.B. "dubious ownership", wenn der Site-Ordner
   // einem anderen User gehört). Früher lief createAuthFile ZUERST — es blieb ein
-  // nutzloses Passwort liegen, und der "bereits initialisiert"-Guard blockierte
+  // eine nutzlose Auth-Datei liegen, und der "bereits initialisiert"-Guard blockierte
   // den zweiten Anlauf. Jetzt scheitert init, bevor der Nutzer tippt.
   describe("git schlägt fehl", () => {
     /** Legt ein fake `git` an, das immer mit der echten Meldung fehlschlägt. */
@@ -386,9 +388,9 @@ describe("regoro init", () => {
     }
 
     function runInitWithFakeGit(bin: string) {
-      const proc = Bun.spawnSync(["bun", CLI, "init", "--password-stdin"], {
+      const proc = Bun.spawnSync(["bun", CLI, "init", "--stdin"], {
         cwd: dir,
-        stdin: new TextEncoder().encode("geheim123"),
+        stdin: new TextEncoder().encode(`${TEST_NUMMER}\n`),
         env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
       });
       return {
@@ -398,7 +400,7 @@ describe("regoro init", () => {
       };
     }
 
-    test("hinterlässt KEINE auth.json (Passwort nicht verloren, init wiederholbar)", () => {
+    test("hinterlässt KEINE auth.json (Einrichtung nicht halb, init wiederholbar)", () => {
       makeSite(dir);
       const bin = fakeGitDir("fatal: not a git repository");
 
@@ -439,9 +441,9 @@ describe("regoro init", () => {
       makeSite(spaced);
       const bin = fakeGitDir("fatal: detected dubious ownership in repository at '/x'");
 
-      const proc = Bun.spawnSync(["bun", CLI, "init", "--password-stdin"], {
+      const proc = Bun.spawnSync(["bun", CLI, "init", "--stdin"], {
         cwd: spaced,
-        stdin: new TextEncoder().encode("geheim123"),
+        stdin: new TextEncoder().encode(`${TEST_NUMMER}\n`),
         env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
       });
       const stderr = proc.stderr.toString();
@@ -469,13 +471,31 @@ describe("regoro init", () => {
     });
   });
 
-  test("leeres Passwort über stdin wird abgelehnt", () => {
+  test("ohne Kontaktweg bricht init ab und legt nichts an", () => {
     makeSite(dir);
-    const r = runInit([], { cwd: dir, password: "   " });
+    const r = runInit([], { cwd: dir, kennung: "   " });
 
     expect(r.code).toBe(1);
-    expect(r.stderr).toContain("leeres Passwort");
+    expect(r.stderr).toContain("kein Kontaktweg");
     expect(existsSync(join(dir, ".regoro"))).toBe(false);
+  });
+
+  test("eine unbrauchbare Kennung bricht ab, statt sie zu verschlucken", () => {
+    makeSite(dir);
+    const r = runInit([], { cwd: dir, kennung: "keine-nummer" });
+
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("unbrauchbarer Kontaktweg");
+    expect(existsSync(join(dir, ".regoro"))).toBe(false);
+  });
+
+  test("Nummer und Adresse zusammen werden beide hinterlegt", () => {
+    makeSite(dir);
+    const r = runInit(["--nummer", "0151 20464812", "--email", "Chef@Firma.de"], { cwd: dir, kennung: "" });
+    expect(r.code).toBe(0);
+    const gespeichert = JSON.parse(readFileSync(join(dir, ".regoro", "auth.json"), "utf8"));
+    expect(gespeichert.nummern).toEqual(["+4915120464812"]);
+    expect(gespeichert.emails).toEqual(["chef@firma.de"]);
   });
 });
 
@@ -582,5 +602,106 @@ describe("regoro serve — Argument-Zerlegung", () => {
     const r = runCli(["serve", "a", "b"]);
     expect(r.code).toBe(1);
     expect(r.stderr).toContain("zu viele");
+  });
+});
+
+// ===========================================================================
+// `regoro kennung` — Kontaktwege pflegen
+// ===========================================================================
+describe("regoro kennung", () => {
+  function initSite(): void {
+    makeSite(dir);
+    expect(runInit([], { cwd: dir }).code).toBe(0);
+  }
+  const auth = () => JSON.parse(readFileSync(join(dir, ".regoro", "auth.json"), "utf8"));
+
+  test("--list zeigt die Kontaktwege verkuerzt, nie vollstaendig", () => {
+    initSite();
+    const r = runCli(["kennung", "--list"]);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain("+4915…812");
+    // Eine Betreiber-Ausgabe landet in Logs und Screenshots.
+    expect(r.stdout).not.toContain(TEST_NUMMER);
+  });
+
+  test("--add nimmt eine Adresse dazu und laesst das Secret unangetastet", () => {
+    initSite();
+    const vorher = auth().secret;
+    const r = runCli(["kennung", "--add", "Chef@Firma.de"]);
+    expect(r.code).toBe(0);
+    expect(auth().emails).toEqual(["chef@firma.de"]);
+    // Eine hinzugefuegte Kennung darf keine laufende Sitzung beenden.
+    expect(auth().secret).toBe(vorher);
+  });
+
+  test("--add derselben Kennung in anderer Schreibweise legt keinen zweiten Eintrag an", () => {
+    initSite();
+    expect(runCli(["kennung", "--add", "0151 20464812"]).code).toBe(0);
+    expect(auth().nummern).toEqual([TEST_NUMMER]);
+  });
+
+  test("--remove entfernt und laesst das Secret unangetastet", () => {
+    initSite();
+    runCli(["kennung", "--add", "chef@firma.de"]);
+    const vorher = auth().secret;
+    const r = runCli(["kennung", "--remove", "0151 20464812"]);
+    expect(r.code).toBe(0);
+    expect(auth().nummern).toEqual([]);
+    expect(auth().emails).toEqual(["chef@firma.de"]);
+    expect(auth().secret).toBe(vorher);
+  });
+
+  test("--remove der LETZTEN Kennung wird verweigert", () => {
+    initSite();
+    const r = runCli(["kennung", "--remove", TEST_NUMMER]);
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("regoro disable");
+    // Und die Datei bleibt unberuehrt.
+    expect(auth().nummern).toEqual([TEST_NUMMER]);
+  });
+
+  test("--remove einer nicht hinterlegten Kennung bricht ab", () => {
+    initSite();
+    const r = runCli(["kennung", "--remove", "+4917099999999"]);
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("nicht hinterlegt");
+  });
+
+  test("unbrauchbare Kennung bricht ab, statt sie zu schlucken", () => {
+    initSite();
+    const r = runCli(["kennung", "--add", "keine-kennung"]);
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("unbrauchbarer Kontaktweg");
+  });
+
+  test("ohne Auth-Datei nennt es den Weg dorthin", () => {
+    makeSite(dir);
+    const r = runCli(["kennung", "--list"]);
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("regoro init");
+  });
+
+  test("altes Passwort-Format wird benannt, nicht stillschweigend weiterbetrieben", () => {
+    makeSite(dir);
+    mkdirSync(join(dir, ".regoro"), { recursive: true });
+    writeFileSync(
+      join(dir, ".regoro", "auth.json"),
+      JSON.stringify({ v: 1, hash: "$argon2id$abc", secret: "x".repeat(32) }),
+    );
+    const r = runCli(["kennung", "--list"]);
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("alten Passwort-Format");
+    expect(r.stderr).toContain("--force");
+  });
+
+  test("ein Verzeichnis, das wie eine Kennung heisst, wird nicht verschluckt", () => {
+    // Dieselbe Falle wie bei `serve --port`: Positional und Flag-Wert duerfen
+    // nicht ueber Textgleichheit unterschieden werden.
+    const site = join(dir, "12345678");
+    mkdirSync(site);
+    makeSite(site);
+    expect(runInit([site], { cwd: dir }).code).toBe(0);
+    expect(existsSync(join(site, ".regoro", "auth.json"))).toBe(true);
+    expect(existsSync(join(dir, ".regoro"))).toBe(false);
   });
 });

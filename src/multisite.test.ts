@@ -19,11 +19,13 @@ import { join } from "node:path";
 import { startServer } from "./server.ts";
 import { createAuthFile, AUTH_DIR_NAME } from "./auth.ts";
 import { SECRET_SCAN_TTL_MS } from "./sites.ts";
+import { attrappenVersand, type Attrappe } from "./versand.ts";
+import { meldeAn } from "./anmeldung.testhelfer.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
 const REAL_SITE = join(REPO_ROOT, "examples", "site");
-const PW_A = "passwort-a-1234";
-const PW_B = "passwort-b-1234";
+const KENNUNG_PW_A = "+4915120464812";
+const KENNUNG_PW_B = "+4917012345678";
 const dirs: string[] = [];
 
 afterAll(() => {
@@ -35,6 +37,7 @@ interface Multi {
   siteA: string;
   siteB: string;
   base: string;
+  versand: Attrappe;
   cookieA: string;
   cookieB: string;
 }
@@ -51,31 +54,21 @@ async function bootMulti(): Promise<Multi> {
   writeFileSync(join(siteB, "index.html"), "<html><body><h1>SEITE B</h1></body></html>");
   // Seite, die es nur bei A gibt.
   writeFileSync(join(siteA, "nur-bei-a.html"), "<html><body><h1>NUR A</h1></body></html>");
-  await createAuthFile(siteA, PW_A);
-  await createAuthFile(siteB, PW_B);
+  await createAuthFile(siteA, [KENNUNG_PW_A]);
+  await createAuthFile(siteB, [KENNUNG_PW_B]);
 
-  const { port } = startServer({ sitesRoot: root, port: 0 });
+  const versand = attrappenVersand();
+  const { port } = startServer({ sitesRoot: root, port: 0, versand });
   const base = `http://127.0.0.1:${port}`;
   return {
     root,
     siteA,
     siteB,
     base,
-    cookieA: await login(base, "kunde-a.test", PW_A),
-    cookieB: await login(base, "kunde-b.test", PW_B),
+    versand,
+    cookieA: await meldeAn(base, KENNUNG_PW_A, versand, { host: "kunde-a.test" }),
+    cookieB: await meldeAn(base, KENNUNG_PW_B, versand, { host: "kunde-b.test" }),
   };
-}
-
-async function login(base: string, host: string, password: string): Promise<string> {
-  const res = await fetch(`${base}/edit/login`, {
-    method: "POST",
-    headers: { Host: host, "content-type": "application/x-www-form-urlencoded" },
-    body: `password=${password}`,
-    redirect: "manual",
-  });
-  const setCookie = res.headers.get("set-cookie");
-  if (!setCookie) throw new Error(`Login bei ${host} lieferte kein Cookie (Status ${res.status})`);
-  return setCookie.split(";")[0]!;
 }
 
 function req(base: string, host: string, path: string, cookie?: string): Promise<Response> {
@@ -201,16 +194,21 @@ describe("Sammelbetrieb — Trennung", () => {
     expect(viewB).not.toContain("nur-bei-a.html");
   });
 
-  test("das Passwort des einen öffnet die Anmeldung des anderen nicht", async () => {
-    const { base } = await bootMulti();
+  test("die Kennung des einen loest beim anderen keinen Code aus", async () => {
+    const { base, versand } = await bootMulti();
+    const vorher = versand.gesendet.length;
     const res = await fetch(`${base}/edit/login`, {
       method: "POST",
       headers: { Host: "kunde-b.test", "content-type": "application/x-www-form-urlencoded" },
-      body: `password=${PW_A}`,
+      body: `kennung=${encodeURIComponent(KENNUNG_PW_A)}&weg=sms`,
       redirect: "manual",
     });
-    expect(res.status).toBe(401);
+    // Gleiche Antwort wie bei einer hinterlegten Kennung — die Anmeldeseite
+    // darf nicht verraten, welche Kontaktwege es gibt.
+    expect(res.status).toBe(200);
     expect(res.headers.get("set-cookie")).toBe(null);
+    // Aber es geht nichts raus.
+    expect(versand.gesendet.length).toBe(vorher);
   });
 });
 
@@ -294,8 +292,8 @@ describe("Sammelbetrieb — kopiertes Sitzungs-Geheimnis", () => {
   /**
    * Der Betriebsfehler: ein Site-Ordner wird als Vorlage kopiert, `.regoro/`
    * fährt mit. Dann tragen zwei Websites dasselbe HMAC-Secret UND denselben
-   * Passwort-Hash — Stütze 2 (Identität) ist damit weg: das Cookie des einen
-   * gilt beim anderen, und schlimmer noch, dasselbe Passwort öffnet beide.
+   * Kontaktwege — Stütze 2 (Identität) ist damit weg: das Cookie des einen
+   * gilt beim anderen, und schlimmer noch, derselbe Kontaktweg öffnet beide.
    * Ein an den Host gebundenes Cookie würde nur die erste Hälfte schließen.
    * Deshalb: Kollision erkennen und BEIDE Editoren fail-closed abschalten.
    */
@@ -308,34 +306,35 @@ describe("Sammelbetrieb — kopiertes Sitzungs-Geheimnis", () => {
     cpSync(REAL_SITE, siteB, { recursive: true });
     writeFileSync(join(siteA, "index.html"), "<html><body><h1>SEITE A</h1></body></html>");
     writeFileSync(join(siteB, "index.html"), "<html><body><h1>SEITE B</h1></body></html>");
-    await createAuthFile(siteA, PW_A);
-    await createAuthFile(siteB, PW_B);
+    await createAuthFile(siteA, [KENNUNG_PW_A]);
+    await createAuthFile(siteB, [KENNUNG_PW_B]);
     return { root, siteA, siteB };
   }
 
   const startAuf = (root: string) => {
-    const { port } = startServer({ sitesRoot: root, port: 0 });
-    return `http://127.0.0.1:${port}`;
+    const versand = attrappenVersand();
+    const { port } = startServer({ sitesRoot: root, port: 0, versand });
+    return { base: `http://127.0.0.1:${port}`, versand };
   };
 
   test("Kopie vor dem Start: beide Editoren aus, beide Websites bleiben online", async () => {
     const { root, siteA } = await bootMitKopie();
     const kopie = join(root, "kunde-c.test");
     cpSync(siteA, kopie, { recursive: true }); // .regoro/ fährt mit
-    const base = startAuf(root);
+    const { base } = startAuf(root);
 
     // Der Login ist zu — auf BEIDEN Seiten, nicht nur auf der Kopie.
     expect(await status(base, "kunde-a.test", "/edit/login")).toBe(404);
     expect(await status(base, "kunde-c.test", "/edit/login")).toBe(404);
-    // Auch das gemeinsame Passwort öffnet nichts mehr.
-    const login = await fetch(`${base}/edit/login`, {
+    // Auch der gemeinsame Kontaktweg oeffnet nichts mehr.
+    const versuch = await fetch(`${base}/edit/login`, {
       method: "POST",
       headers: { Host: "kunde-c.test", "content-type": "application/x-www-form-urlencoded" },
-      body: `password=${PW_A}`,
+      body: `kennung=${encodeURIComponent(KENNUNG_PW_A)}&weg=sms`,
       redirect: "manual",
     });
-    expect(login.status).toBe(404);
-    expect(login.headers.get("set-cookie")).toBe(null);
+    expect(versuch.status).toBe(404);
+    expect(versuch.headers.get("set-cookie")).toBe(null);
 
     // Die Websites selbst laufen weiter — der Betriebsfehler darf keine Seite abschalten.
     expect(await status(base, "kunde-a.test", "/")).toBe(200);
@@ -346,8 +345,8 @@ describe("Sammelbetrieb — kopiertes Sitzungs-Geheimnis", () => {
 
   test("Kopie im laufenden Betrieb wird ebenfalls erkannt", async () => {
     const { root, siteA } = await bootMitKopie();
-    const base = startAuf(root);
-    const cookieA = await login(base, "kunde-a.test", PW_A);
+    const { base, versand } = startAuf(root);
+    const cookieA = await meldeAn(base, KENNUNG_PW_A, versand, { host: "kunde-a.test" });
     expect(await status(base, "kunde-a.test", "/edit", cookieA)).toBe(200);
 
     cpSync(siteA, join(root, "kunde-c.test"), { recursive: true });
@@ -364,11 +363,11 @@ describe("Sammelbetrieb — kopiertes Sitzungs-Geheimnis", () => {
     // vorgelegt, also nie verglichen. Deshalb Durchsicht statt Gedächtnis.
     const root = realpathSync(mkdtempSync(join(tmpdir(), "regoro-einseitig-")));
     dirs.push(root);
-    const base = startAuf(root); // Sammelverzeichnis ist beim Start LEER
+    const { base } = startAuf(root); // Sammelverzeichnis ist beim Start LEER
 
     const siteA = join(root, "kunde-a.test");
     cpSync(REAL_SITE, siteA, { recursive: true });
-    await createAuthFile(siteA, PW_A);
+    await createAuthFile(siteA, [KENNUNG_PW_A]);
     cpSync(siteA, join(root, "kunde-b.test"), { recursive: true });
     await Bun.sleep(SECRET_SCAN_TTL_MS + 200);
 
@@ -376,7 +375,7 @@ describe("Sammelbetrieb — kopiertes Sitzungs-Geheimnis", () => {
     const versuch = await fetch(`${base}/edit/login`, {
       method: "POST",
       headers: { Host: "kunde-b.test", "content-type": "application/x-www-form-urlencoded" },
-      body: `password=${PW_A}`,
+      body: `kennung=${encodeURIComponent(KENNUNG_PW_A)}&weg=sms`,
       redirect: "manual",
     });
     expect(versuch.status).toBe(404);
@@ -392,30 +391,31 @@ describe("Sammelbetrieb — kopiertes Sitzungs-Geheimnis", () => {
     const { root, siteA } = await bootMitKopie();
     const kopie = join(root, "kunde-c.test");
     cpSync(siteA, kopie, { recursive: true });
-    const base = startAuf(root);
+    const { base, versand } = startAuf(root);
     expect(await status(base, "kunde-a.test", "/edit/login")).toBe(404);
     expect(await status(base, "kunde-c.test", "/edit/login")).toBe(404);
 
-    // Das tut `regoro init --force`: frisches Secret, frisches Passwort.
+    // Das tut `regoro init --force`: frisches Secret, frische Kontaktwege.
     // createAuthFile überschreibt kommentarlos — genau das tut `init --force`.
-    await createAuthFile(kopie, "passwort-c-1234");
+    await createAuthFile(kopie, ["+4930111222333"]);
     await Bun.sleep(SECRET_SCAN_TTL_MS + 200);
 
     expect(await status(base, "kunde-a.test", "/edit/login")).toBe(200);
     expect(await status(base, "kunde-c.test", "/edit/login")).toBe(200);
-    // Und die Anmeldung funktioniert auf beiden Seiten wieder, mit je eigenem Passwort.
-    expect(await status(base, "kunde-a.test", "/edit", await login(base, "kunde-a.test", PW_A))).toBe(200);
+    // Und die Anmeldung funktioniert auf beiden Seiten wieder, mit je eigenem Secret.
+    const cookie = await meldeAn(base, KENNUNG_PW_A, versand, { host: "kunde-a.test" });
+    expect(await status(base, "kunde-a.test", "/edit", cookie)).toBe(200);
   });
 
   test("ein Alias-Symlink auf DENSELBEN Ordner ist keine Kollision", async () => {
     const { root, siteA } = await bootMitKopie();
     symlinkSync(siteA, join(root, "kunde-alt.test"));
-    const base = startAuf(root);
+    const { base, versand } = startAuf(root);
 
     // Zwei Hostnamen, ein Ordner — legitim, beide müssen funktionieren.
     expect(await status(base, "kunde-a.test", "/edit/login")).toBe(200);
     expect(await status(base, "kunde-alt.test", "/edit/login")).toBe(200);
-    const cookie = await login(base, "kunde-alt.test", PW_A);
+    const cookie = await meldeAn(base, KENNUNG_PW_A, versand, { host: "kunde-alt.test" });
     expect(await status(base, "kunde-alt.test", "/edit", cookie)).toBe(200);
   });
 });

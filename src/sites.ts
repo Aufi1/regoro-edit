@@ -19,6 +19,7 @@ import { readdirSync, realpathSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { loadAuthFile } from "./auth.ts";
 import type { HostCtx } from "./host.ts";
+import type { Versand } from "./versand.ts";
 
 /**
  * Editierbare Seiten: top-level, kleingeschrieben, `.html`. EINE Definition für
@@ -198,9 +199,9 @@ export function discoverPages(siteDir: string): string[] {
  *
  * Der Betriebsfehler, um den es geht: Ein Ordner wird als Vorlage kopiert
  * (`cp -r kunde-a.de kunde-b.de`), und das versteckte `.regoro/` fährt mit.
- * Dann teilen sich zwei Kunden Secret UND Passwort-Hash. Stütze 2 der
+ * Dann teilen sich zwei Kunden Secret UND hinterlegte Kontaktwege. Stütze 2 der
  * Kundentrennung (Invariante 10) ist damit weg — und zwar doppelt: das Cookie
- * des einen ist beim anderen gültig, und dasselbe Passwort öffnet beide Logins.
+ * des einen ist beim anderen gültig, und derselbe Kontaktweg öffnet beide Anmeldungen.
  * Ein an den Hostnamen gebundenes Cookie schlösse nur die erste Hälfte; das
  * Passwort käme weiterhin durch. Deshalb wird die Kollision erkannt und der
  * Editor **beider** Seiten abgeschaltet — fail-closed, wie überall sonst auch.
@@ -257,10 +258,10 @@ export function erstelleSecretWache(
       console.error(
         `[regoro] FEHLER: ${[...ordner].join(" und ")} führen dasselbe Sitzungs-Geheimnis.\n` +
           "  Vermutlich wurde ein Site-Ordner samt .regoro/ kopiert. Damit gilt das Cookie\n" +
-          "  des einen Kunden beim anderen, und dasselbe Passwort öffnet beide Logins.\n" +
+          "  des einen Kunden beim anderen, und derselbe Kontaktweg öffnet beide Anmeldungen.\n" +
           "  Der Editor ist für ALLE beteiligten Ordner abgeschaltet, die Websites laufen weiter.\n" +
           "  Beheben: `regoro init --force <ordner>` auf allen bis auf einen (setzt dort ein\n" +
-          "  neues Passwort) oder den kopierten Ordner entfernen. Wirkt ohne Neustart.",
+          "  neues Geheimnis) oder den kopierten Ordner entfernen. Wirkt ohne Neustart.",
       );
     }
     for (const dir of kollidierend) {
@@ -298,13 +299,14 @@ export function erstelleSecretWache(
  *     derselben Anfrage. Dass `auth` pro Anfrage frisch gelesen wird, IST der
  *     Kill-Switch — `regoro disable` wirkt dadurch sofort (siehe server.ts).
  */
-export function buildCtx(site: SiteRef, wache?: SecretWache): HostCtx {
+export function buildCtx(site: SiteRef, wache?: SecretWache, versand?: Versand | null): HostCtx {
   let pages: string[] | undefined;
   let auth: ReturnType<typeof loadAuthFile> | undefined;
   return {
     repoRoot: site.siteDir,
     siteDir: site.siteDir,
     sitePrefix: "",
+    versand: versand ?? null,
     get pageWhitelist(): string[] {
       return (pages ??= discoverPages(site.siteDir));
     },

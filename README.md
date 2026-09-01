@@ -1,7 +1,7 @@
 # Regoro Edit
 
 **Inline-WYSIWYG-Editor für bestehende statische HTML-Websites.**
-Installieren, ein Passwort setzen – und danach an **jede** Seite deiner Website `/edit` anhängen, um sie direkt im Browser zu bearbeiten. Kein CMS, keine Datenbank, kein Re-Build. Jede Speicherung ist eine Git-Version.
+Installieren, Telefonnummer und E-Mail-Adresse hinterlegen – und danach an **jede** Seite deiner Website `/edit` anhängen, um sie direkt im Browser zu bearbeiten. Kein CMS, keine Datenbank, kein Re-Build. Jede Speicherung ist eine Git-Version.
 
 ```
 deine-seite.de/                 →  deine ganz normale Website
@@ -54,7 +54,8 @@ curl -fsSL https://raw.githubusercontent.com/Aufi1/regoro-edit/main/install.sh \
 
 | Befehl | Zweck |
 |---|---|
-| `regoro init` | Passwort setzen, Git-Repo anlegen. Einmal pro Site. |
+| `regoro init` | Kontaktwege hinterlegen, Git-Repo anlegen. Einmal pro Site. |
+| `regoro kennung` | Telefonnummern und E-Mail-Adressen pflegen. |
 | `regoro run` | Editor-Server starten. Läuft im Vordergrund, bis `Strg-C`. |
 | `regoro serve` | Sammelbetrieb: **alle** Websites unter einem Sammelverzeichnis in einem Prozess. |
 | `regoro service` | systemd-Unit + Caddy-Block für den Dauerbetrieb ausgeben. |
@@ -66,16 +67,18 @@ Alle nehmen den Site-Ordner aus dem aktuellen Verzeichnis; ein Pfad als Argument
 
 ```bash
 cd /pfad/zu/deiner/site
-regoro init      # Passwort setzen (legt <site>/.regoro/auth.json an)
-regoro run       # Editor starten
+regoro init --nummer "0151 20464812" --email chef@firma.de   # beide Kontaktwege
+regoro run                                                    # Editor starten
 ```
 
-Dann im Browser `http://localhost:8788/` öffnen (deine Site) und an eine beliebige Seite `/edit` anhängen → Login → bearbeiten. Über `localhost` funktioniert das ohne weitere Einstellungen.
+Dann im Browser `http://localhost:8788/` öffnen (deine Site) und an eine beliebige Seite `/edit` anhängen → Anmelden → bearbeiten. Über `localhost` funktioniert das ohne weitere Einstellungen.
+
+Damit ein Code ankommt, muss der Versand eingerichtet sein (siehe unten). Zum Ausprobieren genügt die **Attrappe**: Sie schreibt den Code ins Terminal, statt ihn zu verschicken.
 
 > **Ausprobieren ohne eigene Site:** In diesem Repo liegt eine Beispiel-Site unter `examples/site`:
 > ```bash
 > cp -r examples/site /tmp/meine-site
-> regoro init /tmp/meine-site
+> regoro init /tmp/meine-site --nummer "0151 20464812" --email chef@firma.de
 > regoro run /tmp/meine-site
 > # -> http://localhost:8788/  und  http://localhost:8788/edit
 > ```
@@ -90,10 +93,10 @@ meine-website/            ← Site-Root (hier liegt index.html)
 ├── impressum.html
 ├── styles.css
 ├── assets/…
-└── .regoro/auth.json     ← von `init` angelegt (gehashtes Passwort + Secret, 0600, git-ignoriert)
+└── .regoro/auth.json     ← von `init` angelegt (Kontaktwege + Secret, 0600, git-ignoriert)
 ```
 
-- `regoro init ./meine-website` fragt ein Passwort ab, **hasht** es (argon2id) und legt es zusammen mit einem zufälligen Cookie-Secret in `.regoro/auth.json` ab. Zusätzlich wird ein Git-Repo im Site-Ordner initialisiert (Versionen) und `.regoro/` in eine `.gitignore` eingetragen – das Secret wird also nie mitversioniert.
+- `regoro init ./meine-website --nummer "0151 20464812" --email chef@firma.de` legt die hinterlegten Kontaktwege zusammen mit einem zufälligen Cookie-Secret in `.regoro/auth.json` ab. Zusätzlich wird ein Git-Repo im Site-Ordner initialisiert (Versionen) und `.regoro/` in eine `.gitignore` eingetragen – das Secret wird also nie mitversioniert.
 - `regoro run ./meine-website` startet den Server. Deine Seiten sind unter ihren normalen URLs erreichbar; `…/edit` öffnet den Editor.
 - **Bearbeitbare Seiten** sind alle `*.html`-Dateien im Site-Root (Top-Level). Unterordner-Seiten sind in v1 nicht im Editor (werden aber normal ausgeliefert).
 
@@ -107,13 +110,56 @@ meine-website/            ← Site-Root (hier liegt index.html)
 
 Bist du nicht angemeldet, leitet der Editor auf den **Login** um und danach zurück zur Bearbeitungsansicht der Seite.
 
-## Auth-Modell (wichtig)
+## Anmeldung (wichtig)
 
-- **Genau ein Weg:** gehashte Passwort-Datei `<site>/.regoro/auth.json` (argon2id, per-Site-Cookie-Secret). **Keine** Passwort-Umgebungsvariablen.
-- **Fail-closed:** fehlt/ungültig die Datei → `/edit` ist komplett aus (alle Editor-Routen → 404).
-- **Pro Site ein eigenes Passwort:** Betreibst du mehrere Sites, hat jede ihre eigene `.regoro/auth.json`.
-- **Die Auth-Datei ist nie über das Web erreichbar:** Anfragen auf `.regoro/` bzw. jeden Dotfile werden hart mit 404 beantwortet (zusätzlich blockt die Reverse-Proxy-Vorlage sie).
-- **Das Session-Cookie heißt `__Host-regoro_edit`** (in Prod, mit TLS). Der `__Host-`-Präfix sorgt dafür, dass der Browser es nur mit `Secure`, `Path=/` und ohne `Domain`-Attribut akzeptiert. Relevant, wenn mehrere Sites unter Subdomains derselben Domain laufen (`kunde1.example.de`, `kunde2.example.de`): Ohne das Präfix könnte eine Subdomain den anderen ein gleichnamiges Cookie unterschieben und sie damit aussperren.
+**Es gibt kein Passwort.** Der Kunde tippt ein, wie er erreichbar ist — Telefonnummer oder E-Mail-Adresse —, bekommt einen sechsstelligen Code auf genau diesem Weg und trägt ihn ein. Danach bleibt er 30 Tage angemeldet.
+
+Der Grund: Ein Werkzeug, das ein Handwerksbetrieb viermal im Jahr benutzt, passt nicht zu einem Passwort. Es wird vergessen, das Zurücksetzen kostet Support-Zeit, und ein Zurücksetz-Weg ist selbst wieder eine Angriffsfläche. Ein Telefon hat der Chef dagegen dabei.
+
+```bash
+regoro init ./site --nummer "0151 20464812" --email chef@firma.de
+regoro kennung ./site --list          # zeigt verkürzt: +4915…812
+regoro kennung ./site --add chef2@firma.de
+regoro kennung ./site --remove "0151 20464812"
+```
+
+Beides lässt sich hinterlegen; welcher Weg benutzt wird, entscheidet der Kunde bei jeder Anmeldung über zwei Reiter auf der Anmeldeseite. Der Code geht immer nur an **einen** Weg — den, der eingegeben wurde.
+
+Was daraus folgt:
+
+- **Wer keinen hinterlegten Kontaktweg hat, kommt nicht hinein.** `.regoro/auth.json` enthält die Liste plus das Sitzungs-Geheimnis der Website. Fehlt die Datei oder ist sie leer, antworten alle `/edit*`-Routen mit 404 (fail-closed).
+- **Eine nicht hinterlegte Nummer löst keine Nachricht aus** — aber die Anmeldeseite antwortet gleich. Sonst verriete sie, welche Nummern es gibt.
+- **Codes leben nur im Arbeitsspeicher**, gelten 5 Minuten und vertragen 5 Fehleingaben. Ein Neustart macht offene Codes ungültig; der Kunde fordert einen neuen an.
+- **Bremse:** höchstens 3 Codes je Kontaktweg pro Stunde — das ist der Kostendeckel, denn nur hinterlegte Kontaktwege lösen überhaupt eine Nachricht aus. Dazu 60 Anfragen je Website und Stunde als Flut-Sperre. Beide greifen, *bevor* etwas rausgeht, und zählen auch unbekannte Kennungen mit; täten sie das nicht, verriete die Bremse, wer Kunde ist. Gegen echte Fluten gehört eine Ratenbegrenzung in den Reverse-Proxy.
+- **Beide Kontaktwege hinterlegen, wenn möglich.** Die Bremse zählt je Kontaktweg. Wer die Geschäftsnummer aus dem Impressum kennt, kann mit drei Anfragen pro Stunde deren Codes aufbrauchen — die hinterlegte Adresse hat einen eigenen Zähler und bleibt offen. Zwei Wege sind hier kein Luxus, sondern die Ausweichmöglichkeit. (Halb entschärft ist das ohnehin: Wer eine fremde Nummer flutet, schickt dem Inhaber gültige Codes, mit denen der sich anmelden kann.) Gegen gezielten Missbrauch gehört darüber hinaus eine Ratenbegrenzung in den Reverse-Proxy.
+- **Ob eine Nachricht ankam, sagt die Seite nicht.** Ein Versandfehler steht im Log des Betreibers, nicht im Browser — sonst wäre er ein Hinweis darauf, dass diese Nummer hinterlegt ist. Der Kunde sieht „Nichts bekommen? Neuen Code anfordern".
+- **Eine entfernte Nummer beendet keine laufende Sitzung.** Wer sofort aussperren will, erneuert das Geheimnis: `regoro init --force <site> --nummer …`.
+- **Beim Kundenende die Kontaktwege entfernen.** Deutsche Rufnummern werden nach Abschaltung wieder vergeben — eine Nummer auf der Liste, die den Besitzer wechselt, ist ein Zugang, der den Besitzer wechselt. Deshalb die Geschäftsnummer hinterlegen, nicht eine private.
+
+### Versand einrichten (einmal pro Server)
+
+Der Versand ist **betreiberseitig**, nicht je Website: ein Absender für alle Kunden, eine Konfiguration für alle. `/etc/regoro/versand.json`, Mode 0600:
+
+```json
+{
+  "v": 2,
+  "sms":   { "anbieter": "sevenio",  "apiKey": "…", "absender": "REGORO" },
+  "email": { "anbieter": "scaleway", "apiKey": "…", "projektId": "…",
+             "absenderMail": "editor@deine-domain.de", "absenderName": "Regoro" }
+}
+```
+
+Beide Abschnitte sind einzeln optional — wer nur SMS anbietet, lässt `email` weg. Ist ein Kanal nicht eingerichtet, sagt die Anmeldeseite das **jedem**, der diesen Reiter wählt; sie verrät damit nichts darüber, welche Kontaktwege hinterlegt sind.
+
+Zwei Fallstricke, die früh auffallen sollen und deshalb schon beim Laden geprüft werden: Die **Absenderkennung darf höchstens 11 Zeichen** haben (seven.io lehnt längere ab) und nur Buchstaben und Ziffern enthalten. Auf eine alphanumerische Kennung kann man nicht antworten — für Einmalcodes genau richtig.
+
+**Zum Ausprobieren ohne Konto und ohne Kosten** gibt es die Attrappe. Sie schickt nichts und schreibt den Code ins Terminal:
+
+```json
+{ "v": 2, "sms": { "anbieter": "attrappe" }, "email": { "anbieter": "attrappe" } }
+```
+
+Beim Start warnt der Server laut davor. Niemals in Produktion.
 
 ## Versionen
 
@@ -194,7 +240,7 @@ Der Caddy-Block bedient dann **alle** Kundendomains auf einmal und holt Zertifik
 Zwei Dinge, die im Sammelbetrieb mehr wiegen als vorher:
 
 - **Der Editor-Port darf nicht aus dem Internet erreichbar sein.** Der Prozess lauscht auf allen Adressen; davor gehört der Reverse-Proxy und eine Firewall. Vorher hing an einem Port eine Website, jetzt hängen alle daran.
-- **Nie einen Site-Ordner samt `.regoro/` kopieren**, um eine neue Website anzulegen. Beide trügen dann dasselbe Passwort und dasselbe Sitzungs-Geheimnis — der eine Kunde könnte die Seite des anderen bearbeiten. `regoro serve` erkennt das und schaltet den Editor **beider** Seiten ab, mit einer Meldung im Log; die Websites bleiben online. Richtig ist: Ordner ohne `.regoro/` anlegen und `regoro init` darin ausführen.
+- **Nie einen Site-Ordner samt `.regoro/` kopieren**, um eine neue Website anzulegen. Beide trügen dann dieselben Kontaktwege und dasselbe Sitzungs-Geheimnis — der eine Kunde könnte die Seite des anderen bearbeiten. `regoro serve` erkennt das und schaltet den Editor **beider** Seiten ab, mit einer Meldung im Log; die Websites bleiben online. Richtig ist: Ordner ohne `.regoro/` anlegen und `regoro init` darin ausführen.
 
 Alternativ per Docker – siehe `Dockerfile` (Site als Volume mounten; `init` einmalig im gemounteten Ordner ausführen, damit die Auth-Datei zur Laufzeit vorliegt und **nicht** ins Image gebacken wird).
 
@@ -221,9 +267,9 @@ Die Versionshistorie (`.git`) bleibt dabei erhalten — **jede Speicherung im Ed
 
 ## Weitere CLI-Optionen
 
-Die CLI kennt außerdem `regoro init <site> --password-stdin` (Passwort aus stdin, für Skripte/Docker) und `--force`.
+Die CLI kennt außerdem `regoro init <site> --stdin` (Kontaktwege aus stdin, eine je Zeile, für Skripte/Docker) und `--force`.
 
-`init` bricht ab, wenn die Site bereits eine `.regoro/auth.json` hat oder der Ordner keine top-level `*.html` enthält — beides schützt davor, versehentlich den falschen Ordner zu initialisieren oder ein bestehendes Passwort zu überschreiben. `--force` hebt beide Guards auf; bei bestehender Auth-Datei setzt es das Passwort neu und macht **alle laufenden Sessions ungültig** (das Cookie-Secret wird mit erneuert).
+`init` bricht ab, wenn die Site bereits eine `.regoro/auth.json` hat oder der Ordner keine top-level `*.html` enthält — beides schützt davor, versehentlich den falschen Ordner zu initialisieren oder eine bestehende Einrichtung zu überschreiben. `--force` hebt beide Guards auf; bei bestehender Auth-Datei erneuert es das Cookie-Secret und macht damit **alle laufenden Sitzungen ungültig**. Zum bloßen Hinzufügen oder Entfernen eines Kontaktwegs ist `regoro kennung` der richtige Befehl — es rührt das Secret nicht an.
 
 ## Sicherheit
 
@@ -231,12 +277,14 @@ Die CLI kennt außerdem `regoro init <site> --password-stdin` (Passwort aus stdi
 - Uploads: Größenlimit + Magic-Byte-Prüfung, SVG blockiert (XSS), sicher generierte Dateinamen. Schreibpfade sind **symlink-sicher** (realpath-Containment, fail-closed) – auch Save/Restore.
 - Optimistisches Locking (fileHash) verhindert das Überschreiben zwischenzeitlicher Änderungen.
 - Alle Editor-Antworten sind `noindex`/`no-store`.
+- Kein Passwort, also auch kein Passwort zum Erraten. Der Einmalcode ist sechsstellig, gilt 5 Minuten und verträgt 5 Fehleingaben — 10⁶ Möglichkeiten bleiben damit unerreichbar. Codes und Bremszähler leben nur im Arbeitsspeicher und stehen in keinem Log.
 
 ## Was v1 (noch) nicht kann
 
 - Nur Top-Level-`*.html` sind editierbar (keine verschachtelten Pfade).
 - Kein Layout-/Strukturbau, keine neuen Seiten, keine Benutzer-/Rollenverwaltung.
-- Keine Benutzerverwaltung im Sammelbetrieb: jede Website behält ihr eigenes Passwort in ihrem eigenen Ordner.
+- Keine Benutzerverwaltung: jede Website hat ihre eigenen Kontaktwege in ihrem eigenen Ordner, und wer das Telefon oder das Postfach hat, hat den Zugang.
+- Kein Selbstbedienungs-Wechsel der Nummer — die hinterlegt der Betreiber. Sonst könnte sich jemand mit einer eigenen Nummer selbst eintragen.
 
 ## Entwicklung
 

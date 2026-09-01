@@ -3,21 +3,33 @@
  * regoro — CLI-Entrypoint für den Inline-Editor.
  *
  * Befehle:
- *   regoro init [siteDir] [--password-stdin] [--force]
- *       Legt <siteDir>/.regoro/auth.json (argon2id-Hash + HMAC-Secret, Mode 0600,
- *       git-ignoriert) an und initialisiert ein git-Repo im siteDir (Versionen pro Site).
- *       Ohne siteDir: aktuelles Verzeichnis.
+ *   regoro init [siteDir] --nummer <n> | --email <a> [...] [--stdin] [--force]
+ *       Legt <siteDir>/.regoro/auth.json (hinterlegte Kontaktwege + HMAC-Secret,
+ *       Mode 0600, git-ignoriert) an und initialisiert ein git-Repo im siteDir
+ *       (Versionen pro Site). Ohne siteDir: aktuelles Verzeichnis.
+ *   regoro kennung [siteDir] --add <k> | --remove <k> | --list
+ *       Kontaktwege pflegen, ohne laufende Sitzungen zu beenden.
  *   regoro <siteDir>   bzw.   regoro run [siteDir]
  *       Startet den Editor-Host für <siteDir> (Auth aus <siteDir>/.regoro/auth.json).
  *   regoro disable [siteDir] [--purge]
  *       Entfernt .regoro/ → Editor aus (fail-closed). Site bleibt. --purge löscht
  *       zusätzlich .git, aber nur ohne gespeicherte Bearbeitungen.
  *
- * Auth-Modell: gehashte Datei im Site-Root (fail-closed). KEIN Env-Passwort.
+ * Auth-Modell: hinterlegte Kontaktwege im Site-Root (fail-closed). Kein Passwort —
+ * der Nachweis ist ein Einmalcode per SMS oder E-Mail.
  */
-import { existsSync, statSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, statSync, rmSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
-import { AUTH_DIR_NAME, authFilePath, createAuthFile, ensureGitignore } from "./auth.ts";
+import {
+  AUTH_DIR_NAME,
+  alleKennungen,
+  authFilePath,
+  createAuthFile,
+  ensureGitignore,
+  pruefeAuthDatei,
+  schreibeKennungen,
+} from "./auth.ts";
+import { maskiereKennung, normalisiereKennung } from "./kennung.ts";
 import { countCommits, ensureRepo, shellQuote } from "./git.ts";
 import { startServer } from "./server.ts";
 import { listPageFiles, listSites } from "./sites.ts";
@@ -42,11 +54,15 @@ export const VERSION = "0.2.0";
 const USAGE = `regoro — Inline-Editor
 
 Verwendung:
-  regoro init [siteDir] [--password-stdin] [--force]
-                                  Auth-Datei + git-Repo anlegen
+  regoro init [siteDir] --nummer <n> | --email <a> [...] [--stdin] [--force]
+                                  Auth-Datei + git-Repo anlegen. Mindestens ein
+                                  Kontaktweg; mehrfach möglich.
+  regoro kennung [siteDir] --add <k> | --remove <k> | --list
+                                  Kontaktwege pflegen (ohne Sitzungen zu beenden)
   regoro <siteDir>                Editor für <siteDir> starten
-  regoro run [siteDir]            (identisch zu obigem)
-  regoro serve <sitesRoot> [--port n]
+  regoro run [siteDir] [--versand-config <pfad>]
+                                  (identisch zu obigem)
+  regoro serve <sitesRoot> [--port n] [--versand-config <pfad>]
                                   Sammelbetrieb: alle Websites unter <sitesRoot>
                                   in EINEM Prozess. Jeder Unterordner heißt wie
                                   seine Domain; der Host-Header entscheidet.
@@ -59,17 +75,20 @@ Verwendung:
   regoro --version                Version ausgeben
 
 siteDir ist optional und meint ohne Angabe das aktuelle Verzeichnis.
---force überschreibt eine bestehende Auth-Datei (= Passwort neu setzen; alle
-laufenden Sessions werden ungültig).
+--force überschreibt eine bestehende Auth-Datei. Dabei entsteht ein NEUES
+Secret, alle laufenden Sitzungen werden ungültig — das ist der Weg, jemanden
+sofort auszusperren.
 
 Beispiel:
-  cd ./site && regoro init      # im Site-Ordner
-  regoro init ./site            # oder mit Pfad
+  regoro init ./site --nummer 0151 20464812 --email chef@firma.de
+  regoro kennung ./site --list
   regoro ./site                 # → http://localhost:8788/edit/login
   regoro serve /srv/sites       # alle Kundenwebsites in einem Prozess
 
 Umgebung:
   PORT                   Editor-Port (default 8788)
+  REGORO_VERSAND_CONFIG  Pfad zur Versand-Konfiguration
+                         (default /etc/regoro/versand.json)
   EDITOR_INSECURE_COOKIE =1 lässt das Cookie-Secure-Flag weg. NUR nötig, wenn du
                          den Editor über HTTP unter einem anderen Namen als
                          localhost erreichst (LAN-IP, Hostname). Über
@@ -124,87 +143,85 @@ function requireDir(siteDir = "."): string {
 }
 
 /**
- * Liest ein Passwort versteckt vom TTY (kein Echo) — verlangt Eingabe + Bestätigung.
- * Lehnt leere Passwörter ab. Ohne TTY → Hinweis auf --password-stdin.
+ * Zerlegt die Argumente von `init` in Positionals und Kontaktwege.
+ *
+ * Flag und Wert werden **paarweise** herausgeschnitten. Die naheliegende
+ * Abkürzung — „alles, was wie eine Telefonnummer aussieht, ist ein Wert" —
+ * war ein echter Fehler: `regoro init 12345678 --nummer 0151…` hielt den
+ * Ordnernamen `12345678` für eine Nummer, warf ihn weg und richtete
+ * stillschweigend das aktuelle Verzeichnis ein. Nachgestellt, exit 0.
  */
-async function promptPasswordHidden(): Promise<string> {
-  if (!process.stdin.isTTY) {
-    fail("kein TTY für interaktive Eingabe — nutze --password-stdin");
+function zerlegeInitArgumente(args: string[]): { positional: string[]; roh: string[] } {
+  const positional: string[] = [];
+  const roh: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg === "--nummer" || arg === "--email") {
+      const wert = args[++i];
+      if (wert === undefined) fail(`${arg} braucht einen Wert`);
+      roh.push(wert);
+      continue;
+    }
+    if (arg.startsWith("--")) continue; // schaltende Flags, von checkFlags geprüft
+    positional.push(arg);
   }
-  const readHidden = (label: string): Promise<string> =>
-    new Promise<string>((resolvePw, reject) => {
-      const stdin = process.stdin;
-      process.stdout.write(label);
-      let buf = "";
-      const onData = (chunk: Buffer) => {
-        const s = chunk.toString("utf8");
-        for (const ch of s) {
-          if (ch === "\n" || ch === "\r") {
-            cleanup();
-            process.stdout.write("\n");
-            resolvePw(buf);
-            return;
-          }
-          if (ch === "") {
-            // Ctrl-C
-            cleanup();
-            process.stdout.write("\n");
-            reject(new Error("abgebrochen"));
-            return;
-          }
-          if (ch === "" || ch === "\b") {
-            // Backspace
-            buf = buf.slice(0, -1);
-            continue;
-          }
-          buf += ch;
-        }
-      };
-      const cleanup = () => {
-        stdin.removeListener("data", onData);
-        if (stdin.isTTY) stdin.setRawMode(false);
-        stdin.pause();
-      };
-      if (stdin.isTTY) stdin.setRawMode(true);
-      stdin.resume();
-      stdin.on("data", onData);
-    });
-
-  const pw = (await readHidden("Passwort: ")).trim();
-  if (!pw) fail("leeres Passwort ist nicht zulässig");
-  const confirm = (await readHidden("Passwort bestätigen: ")).trim();
-  if (pw !== confirm) fail("Passwörter stimmen nicht überein");
-  return pw;
+  return { positional, roh };
 }
 
-/** Beschafft das Passwort: --password-stdin (stdin) oder interaktiver TTY-Prompt. */
-async function obtainPassword(passwordStdin: boolean): Promise<string> {
-  if (passwordStdin) {
-    const pw = (await Bun.stdin.text()).trim();
-    if (!pw) fail("leeres Passwort über stdin (--password-stdin)");
-    return pw;
+/**
+ * Normalisiert und entdoppelt die Kontaktwege; mit `--stdin` zusätzlich aus der
+ * Standardeingabe (eine Kennung je Zeile). Bricht bei einer unbrauchbaren
+ * Eingabe ab, statt sie stillschweigend zu schlucken — eine verschluckte Nummer
+ * heißt: der Kunde kommt nicht hinein.
+ */
+function pruefeKennungen(roh: string[], stdinLesen: boolean): string[] {
+  const alle = [...roh];
+  if (stdinLesen) {
+    const text = readFileSync(0, "utf8");
+    for (const zeile of text.split("\n")) {
+      const t = zeile.trim();
+      if (t) alle.push(t);
+    }
   }
-  return promptPasswordHidden();
+  const fertig: string[] = [];
+  for (const r of alle) {
+    const k = normalisiereKennung(r);
+    if (k === null) {
+      fail(
+        `unbrauchbarer Kontaktweg: ${r}\n` +
+          "  Erwartet: eine Telefonnummer (0151 20464812, +4915120464812)\n" +
+          "  oder eine E-Mail-Adresse (name@firma.de).",
+      );
+    }
+    if (!fertig.includes(k.wert)) fertig.push(k.wert);
+  }
+  return fertig;
 }
 
 async function cmdInit(args: string[]): Promise<void> {
-  checkFlags("init", args, ["--password-stdin", "--force"]);
-  const positional = args.filter((a) => !a.startsWith("--"));
-  const passwordStdin = args.includes("--password-stdin");
+  checkFlags("init", args, ["--nummer", "--email", "--stdin", "--force"]);
+  const { positional, roh } = zerlegeInitArgumente(args);
+  if (positional.length > 1) {
+    fail(
+      `zu viele Verzeichnisse für \`init\`: ${positional.join(", ")}\n` +
+        "  init nimmt genau EINEN Site-Ordner.",
+    );
+  }
+  const kennungen = pruefeKennungen(roh, args.includes("--stdin"));
   const force = args.includes("--force");
   const siteDirArg = positional[0] ?? ".";
   const siteDir = requireDir(siteDirArg);
 
-  // Zielordner nennen, BEVOR nach dem Passwort gefragt wird — bei `init` ohne
+  // Zielordner nennen, BEVOR irgendetwas geschrieben wird — bei `init` ohne
   // Argument (= cwd) ist der Pfad sonst nirgends sichtbar.
   console.log(`Site-Verzeichnis: ${siteDir}`);
 
   // Guard 1: nicht versehentlich eine bestehende Site neu initialisieren.
-  // createAuthFile überschreibt sonst Hash UND Secret — Passwort weg, Sessions tot.
+  // createAuthFile überschreibt sonst Kontaktwege UND Secret — Sitzungen tot.
   if (existsSync(authFilePath(siteDir)) && !force) {
     fail(
       `bereits initialisiert: ${authFilePath(siteDir)}\n` +
-        "  Zum Neusetzen des Passworts: regoro init --force " +
+        "  Zum Neueinrichten: regoro init --force " +
         `${siteDirArg}\n  (macht alle laufenden Sessions ungültig)`,
     );
   }
@@ -230,30 +247,119 @@ async function cmdInit(args: string[]): Promise<void> {
   //      beim ersten Save committen und den bereits editierten Stand als
   //      "Baseline" ausgeben. Zu diesem Zeitpunkt existiert auth.json noch NICHT,
   //      das Secret kann also gar nicht in den Commit geraten.
-  //   3. Passwort abfragen und auth.json schreiben — als LETZTES.
+  //   3. auth.json schreiben — als LETZTES.
   //
   // Der Grund für 3 zuletzt: git kann fehlschlagen (z.B. "dubious ownership",
   // wenn der Site-Ordner einem anderen User gehört). Früher lief createAuthFile
-  // zuerst — dann lag ein nutzloses Passwort im Ordner, und der "bereits
+  // zuerst — dann lag eine nutzlose Auth-Datei im Ordner, und der "bereits
   // initialisiert"-Guard blockierte den Wiederholungsversuch. Jetzt scheitert
   // init, bevor der Nutzer überhaupt tippt, und ein zweiter Anlauf funktioniert.
+  if (kennungen.length === 0) {
+    fail(
+      "kein Kontaktweg angegeben.\n" +
+        "  Der Kunde meldet sich mit einem Code an, der an seine Nummer oder Adresse geht.\n" +
+        "  Beispiel: regoro init --nummer 0151 20464812 --email chef@firma.de\n" +
+        "  (mehrfach möglich; --stdin liest je eine Kennung pro Zeile)",
+    );
+  }
+
   ensureGitignore(siteDir);
   ensureRepo(siteDir);
 
-  if (!passwordStdin) console.log(""); // Abstand vor dem interaktiven Prompt
-  const password = await obtainPassword(passwordStdin);
-  const { path } = await createAuthFile(siteDir, password);
+  const { path } = await createAuthFile(siteDir, kennungen);
 
   console.log("");
   console.log("Auth-Datei angelegt:");
   console.log(`  ${path}`);
   console.log("  (Mode 0600, git-ignoriert über .regoro/ — niemals committen/ausliefern)");
   console.log("");
+  console.log(`Hinterlegte Kontaktwege (${kennungen.length}):`);
+  for (const k of kennungen) console.log(`  ${k}`);
+  console.log("");
   console.log("git-Repo im Site-Verzeichnis bereit (jede Speicherung = eine Version).");
   console.log("");
   console.log("Editor starten:");
   console.log(siteDirArg === "." ? "  regoro run" : `  regoro run ${siteDirArg}`);
   console.log("Dann im Browser /edit (bzw. /edit/login) öffnen.");
+}
+
+/**
+ * `regoro kennung [siteDir] --add <k> | --remove <k> | --list`
+ *
+ * Pflegt die hinterlegten Kontaktwege. Rührt das Secret NICHT an — eine
+ * hinzugefügte Nummer soll nicht alle laufenden Sitzungen beenden. Wer sofort
+ * aussperren will, nimmt `regoro init --force`.
+ */
+function cmdKennung(args: string[]): void {
+  checkFlags("kennung", args, ["--add", "--remove", "--list"]);
+  // Flag und Wert paarweise herausschneiden, nicht nach Textgleichheit filtern
+  // — sonst verschluckt ein Ordnername, der wie eine Kennung aussieht, das Ziel.
+  const aktionen: Array<{ art: "add" | "remove"; wert: string }> = [];
+  const positional: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "--add" || a === "--remove") {
+      const wert = args[++i];
+      if (wert === undefined) fail(`${a} braucht einen Wert`);
+      aktionen.push({ art: a === "--add" ? "add" : "remove", wert });
+      continue;
+    }
+    if (a.startsWith("--")) continue;
+    positional.push(a);
+  }
+  if (positional.length > 1) {
+    fail(`zu viele Verzeichnisse für \`kennung\`: ${positional.join(", ")}`);
+  }
+  const siteDir = requireDir(positional[0] ?? ".");
+
+  const befund = pruefeAuthDatei(siteDir);
+  if (befund.art === "veraltet") {
+    fail(
+      `${authFilePath(siteDir)} ist im alten Passwort-Format.\n` +
+        "  Es gibt kein Passwort mehr. Neu einrichten:\n" +
+        `  regoro init --force ${positional[0] ?? "."} --nummer <nummer-oder-mail>`,
+    );
+  }
+  if (befund.art !== "ok") {
+    fail(
+      befund.art === "fehlt"
+        ? `keine Auth-Datei in ${siteDir} — zuerst \`regoro init\` ausführen`
+        : `${authFilePath(siteDir)} ist unbrauchbar: ${befund.grund}`,
+    );
+  }
+
+  const vorher = alleKennungen(befund.auth);
+  if (aktionen.length === 0 || args.includes("--list")) {
+    console.log(`Hinterlegte Kontaktwege (${vorher.length}) in ${siteDir}:`);
+    // Verkürzt: eine Betreiber-Ausgabe ist kein Ort für vollständige
+    // Rufnummern und Adressen — sie landet in Logs und Screenshots.
+    for (const k of vorher) console.log(`  ${maskiereKennung(k)}`);
+    if (aktionen.length === 0) return;
+  }
+
+  let nachher = [...vorher];
+  for (const aktion of aktionen) {
+    const k = normalisiereKennung(aktion.wert);
+    if (k === null) fail(`unbrauchbarer Kontaktweg: ${aktion.wert}`);
+    if (aktion.art === "add") {
+      if (!nachher.includes(k.wert)) nachher.push(k.wert);
+    } else {
+      if (!nachher.includes(k.wert)) fail(`nicht hinterlegt: ${maskiereKennung(k.wert)}`);
+      nachher = nachher.filter((x) => x !== k.wert);
+    }
+  }
+  if (nachher.length === 0) {
+    fail(
+      "das wäre der letzte Kontaktweg — danach käme niemand mehr hinein.\n" +
+        "  Zum Abschalten des Editors: regoro disable",
+    );
+  }
+
+  schreibeKennungen(siteDir, nachher);
+  console.log(`Hinterlegte Kontaktwege (${nachher.length}):`);
+  for (const k of nachher) console.log(`  ${maskiereKennung(k)}`);
+  console.log("");
+  console.log("Laufende Sitzungen bleiben gültig. Sofort aussperren: regoro init --force");
 }
 
 /**
@@ -326,6 +432,12 @@ function cmdDisable(args: string[]): void {
     console.log(`  git-Repo bleibt erhalten (${commits} Version${commits === 1 ? "" : "en"}).`);
   }
 
+  console.log("");
+  // Deutsche Rufnummern werden nach Abschaltung wieder vergeben. Eine Nummer,
+  // die auf der Liste steht und den Besitzer wechselt, ist ein Zugang, der den
+  // Besitzer wechselt — deshalb gehört das Entfernen in den Ablauf beim Kundenende.
+  console.log("Beim Kundenende: die hinterlegten Kontaktwege gehören mit entfernt.");
+  console.log("Rufnummern werden nach Abschaltung wieder vergeben.");
   console.log("");
   console.log("Wieder einschalten:");
   console.log(siteDirArg === "." ? "  regoro init" : `  regoro init ${siteDirArg}`);
@@ -454,7 +566,7 @@ function cmdService(args: string[]): void {
  * Eine Website abschalten: `regoro disable`. Ebenfalls kein Neustart.
  */
 function cmdServe(args: string[]): void {
-  checkFlags("serve", args, ["--port"]);
+  checkFlags("serve", args, ["--port", "--versand-config"]);
 
   // Flag und Wert PAARWEISE herausschneiden, nicht nach Textgleichheit filtern.
   // Ein Filter `a !== portRaw` verschluckt sonst `serve 8080 --port 8080` — beide
@@ -462,6 +574,7 @@ function cmdServe(args: string[]): void {
   // zweites `--port` landete unbemerkt in den Positionals.
   const positional: string[] = [];
   let portRaw: string | undefined;
+  let versandConfig: string | undefined;
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!;
     if (arg === "--port") {
@@ -469,6 +582,12 @@ function cmdServe(args: string[]): void {
       const value = args[++i];
       if (value === undefined) fail("--port braucht einen Wert, z.B. --port 8788");
       portRaw = value;
+      continue;
+    }
+    if (arg === "--versand-config") {
+      const value = args[++i];
+      if (value === undefined) fail("--versand-config braucht einen Pfad");
+      versandConfig = value;
       continue;
     }
     positional.push(arg);
@@ -533,19 +652,32 @@ function cmdServe(args: string[]): void {
     for (const e of unerreichbar) console.log(`  ${e.name}`);
   }
 
-  const { port: actual } = startServer({ sitesRoot, port });
+  const { port: actual } = startServer({ sitesRoot, port, versandConfig });
   console.log(
     `Regoro Editor läuft auf Port ${actual} — welche Website, entscheidet der Host-Header.`,
   );
 }
 
-function cmdRun(siteDirArg?: string): void {
-  const siteDir = requireDir(siteDirArg);
+function cmdRun(args: string[]): void {
+  checkFlags("run", args, ["--versand-config"]);
+  let versandConfig: string | undefined;
+  const positional: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--versand-config") {
+      const value = args[++i];
+      if (value === undefined) fail("--versand-config braucht einen Pfad");
+      versandConfig = value;
+      continue;
+    }
+    positional.push(args[i]!);
+  }
+  const siteDir = requireDir(positional[0]);
   const port = Number(process.env.PORT ?? 8788);
   const { port: actual } = startServer({
     siteDir,
     repoRoot: siteDir, // repoRoot = siteDir → pages top-level (sitePrefix="")
     port,
+    versandConfig,
   });
   console.log(`Regoro Editor läuft auf http://localhost:${actual}/edit/login`);
 }
@@ -572,11 +704,15 @@ async function main(): Promise<void> {
     return;
   }
   if (cmd === "run") {
-    cmdRun(rest[0]); // ohne Pfad: cwd
+    cmdRun(rest); // ohne Pfad: cwd
     return;
   }
   if (cmd === "serve") {
     cmdServe(rest);
+    return;
+  }
+  if (cmd === "kennung") {
+    cmdKennung(rest);
     return;
   }
   if (cmd === "disable") {
@@ -591,7 +727,7 @@ async function main(): Promise<void> {
   // Ein nacktes `regoro` bleibt bewusst die Usage-Ausgabe (siehe Guard oben)
   // statt still die cwd zu starten — sonst gäbe es keinen Weg mehr zur Hilfe.
   if (cmd.startsWith("--")) usageExit();
-  cmdRun(cmd);
+  cmdRun(argv);
 }
 
 // Nur ausführen, wenn direkt gestartet (`regoro …`), nicht beim Import. Ohne

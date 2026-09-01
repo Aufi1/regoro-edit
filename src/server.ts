@@ -15,7 +15,8 @@
 import { join, relative, resolve, sep } from "node:path";
 import { existsSync } from "node:fs";
 import { handleEditorRequest, isEditorPath, notFound, type HostCtx } from "./host.ts";
-import { authFilePath, loadAuthFile } from "./auth.ts";
+import { authFilePath, loadAuthFile, pruefeAuthDatei } from "./auth.ts";
+import { ladeVersand, type Versand } from "./versand.ts";
 // Seiten-Ermittlung wohnt in sites.ts — sie gehört zur Website, nicht zum Server.
 import { buildCtx, discoverPages, erstelleSecretWache, resolveSite } from "./sites.ts";
 
@@ -37,6 +38,10 @@ interface SingleSiteOptions {
   pageWhitelist?: string[];
   port?: number;
   sitesRoot?: undefined;
+  /** Abweichender Pfad zu versand.json (Tests, lokales Ausprobieren). */
+  versandConfig?: string;
+  /** Direkt gesetzter Versand — hat Vorrang vor versandConfig (Tests). */
+  versand?: Versand | null;
 }
 
 interface MultiSiteOptions {
@@ -45,6 +50,8 @@ interface MultiSiteOptions {
   siteDir?: undefined;
   repoRoot?: undefined;
   pageWhitelist?: undefined;
+  versandConfig?: string;
+  versand?: Versand | null;
 }
 
 /** Genau eines von `siteDir` (Einzel-) und `sitesRoot` (Sammelbetrieb). */
@@ -53,10 +60,32 @@ export type ServerOptions = SingleSiteOptions | MultiSiteOptions;
 type Handler = (req: Request, url: URL) => Response | Promise<Response>;
 
 /**
+ * Lädt den Versand einmal beim Start. Eine kaputte Konfiguration bricht den
+ * Server NICHT ab — die Websites sollen weiterlaufen —, aber sie steht laut im
+ * Log, und ohne Versand ist keine Anmeldung möglich (fail-closed).
+ */
+function ladeVersandSicher(opts: ServerOptions): Versand | null {
+  if (opts.versand !== undefined) return opts.versand;
+  try {
+    const v = ladeVersand(opts.versandConfig);
+    if (v === null) {
+      console.warn(
+        "[regoro] Kein Versand eingerichtet — eine Anmeldung ist nicht möglich. " +
+          "Einrichten: /etc/regoro/versand.json (siehe README).",
+      );
+    }
+    return v;
+  } catch (err) {
+    console.error(`[regoro] Versand-Konfiguration unbrauchbar: ${err instanceof Error ? err.message : err}`);
+    return null;
+  }
+}
+
+/**
  * Einzelbetrieb: HostCtx einmalig beim Start. Unverändertes Verhalten —
  * inklusive des Kill-Switches, der `regoro disable` sofort wirken lässt.
  */
-function singleSiteHandler(opts: SingleSiteOptions): Handler {
+function singleSiteHandler(opts: SingleSiteOptions, versand: Versand | null): Handler {
   const pageWhitelist = opts.pageWhitelist ?? discoverPages(opts.siteDir);
 
   // git-Pfad-Präfix der Seiten relativ zum repoRoot (posix-normalisiert).
@@ -64,11 +93,26 @@ function singleSiteHandler(opts: SingleSiteOptions): Handler {
   const rawPrefix = relative(opts.repoRoot, opts.siteDir);
   const sitePrefix = rawPrefix === "" ? "" : rawPrefix.split(sep).join("/");
 
-  const auth = loadAuthFile(opts.siteDir);
-  if (auth === null) {
+  const befund = pruefeAuthDatei(opts.siteDir);
+  const auth = befund.art === "ok" ? befund.auth : null;
+  if (befund.art === "veraltet") {
+    // Klar benennen statt „keine Auth-Datei": Die Datei ist da, sie ist nur aus
+    // der Zeit vor den Einmalcodes. Ein stillschweigender Weiterbetrieb mit
+    // Passwort wäre schlimmer als ein deutlicher Abbruch.
+    console.error(
+      `[regoro] ${authFilePath(opts.siteDir)} ist im alten Passwort-Format — der Editor bleibt aus.\n` +
+        "  Es gibt kein Passwort mehr; der Nachweis ist ein Einmalcode an eine hinterlegte\n" +
+        "  Telefonnummer oder E-Mail-Adresse. Neu einrichten:\n" +
+        `  regoro init --force ${opts.siteDir} --nummer <nummer-oder-mail>`,
+    );
+  } else if (befund.art === "ungueltig") {
+    console.error(
+      `[regoro] ${authFilePath(opts.siteDir)} ist unbrauchbar (${befund.grund}) — der Editor bleibt aus.`,
+    );
+  } else if (befund.art === "fehlt") {
     console.warn(
-      "[regoro-edit] Keine Auth-Datei gefunden — /edit ist deaktiviert (fail-closed → 404). " +
-        "Setup: regoro-edit init <dir>",
+      "[regoro] Keine Auth-Datei gefunden — /edit ist deaktiviert (fail-closed → 404). " +
+        "Einrichten: regoro init <dir> --nummer <nummer-oder-mail>",
     );
   }
 
@@ -78,6 +122,7 @@ function singleSiteHandler(opts: SingleSiteOptions): Handler {
     pageWhitelist,
     auth,
     sitePrefix,
+    versand,
   };
 
   return (req, url) => {
@@ -101,7 +146,7 @@ function singleSiteHandler(opts: SingleSiteOptions): Handler {
  * Einen eigenen Kill-Switch braucht dieser Zweig nicht: `buildCtx` liest
  * `auth.json` pro Anfrage, `regoro disable` wirkt dadurch von selbst sofort.
  */
-function multiSiteHandler(sitesRootRaw: string): Handler {
+function multiSiteHandler(sitesRootRaw: string, versand: Versand | null): Handler {
   const sitesRoot = resolve(sitesRootRaw);
   // Zwei Ordner mit demselben Sitzungs-Geheimnis sind ein Betriebsfehler und
   // heben die Kundentrennung auf. Die Wache sieht das Sammelverzeichnis reihum
@@ -116,14 +161,17 @@ function multiSiteHandler(sitesRootRaw: string): Handler {
     }
     const site = resolveSite(sitesRoot, req.headers.get("host"));
     if (site === null) return notFound();
-    return handleEditorRequest(req, url, buildCtx(site, wache));
+    return handleEditorRequest(req, url, buildCtx(site, wache, versand));
   };
 }
 
 export function startServer(opts: ServerOptions): { port: number } {
   const port = opts.port ?? Number(process.env.PORT ?? 8788);
+  const versand = ladeVersandSicher(opts);
   const handler =
-    opts.sitesRoot !== undefined ? multiSiteHandler(opts.sitesRoot) : singleSiteHandler(opts);
+    opts.sitesRoot !== undefined
+      ? multiSiteHandler(opts.sitesRoot, versand)
+      : singleSiteHandler(opts, versand);
 
   const server = Bun.serve({
     port,

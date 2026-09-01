@@ -15,9 +15,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 // --- Auth-Env VOR allen Host/Auth-Imports setzen ---------------------------
-const TEST_PASSWORD = "testpw";
 const TEST_SECRET = "testsecret-aaaaaaaaaaaaaaaaaaaaaaaa";
-const TEST_AUTH = { hash: await (await import("./auth.ts")).hashPassword(TEST_PASSWORD), secret: TEST_SECRET };
+const TEST_NUMMER = "+4915120464812";
+const TEST_AUTH = { nummern: [TEST_NUMMER], emails: [], secret: TEST_SECRET };
 
 // Pfad zur echten site/ im Repo (Read-only Quelle für Fixtures).
 const REPO_ROOT = join(import.meta.dir, "..");
@@ -341,9 +341,18 @@ describe("host.ts — handleEditorRequest Integration", () => {
     host = await import("./host.ts");
   });
 
-  beforeEach(() => {
+  let versand: import("./versand.ts").Attrappe;
+
+  beforeEach(async () => {
     const fx = makeSiteRepoFixture(git);
-    ctx = { repoRoot: fx.repoRoot, siteDir: fx.siteDir, pageWhitelist: PAGE_WHITELIST, auth: TEST_AUTH };
+    versand = (await import("./versand.ts")).attrappenVersand();
+    ctx = {
+      repoRoot: fx.repoRoot,
+      siteDir: fx.siteDir,
+      pageWhitelist: PAGE_WHITELIST,
+      auth: TEST_AUTH,
+      versand,
+    };
   });
 
   // --- kleine HTTP-Helfer ---
@@ -359,39 +368,68 @@ describe("host.ts — handleEditorRequest Integration", () => {
     return sc.split(";")[0]!; // "regoro_edit=<token>"
   }
 
-  async function login(): Promise<string> {
+  /** Zweistufige Anmeldung: Kennung eintragen, Code aus der Attrappe abtippen. */
+  async function login(returnTo?: string): Promise<string> {
+    const feld = (extra = "") =>
+      `kennung=${encodeURIComponent(TEST_NUMMER)}&weg=sms${returnTo ? `&return=${encodeURIComponent(returnTo)}` : ""}${extra}`;
+    await call("POST", "/edit/login", {
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: feld(),
+    });
+    const code = versand.gesendet.at(-1)?.code;
+    if (!code) throw new Error("kein Code verschickt");
     const res = await call("POST", "/edit/login", {
       headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: "password=" + encodeURIComponent(TEST_PASSWORD),
+      body: feld(`&code=${code}`),
     });
     const cookie = cookieFromSetCookie(res);
-    if (!cookie) throw new Error("Login lieferte kein Cookie");
+    if (!cookie) throw new Error(`Login lieferte kein Cookie (Status ${res.status})`);
     return cookie;
   }
 
+  /** Nur die zweite Stufe, für Tests, die die Weiterleitung prüfen. */
+  async function loginAntwort(returnTo?: string): Promise<Response> {
+    const feld = (extra = "") =>
+      `kennung=${encodeURIComponent(TEST_NUMMER)}&weg=sms${returnTo ? `&return=${encodeURIComponent(returnTo)}` : ""}${extra}`;
+    await call("POST", "/edit/login", {
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: feld(),
+    });
+    const code = versand.gesendet.at(-1)!.code;
+    return call("POST", "/edit/login", {
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: feld(`&code=${code}`),
+    });
+  }
+
   // --- Login ---
-  test("GET /edit/login → 200 HTML-Formular", async () => {
+  test("GET /edit/login → 200 mit beiden Reitern und ohne Passwortfeld", async () => {
     const res = await call("GET", "/edit/login");
     expect(res.status).toBe(200);
     const body = await res.text();
-    expect(body.toLowerCase()).toContain("password");
+    expect(body).toContain("Telefonnummer");
+    expect(body).toContain("E-Mail");
+    // Der Satz "Ein Passwort brauchst du nicht" darf stehen — ein FELD nicht.
+    expect(body).not.toContain('type="password"');
+    expect(body).not.toContain('name="password"');
   });
 
-  test("POST /edit/login korrektes Passwort → Set-Cookie regoro_edit + 302", async () => {
-    const res = await call("POST", "/edit/login", {
-      headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: "password=" + encodeURIComponent(TEST_PASSWORD),
-    });
+  test("richtiger Code → Set-Cookie regoro_edit + 302", async () => {
+    const res = await loginAntwort();
     const sc = res.headers.get("set-cookie") ?? "";
     expect(sc).toContain("regoro_edit=");
     expect(sc).toContain("HttpOnly");
     expect(res.status).toBe(302);
   });
 
-  test("POST /edit/login falsches Passwort → KEIN Cookie", async () => {
+  test("falscher Code → KEIN Cookie", async () => {
+    await call("POST", "/edit/login", {
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: `kennung=${encodeURIComponent(TEST_NUMMER)}&weg=sms`,
+    });
     const res = await call("POST", "/edit/login", {
       headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: "password=" + encodeURIComponent("falsch"),
+      body: `kennung=${encodeURIComponent(TEST_NUMMER)}&weg=sms&code=000000`,
     });
     expect(res.headers.get("set-cookie")).toBeNull();
     expect(res.status).not.toBe(302);
@@ -652,16 +690,16 @@ describe("host.ts — handleEditorRequest Integration", () => {
 // ===========================================================================
 // Contract B — auth.ts (Cookie-Signatur)
 // ===========================================================================
-describe("auth.ts — Passwort + signiertes Cookie", () => {
+describe("auth.ts — hinterlegte Kennungen + signiertes Cookie", () => {
   let auth: typeof import("./auth.ts");
 
   beforeAll(async () => {
     auth = await import("./auth.ts");
   });
 
-  test("verifyPassword: korrekt true, falsch false", async () => {
-    expect(await auth.verifyPassword(TEST_AUTH, TEST_PASSWORD)).toBe(true);
-    expect(await auth.verifyPassword(TEST_AUTH, "falsch")).toBe(false);
+  test("kennungHinterlegt: hinterlegt true, fremd false", () => {
+    expect(auth.kennungHinterlegt(TEST_AUTH, TEST_NUMMER)).toBe(true);
+    expect(auth.kennungHinterlegt(TEST_AUTH, "+4917000000000")).toBe(false);
   });
 
   test("issueCookie erzeugt Set-Cookie mit regoro_edit/HttpOnly/SameSite", () => {

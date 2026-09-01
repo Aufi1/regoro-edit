@@ -13,12 +13,16 @@ import overlayAsset from "./overlay.client.js" with { type: "file" };
 import {
   useSecureCookie,
   isTrustworthyOrigin,
-  verifyPassword,
   issueCookie,
   checkCookie,
   readCookieTokens,
+  kennungHinterlegt,
   type AuthConfig,
 } from "./auth.ts";
+import { maskiereKennung, normalisiereKennung, type Kanal } from "./kennung.ts";
+import { erzeugeCode, merkeCode, pruefeCode } from "./codes.ts";
+import { pruefeBremse, wartezeitText } from "./bremse.ts";
+import type { Versand } from "./versand.ts";
 import { renderEditView, renderVersionPreview } from "./serve.ts";
 // PAGE_RE wohnt in sites.ts, damit Whitelist-Erzeugung und Auflösung nicht driften.
 import { PAGE_RE } from "./sites.ts";
@@ -38,6 +42,12 @@ export interface HostCtx {
   pageWhitelist: string[];
   auth: AuthConfig | null;
   sitePrefix?: string;
+  /**
+   * Womit der Einmalcode verschickt wird. Fehlt er, ist keine Anmeldung
+   * möglich — fail-closed, wie bei fehlender Auth-Datei. Betreiberweit
+   * eingerichtet (`/etc/regoro/versand.json`), nicht je Website.
+   */
+  versand?: Versand | null;
 }
 
 /**
@@ -193,8 +203,8 @@ function resolvePage(ctx: HostCtx, page: string): { page: string; abs: string } 
 function serveStaticAsset(ctx: HostCtx, urlPath: string): Response | null {
   if (!urlPath || urlPath.includes("\0")) return null;
   // Dotfile-Block (Defense-in-depth): kein Segment darf mit "." beginnen
-  // (.regoro/auth.json, .git/, .env …). Der argon2-Hash darf nie ausgeliefert
-  // werden. urlPath ist bereits dekodiert.
+  // (.regoro/auth.json, .git/, .env …). Weder das Sitzungs-Geheimnis noch die
+  // hinterlegten Kontaktwege dürfen je ausgeliefert werden. urlPath ist bereits dekodiert.
   if (hasDotSegment(urlPath)) return null;
   // Extension-Allowlist (case-insensitive); .html ist bewusst NICHT erlaubt.
   const ext = extname(urlPath).toLowerCase();
@@ -271,32 +281,110 @@ Nutze <strong>HTTPS</strong> (Reverse-Proxy davor), oder für einen kurzen Test:
 Über <code>http://localhost</code> funktioniert es ohne Zutun.</div>`;
 }
 
-function loginForm(error?: string, returnTo?: string | null, warning = ""): string {
-  const returnInput = returnTo
-    ? `<input type="hidden" name="return" value="${escapeAttr(returnTo)}">`
-    : "";
+/** Der gewählte Reiter. Alles Unbekannte fällt auf SMS zurück. */
+function validWeg(roh: unknown): Kanal {
+  return roh === "email" ? "email" : "sms";
+}
+
+const SEITE_CSS = `
+:root{color-scheme:light}
+*{box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;
+background:#14324f;color:#16222e;display:flex;min-height:100vh;align-items:center;
+justify-content:center;margin:0;padding:24px}
+main{background:#fff;padding:36px 32px 32px;border-radius:18px;width:100%;max-width:380px;
+box-shadow:0 10px 40px rgba(0,0,0,.28)}
+h1{font-size:21px;line-height:1.3;margin:0 0 6px;letter-spacing:-.01em}
+p.lead{margin:0 0 22px;color:#5b6b7a;font-size:14px;line-height:1.5}
+.tabs{display:flex;gap:4px;background:#eef1f4;padding:4px;border-radius:11px;margin-bottom:20px}
+.tab{flex:1;text-align:center;padding:9px 8px;border-radius:8px;font-size:14px;
+text-decoration:none;color:#5b6b7a;font-weight:500}
+.tab.active{background:#fff;color:#16222e;box-shadow:0 1px 3px rgba(0,0,0,.12)}
+label{display:block;font-size:13px;font-weight:500;margin-bottom:7px}
+input{width:100%;padding:12px 13px;border:1px solid #d3dae0;border-radius:10px;
+font:inherit;background:#fff}
+input:focus{outline:2px solid #e2571e;outline-offset:-1px;border-color:#e2571e}
+input.code{letter-spacing:.4em;font-size:19px;text-align:center;font-variant-numeric:tabular-nums}
+button{margin-top:18px;width:100%;padding:13px;border:0;border-radius:999px;background:#e2571e;
+color:#fff;font:inherit;font-weight:600;font-size:15px;cursor:pointer}
+button:hover{background:#c94a13}
+.err{color:#b3261e;font-size:13.5px;margin-top:14px;line-height:1.45}
+.hint{color:#5b6b7a;font-size:13px;margin-top:16px;line-height:1.5}
+.hint a{color:#e2571e}
+.warn{background:#fff4e5;border:1px solid #f0b37e;color:#663c00;font-size:12.5px;line-height:1.45;
+padding:11px 13px;border-radius:10px;margin-bottom:18px}
+.warn code{background:#00000010;padding:1px 4px;border-radius:3px;font-size:12px}`;
+
+function seite(titel: string, inhalt: string): string {
   return `<!doctype html><html lang="de"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Regoro Editor — Login</title>
-<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;
-background:#14324f;color:#fff;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:16px}
-form{background:#fff;color:#16222e;padding:28px;border-radius:10px;width:300px;box-shadow:0 8px 28px rgba(0,0,0,.3)}
-h1{font-size:18px;margin:0 0 16px}label{display:block;font-size:13px;margin-bottom:6px}
-input{width:100%;padding:9px;border:1px solid #cbd5dc;border-radius:6px;box-sizing:border-box;font:inherit}
-button{margin-top:14px;width:100%;padding:10px;border:0;border-radius:6px;background:#e2571e;color:#fff;
-font:inherit;font-weight:600;cursor:pointer}.err{color:#c0392b;font-size:13px;margin-top:10px}
-.warn{background:#fff4e5;border:1px solid #f0b37e;color:#663c00;font-size:12.5px;line-height:1.45;
-padding:10px 12px;border-radius:6px;margin-bottom:14px}
-.warn code{background:#00000010;padding:1px 4px;border-radius:3px;font-size:12px}</style></head>
-<body><form method="POST" action="/edit/login">
-<h1>Regoro Editor</h1>
-${warning}
-<label for="password">Passwort</label>
-<input id="password" name="password" type="password" autocomplete="current-password" autofocus>
-${returnInput}
+<title>${titel}</title>
+<style>${SEITE_CSS}</style></head>
+<body><main>${inhalt}</main></body></html>`;
+}
+
+function verstecktesReturn(returnTo?: string | null): string {
+  return returnTo ? `<input type="hidden" name="return" value="${escapeAttr(returnTo)}">` : "";
+}
+
+/**
+ * Stufe 1 — Kontaktweg eingeben.
+ *
+ * Die Reiter sind LINKS, kein JavaScript: Die Anmeldeseite ist die einzige
+ * Route ohne Auth-Wall und soll ohne ein einziges Skript auskommen.
+ */
+function loginFormKennung(
+  weg: Kanal,
+  opts: { error?: string; returnTo?: string | null; warning?: string } = {},
+): string {
+  const q = opts.returnTo ? `&return=${encodeURIComponent(opts.returnTo)}` : "";
+  const tab = (k: Kanal, beschriftung: string) =>
+    `<a class="tab${weg === k ? " active" : ""}" href="/edit/login?weg=${k}${q}">${beschriftung}</a>`;
+  const istSms = weg === "sms";
+  return seite(
+    "Anmelden",
+    `<h1>Website bearbeiten</h1>
+<p class="lead">Wir schicken dir einen Code. Ein Passwort brauchst du nicht.</p>
+${opts.warning ?? ""}
+<div class="tabs">${tab("sms", "Telefonnummer")}${tab("email", "E-Mail")}</div>
+<form method="POST" action="/edit/login">
+<label for="kennung">${istSms ? "Telefonnummer" : "E-Mail-Adresse"}</label>
+<input id="kennung" name="kennung" type="${istSms ? "tel" : "email"}"
+ inputmode="${istSms ? "tel" : "email"}"
+ autocomplete="${istSms ? "tel" : "email"}"
+ placeholder="${istSms ? "0151 20464812" : "name@firma.de"}" autofocus>
+<input type="hidden" name="weg" value="${weg}">
+${verstecktesReturn(opts.returnTo)}
+<button type="submit">Code anfordern</button>
+${opts.error ? `<div class="err">${opts.error}</div>` : ""}
+</form>`,
+  );
+}
+
+/** Stufe 2 — Code eintragen. Kennung und Reiter reisen im Formular mit. */
+function loginFormCode(
+  weg: Kanal,
+  kennungRoh: string,
+  opts: { error?: string; returnTo?: string | null } = {},
+): string {
+  const q = opts.returnTo ? `&return=${encodeURIComponent(opts.returnTo)}` : "";
+  return seite(
+    "Code eingeben",
+    `<h1>Code eingeben</h1>
+<p class="lead">Wir haben dir einen sechsstelligen Code geschickt, falls dieser Kontaktweg
+hinterlegt ist. Er gilt 5 Minuten.</p>
+<form method="POST" action="/edit/login">
+<label for="code">Code</label>
+<input id="code" name="code" class="code" type="text" inputmode="numeric" autocomplete="one-time-code"
+ maxlength="6" pattern="[0-9]*" placeholder="000000" autofocus>
+<input type="hidden" name="kennung" value="${escapeAttr(kennungRoh)}">
+<input type="hidden" name="weg" value="${weg}">
+${verstecktesReturn(opts.returnTo)}
 <button type="submit">Anmelden</button>
-${error ? `<div class="err">${error}</div>` : ""}
-</form></body></html>`;
+${opts.error ? `<div class="err">${opts.error}</div>` : ""}
+</form>
+<p class="hint">Nichts bekommen? <a href="/edit/login?weg=${weg}${q}">Neuen Code anfordern</a></p>`,
+  );
 }
 
 /** 302-Redirect auf die Login-Seite mit (bereits validiertem) return-Ziel. */
@@ -335,33 +423,146 @@ async function route(req: Request, url: URL, ctx: HostCtx): Promise<Response> {
 
 
   // === Präzedenz (1): /edit/login (exakt) — einzige Route ohne Auth-Wall. ===
+  //
+  // Zweistufig: Kontaktweg eingeben → Code eingeben. Unterschieden wird an der
+  // Anwesenheit des Feldes `code`, nicht an einer serverseitigen Sitzung — die
+  // gäbe es sonst vor der Anmeldung, und sie wäre selbst wieder Angriffsfläche.
   if (path === "/edit/login") {
     // Fail-closed: ohne Auth-Datei ist kein Login möglich → 404 (auch GET/POST).
     if (ctx.auth === null) return notFound();
+    const auth = ctx.auth;
+
     if (method === "GET") {
       // return-Query validieren (Open-Redirect-Schutz); nur gültige Ziele in die Form.
       const returnTo = validateReturn(url.searchParams.get("return"));
-      return html(loginForm(undefined, returnTo, insecureOriginWarning(req, url)));
+      return html(
+        loginFormKennung(validWeg(url.searchParams.get("weg")), {
+          returnTo,
+          warning: insecureOriginWarning(req, url),
+        }),
+      );
     }
+
     if (method === "POST") {
       const body = await parseBody(req);
-      const pw = typeof body.password === "string" ? body.password : "";
       // return kann aus dem Body ODER der Query kommen (Body hat Vorrang). Beide
-      // laufen durch dieselbe strenge Validierung → Open-Redirect-sicher.
+      // laufen durch dieselbe strenge Validierung → Open-Redirect-sicher, und
+      // zwar über BEIDE Stufen: an der zweiten wäre der Schutz sonst wirkungslos.
       const returnRaw =
         typeof body.return === "string" ? body.return : url.searchParams.get("return");
       const returnTo = validateReturn(returnRaw);
-      if (await verifyPassword(ctx.auth, pw)) {
-        // Bei Erfolg: auf validiertes return-Ziel, sonst Default /edit.
+      const weg = validWeg(typeof body.weg === "string" ? body.weg : url.searchParams.get("weg"));
+      const kennungRoh = typeof body.kennung === "string" ? body.kennung : "";
+      const codeRoh = typeof body.code === "string" ? body.code.trim() : "";
+
+      // --- Stufe 2: Code prüfen ---
+      if (codeRoh !== "") {
+        const kennung = normalisiereKennung(kennungRoh, weg);
+        // Eine Fehlermeldung darf NICHT unterscheiden zwischen „Kennung nicht
+        // hinterlegt", „Code falsch" und „Code abgelaufen" — sonst verrät die
+        // Anmeldeseite, welche Kontaktwege es gibt.
+        const abweisen = () =>
+          html(
+            loginFormCode(weg, kennungRoh, {
+              returnTo,
+              error: "Der Code stimmt nicht oder ist abgelaufen. Fordere einen neuen an.",
+            }),
+            401,
+          );
+        if (kennung === null) return abweisen();
+        // Zweite Schranke: Ein Code kann für eine nicht hinterlegte Kennung gar
+        // nicht entstanden sein — die Prüfung ist trotzdem da, weil sie billig ist.
+        if (!kennungHinterlegt(auth, kennung.wert)) return abweisen();
+        if (pruefeCode(ctx.siteDir, kennung.wert, codeRoh) !== "ok") return abweisen();
+
         return new Response(null, {
           status: 302,
           headers: withHeaders({
-            "Set-Cookie": issueCookie(ctx.auth),
+            "Set-Cookie": issueCookie(auth),
             Location: returnTo ?? "/edit",
           }),
         });
       }
-      return html(loginForm("Falsches Passwort.", returnTo, insecureOriginWarning(req, url)), 401);
+
+      // --- Stufe 1: Code anfordern ---
+      const kennung = normalisiereKennung(kennungRoh, weg);
+      if (kennung === null) {
+        // Formfehler nennen wir beim Namen — das verrät nichts darüber, WELCHE
+        // Kontaktwege hinterlegt sind, und erspart eine ratlose Wartezeit.
+        return html(
+          loginFormKennung(weg, {
+            returnTo,
+            error:
+              weg === "email"
+                ? "Das sieht nicht nach einer E-Mail-Adresse aus."
+                : "Das sieht nicht nach einer Telefonnummer aus.",
+            warning: insecureOriginWarning(req, url),
+          }),
+          400,
+        );
+      }
+
+      // Ist dieser Kanal überhaupt eingerichtet? Diese Frage MUSS vor der
+      // Hinterlegt-Prüfung stehen und darf nur vom gewählten Kanal abhängen.
+      // Stünde sie danach, bekäme eine hinterlegte Kennung bei fehlendem
+      // Versand einen anderen Statuscode als eine unbekannte — ein rauschfreies
+      // Orakel darüber, wer Kunde dieser Website ist. Genau das war der Zustand
+      // direkt nach `regoro init`, solange versand.json noch fehlte.
+      if (ctx.versand == null || (ctx.versand.kanaele && !ctx.versand.kanaele.has(kennung.kanal))) {
+        return html(
+          loginFormKennung(weg, {
+            returnTo,
+            // Der Text richtet sich nach dem TATSÄCHLICHEN Kanal, nicht nach dem
+            // Reiter: Wer im SMS-Reiter eine Adresse eintippt, bekommt eine Mail
+            // (siehe normalisiereKennung) — und soll dann auch hören, dass der
+            // E-Mail-Versand fehlt, nicht der SMS-Versand.
+            error:
+              kennung.kanal === "email"
+                ? "Anmeldung per E-Mail ist auf diesem Server nicht eingerichtet. Bitte den Betreiber informieren."
+                : "Anmeldung per SMS ist auf diesem Server nicht eingerichtet. Bitte den Betreiber informieren.",
+            warning: insecureOriginWarning(req, url),
+          }),
+          503,
+        );
+      }
+      const versand = ctx.versand;
+
+      // Die Bremse greift VOR dem Versand — sie schützt vor Kosten und Fluten.
+      const bremse = pruefeBremse(ctx.siteDir, kennung.wert);
+      if (!bremse.erlaubt) {
+        return html(
+          loginFormKennung(weg, {
+            returnTo,
+            error:
+              bremse.grund === "kennung"
+                ? `Zu viele Codes angefordert. Versuche es in ${wartezeitText(bremse.wartenMs)} erneut.`
+                : `Für diese Website wurden zu viele Codes angefordert. Bitte in ${wartezeitText(bremse.wartenMs)} erneut versuchen.`,
+            warning: insecureOriginWarning(req, url),
+          }),
+          429,
+        );
+      }
+
+      if (kennungHinterlegt(auth, kennung.wert)) {
+        const code = erzeugeCode();
+        merkeCode(ctx.siteDir, kennung.wert, code);
+        // **Bewusst NICHT abgewartet.** Würde die Antwort auf den Anbieter
+        // warten, hinge ihre Laufzeit daran, ob die Kennung hinterlegt ist —
+        // gemessen 152 ms gegen 0,2 ms. Damit ließe sich für jede beliebige
+        // Nummer prüfen, ob sie zu dieser Website gehört. Ein gescheiterter
+        // Versand geht deshalb ins Log des Betreibers, nicht an den Browser;
+        // der Kunde sieht auf der Code-Seite ohnehin „Neuen Code anfordern".
+        void versand.sendeCode(kennung, code).catch((err: unknown) => {
+          console.error(
+            `[regoro] Code für ${maskiereKennung(kennung.wert)} ging nicht raus: ` +
+              `${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
+      }
+
+      // Hinterlegt oder nicht: dieselbe Antwort. Sonst verrät die Anmeldeseite,
+      // welche Nummern und Adressen es gibt.
+      return html(loginFormCode(weg, kennungRoh, { returnTo }));
     }
     return notFound();
   }
