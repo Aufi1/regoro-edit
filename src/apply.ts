@@ -11,7 +11,7 @@
  */
 import { createHash } from "node:crypto";
 import { basename, dirname, join, sep } from "node:path";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { parseHTML } from "linkedom";
 import {
   enumerateEditableTextNodes,
@@ -73,7 +73,35 @@ export function fileSha256(content: string): string {
 export function pathInsideSite(siteDir: string, absPath: string): boolean {
   try {
     const realSite = realpathSync(siteDir);
-    // Existierende Datei/Verzeichnis: real auflösen; sonst realen Parent + Basename.
+
+    // Ist der Zielpfad SELBST ein Symlink, wird nie durch ihn geschrieben —
+    // egal wohin er zeigt. Die Prüfung muss VOR dem existsSync stehen und mit
+    // lstat arbeiten, weil beides sonst am HÄNGENDEN Symlink vorbeiläuft:
+    // existsSync folgt dem Link, ein noch nicht existierendes Ziel meldet also
+    // „gibt es nicht", und der Zweig für neue Dateien unten ergibt aus
+    // realpath(Elternverzeichnis) + Basename einen Pfad INNERHALB der Site.
+    // Die Funktion sagte damit true, und der folgende writeFileSync legte die
+    // Datei draußen an — nachgemessen. Latent, solange nur der Text-Editor
+    // schreibt (er kann keine Symlinks anlegen); mit einem Agentenlauf ist
+    // „neue Datei" der Normalfall und der Weg damit erreichbar.
+    //
+    // Auch ein nach INNEN zeigender Symlink wird abgelehnt: Wohin er zeigt,
+    // ist zwischen Prüfung und Write veränderbar (TOCTOU). Ein Site-Ordner
+    // braucht keine Symlinks in seinen Dateien; der legitime Fall — der
+    // Site-Ordner selbst ist ein Mount-Symlink — ist davon nicht betroffen,
+    // weil resolveSite ihn bereits aufgelöst übergibt.
+    let istSymlink = false;
+    try {
+      istSymlink = lstatSync(absPath).isSymbolicLink();
+    } catch {
+      // Es gibt den Pfad gar nicht → die neue Datei, der legitime Fall.
+      // Nicht ablehnen; darüber entscheidet die Containment-Prüfung unten.
+    }
+    if (istSymlink) return false;
+
+    // Existierende Datei/Verzeichnis: real auflösen; sonst realen Parent +
+    // Basename. Das fängt Symlinks in den ELTERNsegmenten (z.B. `assets` als
+    // Symlink nach außen), die lstat oben nicht sieht.
     const real = existsSync(absPath)
       ? realpathSync(absPath)
       : join(realpathSync(dirname(absPath)), basename(absPath));
