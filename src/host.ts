@@ -4,9 +4,9 @@
  * Kennt Auth + Routing, delegiert die eigentliche Logik an contract/serve/apply/git.
  * Auth-Fehler → 404 (nicht 401), außer /edit/login. Alle Antworten noindex/no-store.
  */
-import { join, resolve, dirname, basename, extname, sep, posix } from "node:path";
+import { join, resolve, extname, sep, posix } from "node:path";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync, statSync, mkdirSync, realpathSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, statSync, mkdirSync } from "node:fs";
 import { parseHTML } from "linkedom";
 // Bun-"file"-Import: liefert einen Pfad, den bun build --compile mit einbettet.
 import overlayAsset from "./overlay.client.js" with { type: "file" };
@@ -24,9 +24,16 @@ import { erzeugeCode, merkeCode, pruefeCode } from "./codes.ts";
 import { pruefeBremse, wartezeitText } from "./bremse.ts";
 import type { Versand } from "./versand.ts";
 import { renderEditView, renderVersionPreview } from "./serve.ts";
-// PAGE_RE wohnt in sites.ts, damit Whitelist-Erzeugung und Auflösung nicht driften.
-import { PAGE_RE } from "./sites.ts";
-import { applyEdits, setImageSrc, fileSha256, type Edit } from "./apply.ts";
+// PAGE_RE und ASSET_TYPES wohnen in sites.ts — sie beschreiben die WEBSITE
+// (welche Seiten es gibt, was ausgeliefert wird), nicht den Router. PAGE_RE
+// braucht dort ohnehin die Whitelist-Erzeugung; ASSET_TYPES ist mitgezogen,
+// damit validate.ts sie ohne Importzyklus lesen kann (Begründung dort).
+import { ASSET_TYPES, PAGE_RE } from "./sites.ts";
+// Re-Export für Bestandsleser. NEUE Leser importieren aus sites.ts: Ein
+// `from "./host.ts"` baut den Zyklus host → agent → validate → host wieder auf,
+// und in dem ist die Konstante beim Import des Partners noch nicht initialisiert.
+export { ASSET_TYPES, PAGE_RE };
+import { applyEdits, setImageSrc, fileSha256, pathInsideSite, type Edit } from "./apply.ts";
 import { enumerateImages } from "./contract.ts";
 import {
   ensureRepo,
@@ -35,6 +42,21 @@ import {
   showVersion,
   restoreVersion,
 } from "./git.ts";
+
+/**
+ * VORLÄUFIG. Die Wahrheit über diesen Typ ist `src/betreiber-config.ts`
+ * (Contract §1); die Datei entsteht gerade und ein Import auf eine fehlende
+ * Datei bräche `tsc --noEmit` für das ganze Team. Sobald sie da ist, diese
+ * Deklaration durch
+ *   import type { KiConfig } from "./betreiber-config.ts";
+ * ersetzen — die Form ist absichtlich identisch, der Tausch ist eine Zeile.
+ */
+type KiConfig = {
+  apiKey: string;
+  braveKey: string | null;
+  baseUrl: string;
+  model: string;
+};
 
 export interface HostCtx {
   repoRoot: string;
@@ -48,6 +70,22 @@ export interface HostCtx {
    * eingerichtet (`/etc/regoro/versand.json`), nicht je Website.
    */
   versand?: Versand | null;
+  /**
+   * Der betreiberweite Modellzugang (`/etc/regoro/ki.json`). Fehlt er, gibt es
+   * die KI-Seitenleiste nicht: alle `/edit/agent*`-Routen antworten 404 und
+   * `serve.ts` blendet die Leiste gar nicht erst ins DOM — fail-closed wie bei
+   * `auth`.
+   *
+   * Wird VERZÖGERT gelesen (Getter in `buildCtx`/`singleSiteHandler`), nicht
+   * einmal beim Start: sonst wirkte `regoro ki --off` erst nach einem Neustart,
+   * und der Betreiber hätte keinen sofortigen Hebel gegen einen Lauf, der Geld
+   * kostet.
+   *
+   * Optional wie `versand`, damit die Ctx-Bauer ihn erst ergänzen müssen, wenn
+   * der Lader existiert. Deshalb überall `== null` prüfen, nie `=== null`:
+   * `undefined` ist derselbe Fall — „kein Modellzugang".
+   */
+  ki?: KiConfig | null;
 }
 
 /**
@@ -63,6 +101,12 @@ function pagePathFor(ctx: HostCtx, page: string): string {
 /**
  * Ist der Pfad eine Editor-Route? Exakt matchen, nicht startsWith("/edit"):
  * eine öffentliche Seite darf "edit-preise.html" heißen.
+ *
+ * Die Routen der KI-Seitenleiste (`/edit/agent`, `/edit/agent/events|abort|status`)
+ * fallen unter `startsWith("/edit/")` und sind damit gedeckt — der Kill-Switch in
+ * server.ts (`regoro disable` wirkt sofort) greift für sie ohne Zusatzregel. Nicht
+ * auf eine engere Liste umbauen: Eine vergessene Agenten-Route liefe sonst weiter,
+ * nachdem der Betreiber den Zugang entzogen hat.
  */
 export function isEditorPath(path: string): boolean {
   return (
@@ -95,27 +139,6 @@ const COMMIT_RE = /^[0-9a-f]{7,40}$/;
 // Binary ins Leere → /edit-assets/overlay.js gab 404 und der Editor war stumm
 // funktionslos. readFileSync/existsSync können beide Pfade.
 const OVERLAY_PATH: string = overlayAsset;
-
-// Allowlist statischer Asset-Extensions → Content-Type. KEIN .html hier
-// (Seiten laufen über den /edit-Pfad; Asset-Serving darf keine beliebigen
-// .html ausliefern). Nur diese Extensions werden öffentlich ausgeliefert.
-const ASSET_TYPES: Record<string, string> = {
-  ".css": "text/css; charset=utf-8",
-  ".js": "application/javascript; charset=utf-8",
-  ".png": "image/png",
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".webp": "image/webp",
-  // KEIN .svg: image/svg+xml ist script-fähig (latenter Stored-XSS). regoro.de
-  // nutzt nur webp/jpg. Upload blockt SVG ohnehin per Sniff — das schließt auch
-  // den Static-Serving-Pfad.
-  ".gif": "image/gif",
-  ".ico": "image/x-icon",
-  ".woff": "font/woff",
-  ".woff2": "font/woff2",
-  ".txt": "text/plain; charset=utf-8",
-  ".xml": "application/xml; charset=utf-8",
-};
 
 // Bild-Upload: Größenlimit + Magic-Byte-Sniff. SVG bewusst NICHT zugelassen
 // (XSS-Risiko durch eingebettetes Script). Liefert die kanonische Extension
@@ -601,6 +624,11 @@ async function route(req: Request, url: URL, ctx: HostCtx): Promise<Response> {
     path === "/edit/upload" ||
     path === "/edit/restore" ||
     path === "/edit/versions" ||
+    // KI-Seitenleiste: Auftrag, Ereignisstrom, Abbruch, Zustand. Gehören HIER
+    // hin und nicht zu den View-Routen: Ohne den Auth-Gate könnte ein Fremder
+    // einen Agentenlauf auslösen — der kostet Token und schreibt in die Website.
+    // Unangemeldet also 404 (nicht 401), wie bei jeder anderen API-Route.
+    /^\/edit\/agent(\/(events|abort|status))?$/.test(path) ||
     /^\/edit\/version\/[^/]+$/.test(path);
   if (isApiRoute) {
     if (!isAuthed(req, ctx)) return notFound();
@@ -702,26 +730,6 @@ async function route(req: Request, url: URL, ctx: HostCtx): Promise<Response> {
   return notFound();
 }
 
-/**
- * Symlink-sichere Containment-Prüfung: true, wenn der REALE (aufgelöste) Pfad
- * innerhalb von siteDir liegt. Verhindert, dass Schreib-/Restore-Vorgänge einem
- * Symlink (z.B. eine als Symlink angelegte Seite/`assets` in einer mounted-/
- * restored-site) nach außerhalb des Site-Baums folgen. Der lexikalische
- * resolve()-Check erkennt Symlinks nicht — realpath schon. Fail-closed.
- */
-function pathInsideSite(ctx: HostCtx, absPath: string): boolean {
-  try {
-    const realSite = realpathSync(ctx.siteDir);
-    // Existierende Datei/Verzeichnis: real auflösen; sonst realen Parent + Basename.
-    const real = existsSync(absPath)
-      ? realpathSync(absPath)
-      : join(realpathSync(dirname(absPath)), basename(absPath));
-    return real === realSite || real.startsWith(realSite + sep);
-  } catch {
-    return false;
-  }
-}
-
 async function handleSave(req: Request, ctx: HostCtx): Promise<Response> {
   const body = await parseBody(req);
   const pagePath = typeof body.pagePath === "string" ? body.pagePath : "";
@@ -741,7 +749,7 @@ async function handleSave(req: Request, ctx: HostCtx): Promise<Response> {
 
   const { html: nextHtml } = applyEdits(current, edits);
   // Symlink-sicher: nie einer als Symlink angelegten Seite nach außerhalb folgen.
-  if (!pathInsideSite(ctx, target.abs)) return json({ error: "bad-path" }, 400);
+  if (!pathInsideSite(ctx.siteDir, target.abs)) return json({ error: "bad-path" }, 400);
   writeFileSync(target.abs, nextHtml, "utf8");
 
   ensureRepo(ctx.repoRoot);
@@ -800,14 +808,14 @@ async function handleUpload(req: Request, ctx: HostCtx): Promise<Response> {
   // Elternsegment) ein Symlink nach außerhalb (mounted-/restored-site), würde
   // writeFileSync dem Symlink folgen. Daher das ECHTE Ziel gegen siteDir prüfen.
   mkdirSync(assetsBase, { recursive: true });
-  if (!pathInsideSite(ctx, assetsAbs)) return json({ error: "bad-path" }, 400);
+  if (!pathInsideSite(ctx.siteDir, assetsAbs)) return json({ error: "bad-path" }, 400);
   writeFileSync(assetsAbs, bytes);
 
   // 8. src auf der Seite aktualisieren + schreiben.
   const newSrc = `/assets/${filename}`;
   const { html: nextHtml, applied } = setImageSrc(pageHtml, imgIdx, newSrc);
   if (applied !== 1) return json({ error: "img-not-applied" }, 400);
-  if (!pathInsideSite(ctx, target.abs)) return json({ error: "bad-path" }, 400);
+  if (!pathInsideSite(ctx.siteDir, target.abs)) return json({ error: "bad-path" }, 400);
   writeFileSync(target.abs, nextHtml, "utf8");
 
   // 9. Beide (Asset + Seite) committen.
@@ -832,7 +840,7 @@ async function handleRestore(req: Request, ctx: HostCtx): Promise<Response> {
   if (!target || pagePath !== pagePathFor(ctx, target.page)) return notFound();
   if (!COMMIT_RE.test(commit)) return notFound();
   // Symlink-sicher: Restore würde sonst einem als Symlink angelegten Seitenpfad folgen.
-  if (existsSync(target.abs) && !pathInsideSite(ctx, target.abs)) {
+  if (existsSync(target.abs) && !pathInsideSite(ctx.siteDir, target.abs)) {
     return json({ ok: false, error: "bad-path" }, 400);
   }
 

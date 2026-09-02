@@ -10,6 +10,8 @@
  * aufgelöst, damit strukturändernde delete/insert die anderen idx nicht verrutschen.
  */
 import { createHash } from "node:crypto";
+import { basename, dirname, join, sep } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
 import { parseHTML } from "linkedom";
 import {
   enumerateEditableTextNodes,
@@ -54,6 +56,31 @@ export interface ApplyResult {
 /** Stabiler SHA-256-Hex über den Datei-Inhalt (für Optimistic-Locking). */
 export function fileSha256(content: string): string {
   return createHash("sha256").update(content, "utf8").digest("hex");
+}
+
+/**
+ * Symlink-sichere Containment-Prüfung: true, wenn der REALE (aufgelöste) Pfad
+ * innerhalb von siteDir liegt. Verhindert, dass Schreib-/Restore-Vorgänge einem
+ * Symlink (z.B. eine als Symlink angelegte Seite/`assets` in einer mounted-/
+ * restored-site) nach außerhalb des Site-Baums folgen. Der lexikalische
+ * resolve()-Check erkennt Symlinks nicht — realpath schon. Fail-closed.
+ *
+ * Steht in apply.ts und nicht in host.ts, weil sie an jeder Schreibstelle
+ * gebraucht wird — auch außerhalb der HTTP-Schicht, sobald ein Agentenlauf
+ * Dateien übernimmt. apply.ts ist ein Blattmodul; ein Import aus host.ts hätte
+ * dort einen Zyklus gebaut.
+ */
+export function pathInsideSite(siteDir: string, absPath: string): boolean {
+  try {
+    const realSite = realpathSync(siteDir);
+    // Existierende Datei/Verzeichnis: real auflösen; sonst realen Parent + Basename.
+    const real = existsSync(absPath)
+      ? realpathSync(absPath)
+      : join(realpathSync(dirname(absPath)), basename(absPath));
+    return real === realSite || real.startsWith(realSite + sep);
+  } catch {
+    return false;
+  }
 }
 
 // --- linkedom-Node-Hilfstypen (schmal gehalten) ----------------------------

@@ -30,6 +30,52 @@ import type { Versand } from "./versand.ts";
 export const PAGE_RE = /^[a-z0-9-]+\.html$/;
 
 /**
+ * Allowlist statischer Asset-Endungen → Content-Type. Sie entscheidet, was aus
+ * einem Site-Ordner überhaupt öffentlich wird — und damit, was NICHT: Ein
+ * Kundenordner enthält real auch Build-Artefakte (`design.json`, `images.json`
+ * mit internen Serverpfaden), Backups und Notizen. KEIN `.html` (Seiten laufen
+ * über resolvePage), KEIN `.json`/`.yaml`/`.md`, und `.svg` bleibt draußen:
+ * `image/svg+xml` ist script-fähig, ein hochgeladenes SVG wäre latenter
+ * Stored-XSS. Siehe CLAUDE.md, Invariante 3.
+ *
+ * **Warum hier und nicht in host.ts**, wo sie bis v0.2 stand: Der Prüfschritt
+ * des KI-Laufs (`validate.ts`) muss dieselbe Liste führen — eine zweite Kopie
+ * dort risse genau die Schranke auf, die Invariante 3 trägt. Ein Import aus
+ * host.ts hätte aber einen Zyklus gebaut (host → agent → validate → host), und
+ * in einem Zyklus ist eine Konstante beim Import des Partners noch nicht
+ * initialisiert: `Object.keys(ASSET_TYPES)` auf Modulebene wirft dann, je nach
+ * Importreihenfolge. sites.ts ist zur Laufzeit ein Blatt (aus host.ts kommt nur
+ * `type HostCtx`, und Typ-Importe werden wegkompiliert), deshalb wohnt sie hier.
+ *
+ * **Daraus folgt eine Regel:** Neue Leser importieren `ASSET_TYPES` und
+ * `PAGE_RE` aus DIESER Datei. host.ts re-exportiert beide nur der Bequemlichkeit
+ * halber; ein `from "./host.ts"` stellt den Zyklus wieder her, egal wo die
+ * Konstante wohnt — entscheidend ist die Import-Kante, nicht der Ort.
+ *
+ * Ändert sich diese Liste, ändern sich `caddyBlock()` in service.ts und BEIDE
+ * Caddyfile-Vorlagen mit: Im Sammelbetrieb liefert Caddy die statischen Dateien
+ * selbst aus, der Bun-Host ist dafür nicht im Pfad. Ein Test nagelt die
+ * `@allowed`-Zeile in allen vieren aneinander fest.
+ */
+export const ASSET_TYPES: Record<string, string> = {
+  ".css": "text/css; charset=utf-8",
+  ".js": "application/javascript; charset=utf-8",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+  // KEIN .svg: image/svg+xml ist script-fähig (latenter Stored-XSS). regoro.de
+  // nutzt nur webp/jpg. Upload blockt SVG ohnehin per Sniff — das schließt auch
+  // den Static-Serving-Pfad.
+  ".gif": "image/gif",
+  ".ico": "image/x-icon",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
+  ".txt": "text/plain; charset=utf-8",
+  ".xml": "application/xml; charset=utf-8",
+};
+
+/**
  * Ein Hostname nach RFC-1123-Zeichensatz: Labels aus [a-z0-9-], die weder mit
  * "-" beginnen noch enden, getrennt durch genau einen Punkt. Bewusst streng —
  * alles, was hier durchfällt, wird nie zu einem Pfadsegment.
