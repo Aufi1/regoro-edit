@@ -453,10 +453,16 @@ async function route(req: Request, url: URL, ctx: HostCtx): Promise<Response> {
       const returnTo = validateReturn(returnRaw);
       const weg = validWeg(typeof body.weg === "string" ? body.weg : url.searchParams.get("weg"));
       const kennungRoh = typeof body.kennung === "string" ? body.kennung : "";
-      const codeRoh = typeof body.code === "string" ? body.code.trim() : "";
+      // Die Stufe entscheidet sich an der ANWESENHEIT des Feldes, nicht an
+      // seinem Inhalt. Ein leeres Feld hieße sonst „neuen Code anfordern": Wer
+      // im Code-Formular versehentlich ohne Eingabe abschickt, bekäme eine
+      // zweite Nachricht — kostenpflichtig — und der Code aus der ersten wäre
+      // tot, weil `merkeCode` ihn ersetzt. Nachgestellt und behoben.
+      const codeFeld = typeof body.code === "string" ? body.code : null;
+      const codeRoh = codeFeld === null ? "" : codeFeld.trim();
 
       // --- Stufe 2: Code prüfen ---
-      if (codeRoh !== "") {
+      if (codeFeld !== null) {
         const kennung = normalisiereKennung(kennungRoh, weg);
         // Eine Fehlermeldung darf NICHT unterscheiden zwischen „Kennung nicht
         // hinterlegt", „Code falsch" und „Code abgelaufen" — sonst verrät die
@@ -469,6 +475,17 @@ async function route(req: Request, url: URL, ctx: HostCtx): Promise<Response> {
             }),
             401,
           );
+        // Leeres Feld ist kein Fehlversuch, sondern ein Vertipper: erneut fragen,
+        // ohne einen der fünf Versuche zu verbrauchen und ohne den Code zu entwerten.
+        if (codeRoh === "") {
+          return html(
+            loginFormCode(weg, kennungRoh, {
+              returnTo,
+              error: "Bitte den sechsstelligen Code aus der Nachricht eintragen.",
+            }),
+            400,
+          );
+        }
         if (kennung === null) return abweisen();
         // Zweite Schranke: Ein Code kann für eine nicht hinterlegte Kennung gar
         // nicht entstanden sein — die Prüfung ist trotzdem da, weil sie billig ist.

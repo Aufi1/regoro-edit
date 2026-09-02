@@ -188,6 +188,18 @@ function nachrichtentext(code: string): string {
   return `Ihr Anmeldecode für den Website-Editor: ${code}\n\nEr gilt 5 Minuten. Wenn Sie sich nicht anmelden wollten, ignorieren Sie diese Nachricht.`;
 }
 
+/**
+ * Fremdtext, der in eine Fehlermeldung und damit ins Betreiber-Log wandert.
+ *
+ * Der Anbieter bestimmt diesen Inhalt, nicht wir. Zeilenumbrüche und
+ * Steuerzeichen würden im Log wie eigene Einträge aussehen — ein Angreifer, der
+ * die Antwort beeinflussen kann, schriebe sich sonst gefälschte Zeilen hinein.
+ */
+function entschaerft(roh: string): string {
+  // eslint-disable-next-line no-control-regex
+  return roh.replace(/[\u0000-\u001f\u007f]+/g, " ").trim().slice(0, 200);
+}
+
 async function ruf(was: string, url: string, init: RequestInit): Promise<unknown> {
   let antwort: Response;
   try {
@@ -202,7 +214,7 @@ async function ruf(was: string, url: string, init: RequestInit): Promise<unknown
   }
   const roh = await antwort.text();
   if (!antwort.ok) {
-    throw new Error(`${was} fehlgeschlagen: HTTP ${antwort.status} — ${roh.slice(0, 200)}`);
+    throw new Error(`${was} fehlgeschlagen: HTTP ${antwort.status} — ${entschaerft(roh)}`);
   }
   try {
     return JSON.parse(roh);

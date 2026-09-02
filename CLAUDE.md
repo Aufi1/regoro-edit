@@ -23,7 +23,7 @@ Ein einzelner Bun-Prozess, der eine **bestehende statische Website** ausliefert 
 ## Nicht-verhandelbare Invarianten (bei Änderungen erhalten!)
 1. **Command-based editing:** Der Client schickt **nie Markup**, nur Befehle (Text, Offsets, Format-Flags). Der Server erzeugt **jedes** `<strong>/<em>/<u>/<a>/<span style=color>/<br>`. Deshalb kein HTML-Sanitizer nötig — validiert werden ausschließlich **`href`** (`isValidHref`) und **Farbe** (`isValidColor`/`normalizeColor`). Führe keine client-gelieferten HTML-Strings ein.
 2. **Auth ausschließlich datei-basiert, Nachweis per Einmalcode:** `<siteDir>/.regoro/auth.json` (`v:2`, Listen `nummern`/`emails` + per-Site HMAC-Secret). **Kein Passwort, kein argon2id** — mit ihm verschwand ein Überlastungshebel (jeder Versuch kostete ~64 MB, ungebremst von außen auslösbar). **Fail-closed:** kein/ungültiges/veraltetes File, oder leere Kennungsliste → alle `/edit*` inkl. Anmeldung → 404. Eine `v:1`-Datei wird **abgelehnt**, nicht migriert (`pruefeAuthDatei` → `"veraltet"`).
-   - **Die Anmeldung ist zweistufig:** Kennung (Telefonnummer *oder* E-Mail) → Einmalcode. Unterschieden wird an der Anwesenheit des Feldes `code`, **nicht** an einer serverseitigen Sitzung — die gäbe es sonst vor der Anmeldung. Die Kennung reist im Formular mit; wer sie fälscht, hat trotzdem keinen gültigen Code.
+   - **Die Anmeldung ist zweistufig:** Kennung (Telefonnummer *oder* E-Mail) → Einmalcode. Unterschieden wird an der **Anwesenheit** des Feldes `code`, nicht an seinem Inhalt und nicht an einer serverseitigen Sitzung. Auf „nicht leer" zurückgebaut hieße ein versehentlicher Leer-Klick im Code-Formular „neuen Code anfordern": eine zweite, kostenpflichtige Nachricht, und der Code aus der ersten wäre tot, weil `merkeCode` ihn ersetzt. Ein leeres Feld verbraucht auch keinen der fünf Versuche — es ist ein Vertipper, kein Rateversuch. Die Kennung reist im Formular mit; wer sie fälscht, hat trotzdem keinen gültigen Code.
    - **Dieselbe Antwort für hinterlegt und nicht hinterlegt** — in Inhalt, Statuscode **und Laufzeit**. Sonst verrät die Anmeldeseite, welche Nummern es gibt. Ebenso dürfen „Code falsch", „abgelaufen" und „Kennung unbekannt" nicht unterscheidbar sein. Tests: `login-code.test.ts`.
      - **Der Versand wird bewusst NICHT abgewartet** (`void versand.sendeCode(…).catch(…)`). Gemessen: mit `await` dauerte die Antwort 152 ms für eine hinterlegte und 0,2 ms für eine unbekannte Kennung — für jede beliebige Nummer nachprüfbar, ob sie zu dieser Website gehört. Ohne `await` bleibt ein Unterschied von ~1 µs. Nicht auf `await` zurückbauen.
      - **Ein Versandfehler geht ins Log, nie an den Browser.** Nur eine hinterlegte Kennung kann einen Versandfehler auslösen — ein 502 wäre ein rauschfreies Orakel. Der Kunde sieht auf der Code-Seite „Neuen Code anfordern".
@@ -60,7 +60,7 @@ Ein einzelner Bun-Prozess, der eine **bestehende statische Website** ausliefert 
 ## Testen / Checks
 ```bash
 export PATH="$HOME/.bun/bin:$PATH"
-bun test                 # 668 Tests (Fixtures kopieren examples/site in tmp-Dirs)
+bun test                 # 671 Tests (Fixtures kopieren examples/site in tmp-Dirs)
 bun x tsc --noEmit       # Typecheck (tsconfig include: src/**/*.ts)
 bun build src/overlay.client.js --target=browser >/dev/null   # Syntax-Check des Client-JS (tsc erfasst es NICHT)
 caddy validate --config Caddyfile.example --adapter caddyfile        # Proxy-Vorlage Einzelbetrieb

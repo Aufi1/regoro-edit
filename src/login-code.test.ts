@@ -175,6 +175,30 @@ describe("Der Code selbst", () => {
     expect((await post({ kennung: NUMMER, weg: "sms", code })).status).toBe(302);
   });
 
+  test("ein versehentlich leeres Feld entwertet den Code NICHT", async () => {
+    // Die Stufe entscheidet sich an der Anwesenheit des Feldes, nicht an seinem
+    // Inhalt. Sonst hiesse ein Leer-Klick "neuen Code anfordern": zweite
+    // Nachricht (kostenpflichtig), und der Code aus der ersten waere tot.
+    await post({ kennung: NUMMER, weg: "sms" });
+    const code = versand.gesendet[0]!.code;
+
+    const versehen = await post({ kennung: NUMMER, weg: "sms", code: "" });
+    expect(versehen.status).toBe(400);
+    expect(await versehen.text()).toContain("sechsstelligen Code");
+    expect(versand.gesendet).toHaveLength(1); // keine zweite Nachricht
+
+    expect((await post({ kennung: NUMMER, weg: "sms", code })).status).toBe(302);
+  });
+
+  test("ein leeres Feld verbraucht keinen der fuenf Versuche", async () => {
+    await post({ kennung: NUMMER, weg: "sms" });
+    const code = versand.gesendet[0]!.code;
+    for (let i = 0; i < MAX_VERSUCHE + 3; i++) {
+      expect((await post({ kennung: NUMMER, weg: "sms", code: "   " })).status).toBe(400);
+    }
+    expect((await post({ kennung: NUMMER, weg: "sms", code })).status).toBe(302);
+  });
+
   test("nach fuenf Fehlversuchen ist der Code verbraucht", async () => {
     await post({ kennung: NUMMER, weg: "sms" });
     const code = versand.gesendet[0]!.code;

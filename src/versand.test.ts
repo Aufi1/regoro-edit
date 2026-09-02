@@ -120,6 +120,22 @@ describe("SMS ueber seven.io", () => {
     expect(v.sendeCode(NUMMER, "1")).rejects.toThrow("502");
     s.stop();
   });
+
+  test("Fremdtext aus der Antwort kann keine Log-Zeilen faelschen", async () => {
+    // Der Anbieter bestimmt diesen Text. Zeilenumbrueche saehen im Log wie
+    // eigene Eintraege aus — ein Angreifer schriebe sich gefaelschte hinein.
+    const s = attrappenServer(() => ({
+      status: 500,
+      body: "kaputt\n[regoro] ALLES GUT: nichts passiert\r\n\u0000",
+    }));
+    const v = sevenioVersand({ anbieter: "sevenio", absender: "REGORO" }, s.basis);
+    const fehler = await v.sendeCode(NUMMER, "1").catch((e: Error) => e.message);
+    expect(fehler).not.toContain("\n");
+    expect(fehler).not.toContain("\r");
+    expect(fehler).not.toContain("\u0000");
+    expect(fehler).toContain("kaputt");
+    s.stop();
+  });
 });
 
 describe("E-Mail ueber Scaleway", () => {
