@@ -18,6 +18,7 @@ import { dirname, resolve } from "node:path";
 import { readdirSync, realpathSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { loadAuthFile } from "./auth.ts";
+import { loadKiConfig, type KiConfig } from "./betreiber-config.ts";
 import type { HostCtx } from "./host.ts";
 import type { Versand } from "./versand.ts";
 
@@ -344,10 +345,15 @@ export function erstelleSecretWache(
  *   - Die Lazyness ändert nichts an der Semantik: der Wert entsteht innerhalb
  *     derselben Anfrage. Dass `auth` pro Anfrage frisch gelesen wird, IST der
  *     Kill-Switch — `regoro disable` wirkt dadurch sofort (siehe server.ts).
+ *
+ * `ki` folgt demselben Muster und aus demselben Grund: Weil der Ctx pro
+ * Anfrage entsteht, wirkt `regoro ki --off` ohne Neustart. Betreiberweit
+ * gelesen, nicht aus dem Kundenordner — ein Modellzugang bedient alle Kunden.
  */
 export function buildCtx(site: SiteRef, wache?: SecretWache, versand?: Versand | null): HostCtx {
   let pages: string[] | undefined;
   let auth: ReturnType<typeof loadAuthFile> | undefined;
+  let ki: KiConfig | null | undefined;
   return {
     repoRoot: site.siteDir,
     siteDir: site.siteDir,
@@ -366,6 +372,12 @@ export function buildCtx(site: SiteRef, wache?: SecretWache, versand?: Versand |
             : geladen;
       }
       return auth;
+    },
+    get ki(): KiConfig | null {
+      // Gemerkt für die Dauer DIESER Anfrage: Der Edit-View liest ihn einmal,
+      // die Agenten-Routen mehrfach. Über die Anfrage hinaus wird nichts
+      // gemerkt — sonst wirkte `regoro ki --off` erst nach einem Neustart.
+      return (ki ??= loadKiConfig());
     },
   };
 }

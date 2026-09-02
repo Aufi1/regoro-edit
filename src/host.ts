@@ -23,6 +23,7 @@ import { maskiereKennung, normalisiereKennung, type Kanal } from "./kennung.ts";
 import { erzeugeCode, merkeCode, pruefeCode } from "./codes.ts";
 import { pruefeBremse, wartezeitText } from "./bremse.ts";
 import type { Versand } from "./versand.ts";
+import type { KiConfig } from "./betreiber-config.ts";
 import { renderEditView, renderVersionPreview } from "./serve.ts";
 // PAGE_RE und ASSET_TYPES wohnen in sites.ts — sie beschreiben die WEBSITE
 // (welche Seiten es gibt, was ausgeliefert wird), nicht den Router. PAGE_RE
@@ -35,6 +36,8 @@ import { ASSET_TYPES, PAGE_RE } from "./sites.ts";
 export { ASSET_TYPES, PAGE_RE };
 import { applyEdits, setImageSrc, fileSha256, pathInsideSite, type Edit } from "./apply.ts";
 import { enumerateImages } from "./contract.ts";
+import { brichAb, ereignisse, laufAktiv, starteLauf, type AgentEreignis } from "./agent.ts";
+import { pruefeKontingent, TOKEN_KONTINGENT } from "./kontingent.ts";
 import {
   ensureRepo,
   commitEdit,
@@ -42,21 +45,6 @@ import {
   showVersion,
   restoreVersion,
 } from "./git.ts";
-
-/**
- * VORLÄUFIG. Die Wahrheit über diesen Typ ist `src/betreiber-config.ts`
- * (Contract §1); die Datei entsteht gerade und ein Import auf eine fehlende
- * Datei bräche `tsc --noEmit` für das ganze Team. Sobald sie da ist, diese
- * Deklaration durch
- *   import type { KiConfig } from "./betreiber-config.ts";
- * ersetzen — die Form ist absichtlich identisch, der Tausch ist eine Zeile.
- */
-type KiConfig = {
-  apiKey: string;
-  braveKey: string | null;
-  baseUrl: string;
-  model: string;
-};
 
 export interface HostCtx {
   repoRoot: string;
@@ -86,6 +74,25 @@ export interface HostCtx {
    * `undefined` ist derselbe Fall — „kein Modellzugang".
    */
   ki?: KiConfig | null;
+}
+
+/**
+ * Der Teil von `Bun.Server`, den der Router braucht — mehr nicht.
+ *
+ * Gebraucht wird er allein für `server.timeout(req, 0)` auf dem Ereignisstrom:
+ * Bun beendet jede Antwort, die `idleTimeout` lang (Vorgabe 10 s) kein Byte
+ * geliefert hat. Ein Agentenlauf schweigt minutenlang, während das Modell
+ * nachdenkt — ohne diese Abschaltung risse die Seitenleiste reproduzierbar
+ * nach zehn Sekunden ab, und zwar erst in Produktion, weil im Test niemand so
+ * lange wartet. Ein globales `idleTimeout: 0` wäre der falsche Handel: Es
+ * nähme JEDER Anfrage den Schutz vor Stillstand, um ein Problem zu lösen, das
+ * eine einzige Route hat.
+ *
+ * Als schmale Form statt `Bun.Server`, damit ein Test eine Attrappe übergeben
+ * und nachweisen kann, dass die Abschaltung wirklich passiert.
+ */
+export interface AnfrageZeitgrenze {
+  timeout(request: Request, seconds: number): void;
 }
 
 /**
@@ -435,12 +442,29 @@ async function parseBody(req: Request): Promise<Record<string, unknown>> {
   return obj;
 }
 
-/** Haupt-Router. Synchron oder als Promise<Response>. */
-export function handleEditorRequest(req: Request, url: URL, ctx: HostCtx): Promise<Response> {
-  return route(req, url, ctx);
+/**
+ * Haupt-Router. Synchron oder als Promise<Response>.
+ *
+ * `srv` ist optional, damit die bestehenden Aufrufer und Tests unverändert
+ * bleiben; nur der Ereignisstrom braucht es (siehe AnfrageZeitgrenze). Fehlt
+ * es, funktioniert alles außer der Zeitgrenze — der Strom risse dann nach
+ * zehn Sekunden ab, statt gar nicht erst zu entstehen.
+ */
+export function handleEditorRequest(
+  req: Request,
+  url: URL,
+  ctx: HostCtx,
+  srv?: AnfrageZeitgrenze,
+): Promise<Response> {
+  return route(req, url, ctx, srv);
 }
 
-async function route(req: Request, url: URL, ctx: HostCtx): Promise<Response> {
+async function route(
+  req: Request,
+  url: URL,
+  ctx: HostCtx,
+  srv?: AnfrageZeitgrenze,
+): Promise<Response> {
   const path = url.pathname;
   const method = req.method.toUpperCase();
 
@@ -633,6 +657,23 @@ async function route(req: Request, url: URL, ctx: HostCtx): Promise<Response> {
   if (isApiRoute) {
     if (!isAuthed(req, ctx)) return notFound();
 
+    // --- KI-Seitenleiste ---
+    // Ohne betreiberweiten Modellzugang gibt es diese Routen NICHT — auch mit
+    // gültigem Cookie. Fail-closed wie bei fehlender Auth-Datei: 404, kein 503,
+    // keine Fehlermeldung. Sonst wäre die Antwort ein Orakel darüber, welche
+    // Websites dieser Server bedient und wie er eingerichtet ist.
+    //
+    // `== null` und nicht `=== null`: `ki` ist optional am HostCtx, und ein Ctx,
+    // der das Feld gar nicht kennt, ist derselbe Fall — kein Modellzugang.
+    if (path.startsWith("/edit/agent")) {
+      if (ctx.ki == null) return notFound();
+      if (path === "/edit/agent" && method === "POST") return handleAgentStart(req, ctx);
+      if (path === "/edit/agent/status" && method === "GET") return handleAgentStatus(ctx);
+      if (path === "/edit/agent/abort" && method === "POST") return handleAgentAbort(ctx);
+      if (path === "/edit/agent/events" && method === "GET") return handleAgentEvents(req, ctx, srv);
+      return notFound();
+    }
+
     if (path === "/edit/save" && method === "POST") return handleSave(req, ctx);
     if (path === "/edit/upload" && method === "POST") return handleUpload(req, ctx);
     if (path === "/edit/restore" && method === "POST") return handleRestore(req, ctx);
@@ -690,6 +731,9 @@ async function route(req: Request, url: URL, ctx: HostCtx): Promise<Response> {
       scriptUrl: "/edit-assets/overlay.js",
       pages: ctx.pageWhitelist,
       page: target.page,
+      // Ohne Modellzugang erscheint die Seitenleiste gar nicht erst im DOM —
+      // ein Knopf, der nur 404 erntet, ist schlimmer als kein Knopf.
+      ki: ctx.ki != null,
     });
     return html(out);
   }
@@ -851,6 +895,204 @@ async function handleRestore(req: Request, ctx: HostCtx): Promise<Response> {
     return json({ ok: false, error: "restore-failed" }, 400);
   }
   return json({ ok: true });
+}
+
+// ===========================================================================
+// KI-Seitenleiste — vier Routen (Contract §7)
+//
+// Der Wortlaut jeder Fehlermeldung und jeder Statuscode gehören hierher
+// (Contract §10). `agent.ts` liefert maschinenlesbare Gründe; erst hier werden
+// daraus deutsche Sätze. Stünde der Wortlaut an beiden Stellen, driftete er.
+// ===========================================================================
+
+/**
+ * Obergrenze für einen Auftrag.
+ *
+ * Der Auftrag geht in den System-Prompt des Modells und als Umgebungsvariable
+ * an den Worker. Ohne Grenze ist beides ein bezahltes Fass ohne Boden, und der
+ * Kernel hat für Umgebungsvariablen eine eigene, deutlich unfreundlichere
+ * Grenze — die schlüge als unverständlicher Startfehler durch statt als klarer
+ * Satz im Browser. 4000 Zeichen sind rund 600 Wörter; ein Kundenauftrag in
+ * normalen Sätzen bleibt weit darunter.
+ */
+const MAX_AUFTRAG_ZEICHEN = 4000;
+
+/**
+ * Maschinenlesbare Gründe aus `agent.ts` in Sätze übersetzen, die ein
+ * Handwerksbetrieb versteht. Alles Unbekannte geht unverändert durch: Der
+ * Validator und die Recherche liefern bereits deutschen Klartext, und den
+ * hier noch einmal zu übersetzen hieße, ihn zu verlieren.
+ */
+function agentFehlerText(grund: string): string {
+  switch (grund) {
+    case "kein-lauf":
+      return "Kein Lauf aktiv.";
+    case "kein-modellzugang":
+      return "Der KI-Assistent ist auf diesem Server nicht eingerichtet.";
+    case "lauf-gescheitert":
+      return "Der Auftrag konnte nicht ausgeführt werden. Es wurde nichts geändert.";
+    case "worker-abgestuerzt":
+      // Nachgemessen: Ohne diesen Fall stand wörtlich „worker-abgestuerzt" im
+      // Chatfenster des Kunden. Was schiefging, gehört ins Log des Betreibers;
+      // der Kunde braucht zu wissen, dass seine Website unberührt ist.
+      return "Der Assistent hat sich unerwartet beendet. An der Website wurde nichts geändert.";
+    case "kontingent-erschoepft":
+      return "Das Monatskontingent ist mitten im Auftrag aufgebraucht. Es wurde nichts geändert; am Monatsersten geht es weiter.";
+    case "ende":
+      return "Der Auftrag wurde abgebrochen.";
+    default:
+      return grund;
+  }
+}
+
+async function handleAgentStart(req: Request, ctx: HostCtx): Promise<Response> {
+  const body = await parseBody(req);
+  const auftrag = typeof body.auftrag === "string" ? body.auftrag.trim() : "";
+  // Leer und „nur Leerzeichen" sind derselbe Fall: Ein Lauf ohne Auftrag würde
+  // Kontingent verbrauchen, um nichts zu tun.
+  if (auftrag === "") {
+    return json({ ok: false, grund: "Auftrag fehlt." }, 400);
+  }
+  if (auftrag.length > MAX_AUFTRAG_ZEICHEN) {
+    return json(
+      {
+        ok: false,
+        grund: `Der Auftrag ist zu lang (${auftrag.length} Zeichen, erlaubt sind ${MAX_AUFTRAG_ZEICHEN}). Beschreibe in ein paar Sätzen, was sich ändern soll.`,
+      },
+      400,
+    );
+  }
+
+  const start = starteLauf(ctx, auftrag);
+  if (start.ok) return json({ ok: true, laufId: start.laufId });
+
+  switch (start.grund) {
+    case "laeuft-bereits":
+      return json({ ok: false, grund: "Es läuft bereits ein Auftrag für diese Website." }, 409);
+    case "kontingent":
+      return json(
+        {
+          ok: false,
+          grund: "Das Monatskontingent ist aufgebraucht. Es setzt sich am Monatsersten zurück.",
+        },
+        429,
+      );
+    case "keine-sandbox":
+      // 503 und nicht 500: Es ist eine fehlende Voraussetzung des Servers, kein
+      // Fehler des Kunden und nichts, was ein zweiter Versuch behebt.
+      return json(
+        { ok: false, grund: "Die Sandbox (bwrap) ist auf diesem Server nicht verfügbar." },
+        503,
+      );
+  }
+}
+
+function handleAgentStatus(ctx: HostCtx): Response {
+  const k = pruefeKontingent(ctx.siteDir);
+  return json({
+    ok: true,
+    laeuft: laufAktiv(ctx.siteDir) !== null,
+    laufId: laufAktiv(ctx.siteDir),
+    // Bewusst nur diese vier Felder: `tokens` und `laeufe` aus dem Kontingent
+    // sind Betreiber-Buchhaltung und gehen den Browser nichts an. `gesamt`
+    // kommt dazu, damit die Seitenleiste „noch X von Y" anzeigen kann, ohne
+    // die Obergrenze selbst zu kennen — sonst rechnete sie beim Monatswechsel
+    // falsch.
+    kontingent: {
+      frei: k.frei,
+      gesamt: TOKEN_KONTINGENT,
+      erschoepft: k.erschoepft,
+      monat: k.monat,
+    },
+  });
+}
+
+function handleAgentAbort(ctx: HostCtx): Response {
+  // Idempotent: Auch ohne laufenden Auftrag 200. Ein 404 wäre hier irreführend
+  // (die Route gibt es ja) und ein 409 zwänge die Seitenleiste zu einer
+  // Fallunterscheidung, die niemandem hilft — abgebrochen ist abgebrochen.
+  brichAb(ctx.siteDir);
+  return json({ ok: true });
+}
+
+/** Ein Ereignis als SSE-Rahmen. Der Ereignisname ist `t`, der Rest die Daten. */
+function sseRahmen(e: AgentEreignis): string {
+  const { t, ...daten } = e;
+  const nutzlast = t === "fehler" ? { grund: agentFehlerText(e.grund) } : daten;
+  // EINE `data:`-Zeile je Ereignis: `JSON.stringify` maskiert Zeilenumbrüche
+  // selbst und kann ein Ereignis daher nie zerschneiden. Ein roher Umbruch im
+  // Text des Agenten würde den Rahmen sonst mitten im Satz beenden.
+  return `event: ${t}\ndata: ${JSON.stringify(nutzlast)}\n\n`;
+}
+
+function handleAgentEvents(req: Request, ctx: HostCtx, srv?: AnfrageZeitgrenze): Response {
+  // Bun beendet jede Antwort, die `idleTimeout` lang (Vorgabe 10 s) kein Byte
+  // geliefert hat. Ein Agentenlauf schweigt minutenlang, während das Modell
+  // nachdenkt — ohne diese Abschaltung risse der Strom reproduzierbar ab, und
+  // zwar erst in Produktion.
+  srv?.timeout(req, 0);
+
+  const quelle = ereignisse(ctx.siteDir);
+  const enc = new TextEncoder();
+  let offen = true;
+
+  // Klassischer ReadableStream, NICHT `type: "direct"`: dort feuert `cancel()`
+  // unzuverlässig (oven-sh/bun#18315), und ein nicht feuerndes `cancel` hieße
+  // hier, dass der Zuhörer bis zum Prozessende registriert bleibt.
+  const strom = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      // SOFORT ein Byte senden, bevor irgendetwas passiert.
+      //
+      // Gemessen an Caddy 2.11.4: direkt am Bun-Host liegen 0,0003 s zwischen
+      // Anfrage und erstem Byte, durch den Proxy 4 s — genau so lange, bis das
+      // erste echte Ereignis kam. `flush_interval -1` ändert daran nichts,
+      // denn gepuffert wird nicht der Körper, sondern die ANTWORT-HEADER: Go
+      // gibt sie erst mit dem ersten Körper-Byte heraus. Im Browser feuert
+      // `onopen` deshalb erst mit dem ersten Ereignis — bei einem Agentenlauf
+      // sind das Minuten, in denen die Seitenleiste leer steht und jede
+      // Zwischenstation die Verbindung für tot halten darf.
+      //
+      // Eine SSE-Kommentarzeile OHNE abschließende Leerzeile: Sie schiebt
+      // Bytes auf die Leitung, löst aber kein Ereignis aus. Mit Leerzeile wäre
+      // es ein leerer `message`-Rahmen — der Browser ignoriert den zwar, aber
+      // jeder mitlesende Parser zählte ihn als Ereignis.
+      controller.enqueue(enc.encode(": verbunden\n"));
+      try {
+        for await (const e of quelle) {
+          if (!offen) break;
+          controller.enqueue(enc.encode(sseRahmen(e)));
+        }
+      } catch (err) {
+        // Der Lauf ist ein fremder Prozess; ein Fehler hier darf den Server
+        // nicht mitreißen. Ins Log, nicht in den Browser — die Meldung könnte
+        // interne Pfade enthalten.
+        console.error(
+          `[regoro] Ereignisstrom abgebrochen: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      if (offen) {
+        offen = false;
+        try {
+          controller.close();
+        } catch {
+          /* der Client war schneller weg */
+        }
+      }
+    },
+    cancel() {
+      // Der Kunde hat den Tab geschlossen oder neu geladen. Das hängt NUR den
+      // Zuhörer ab und beendet den Lauf nicht (§13.14): Ein versehentlicher
+      // Reload wäre sonst ein Abbruchknopf für Arbeit, deren Kontingent schon
+      // gebucht ist. Abgebrochen wird ausschließlich über /edit/agent/abort.
+      offen = false;
+      void quelle.return(undefined as never);
+    },
+  });
+
+  return new Response(strom, {
+    status: 200,
+    headers: withHeaders({ "Content-Type": "text/event-stream; charset=utf-8" }),
+  });
 }
 
 /**

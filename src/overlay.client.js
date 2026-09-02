@@ -5,7 +5,7 @@
  * Wird vom Editor-Host vor </body> eingebunden via <script src="/edit-assets/overlay.js">.
  *
  * Erwartet (vom Server injiziert):
- *   - window.__REGORO_EDIT__ = { pagePath, fileHash, pages?:string[], page?:string }
+ *   - window.__REGORO_EDIT__ = { pagePath, fileHash, pages?:string[], page?:string, ki?:boolean }
  *   - data-edit-idx="N" auf jedem editierbaren Text-Lauf (inline-<span>, auch der
  *     Text rund um Inline-Links — Mixed-Content). Format gilt für den GANZEN Lauf.
  *   - data-edit-img-idx="N" auf jedem austauschbaren <img> (Bild-Upload im Edit-Modus).
@@ -30,6 +30,13 @@
  *   GET  /edit/version/<commit>?page=<basename>   (read-only HTML-Vorschau)
  *   POST /edit/restore         { commit, pagePath } -> 200 { ok:true }
  *
+ * KI-Seitenleiste (nur wenn CFG.ki === true; sonst existiert sie nicht im DOM):
+ *   POST /edit/agent           { auftrag } -> 200 { ok:true, laufId } | 400/409/429/503 { ok:false, grund }
+ *   GET  /edit/agent/status    -> 200 { ok:true, laeuft, laufId, kontingent:{frei,gesamt,erschoepft,monat} }
+ *   GET  /edit/agent/events    text/event-stream: text | werkzeug | tokens | fertig | fehler
+ *   POST /edit/agent/abort     -> 200 { ok:true }  (idempotent)
+ * Alle Agenten-Routen antworten unangemeldet mit 404, nie 401.
+ *
  * Alle UI-Elemente und CSS-Klassen sind mit "__regoro" geprefixt, damit nichts
  * mit site/styles.css kollidiert.
  */
@@ -51,6 +58,19 @@
   var elements = [];
   var activeRun = null;     // aktuell fokussierter elements-Eintrag (für die Format-Toolbar)
   var versionsPanel = null;
+  // KI-Seitenleiste: Panel, offener Ereignisstrom und der zuletzt bekannte
+  // Laufzustand. `agentQuelle` MUSS beim Schließen zugemacht werden — eine
+  // offene EventSource verbindet sich sonst nach jedem Serverende von selbst
+  // neu und hält den Lauf-Endpunkt dauerhaft belegt.
+  var agentPanel = null;
+  var agentQuelle = null;
+  var agentLaeuft = false;
+  // Die Sprechblase, an die gerade angehängt wird. `text`-Ereignisse kommen
+  // token-für-token aus dem Modell — an einem echten Lauf gemessen waren es
+  // für zwei Sätze über sechzig Stück („Nun", " fü", "ge ich", …). Je eine
+  // Blase daraus zu machen wäre unlesbar; sie werden deshalb in EINE Blase
+  // geschrieben, bis ein anderes Ereignis dazwischenkommt.
+  var agentTextBlase = null;
   // Bild-Austausch-State.
   var images = [];          // [{ img, imgIdx, badge, imgClickHandler }]
   var fileInput = null;     // verstecktes <input type="file">, lazily erzeugt
@@ -468,6 +488,57 @@
       "[data-edit-del-idx].__regoro-block-flash{outline:2px solid #e2571e;outline-offset:3px;",
       "transition:outline-color .2s;}",
       "[data-edit-del-idx].__regoro-block-del{opacity:.45;outline:2px dashed #e2571e;outline-offset:3px;}",
+      // KI-Seitenleiste. Gleiche Geometrie wie das Versionen-Panel, aber ein
+      // höherer z-index (2147483603 > 2147483601): Beide schließen sich zwar
+      // gegenseitig aus, aber wenn doch einmal beide offen sind, soll das
+      // Chatfenster oben liegen — dort tippt der Kunde.
+      "#__regoro-agent{position:fixed;top:0;right:0;bottom:0;width:420px;max-width:96vw;",
+      "z-index:2147483603;background:#fff;color:#16222e;box-shadow:-4px 0 18px rgba(0,0,0,.28);",
+      "display:flex;flex-direction:column;",
+      "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;}",
+      "#__regoro-agent *{box-sizing:border-box;}",
+      "#__regoro-agent .__regoro-ahead{display:flex;align-items:center;justify-content:space-between;",
+      "padding:14px 16px;background:#14324f;color:#fff;flex:0 0 auto;}",
+      "#__regoro-agent .__regoro-ahead h2{margin:0;font-size:16px;font-weight:700;}",
+      "#__regoro-agent .__regoro-aclose{appearance:none;background:transparent;border:0;",
+      "color:#fff;font-size:22px;line-height:1;cursor:pointer;padding:0 4px;}",
+      "#__regoro-agent .__regoro-aquota{flex:0 0 auto;padding:8px 16px;background:#f5f8fa;",
+      "border-bottom:1px solid #e2e8ec;font-size:12.5px;color:#5a6b78;}",
+      "#__regoro-agent .__regoro-aquota.__regoro-aleer{background:#fff4e5;color:#663c00;}",
+      "#__regoro-agent .__regoro-averlauf{flex:1 1 auto;overflow:auto;padding:12px 16px;",
+      "display:flex;flex-direction:column;gap:10px;}",
+      "#__regoro-agent .__regoro-anachricht{font-size:14px;line-height:1.5;white-space:pre-wrap;",
+      "overflow-wrap:anywhere;border-radius:10px;padding:9px 12px;}",
+      "#__regoro-agent .__regoro-avon-kunde{background:#14324f;color:#fff;align-self:flex-end;",
+      "max-width:85%;}",
+      "#__regoro-agent .__regoro-avon-agent{background:#f0f4f7;color:#16222e;align-self:flex-start;",
+      "max-width:95%;}",
+      "#__regoro-agent .__regoro-awerkzeug{font-size:12.5px;color:#5a6b78;align-self:flex-start;",
+      "display:flex;align-items:center;gap:6px;}",
+      "#__regoro-agent .__regoro-afehler{background:#fdecea;color:#b3261e;border:1px solid #f5c2bd;}",
+      "#__regoro-agent .__regoro-afertig{background:#e9f7ef;color:#14663a;border:1px solid #b7e2c8;}",
+      "#__regoro-agent .__regoro-adateien{margin:6px 0 0;padding-left:18px;font-size:13px;}",
+      "#__regoro-agent .__regoro-aform{flex:0 0 auto;border-top:1px solid #e2e8ec;padding:10px 12px;",
+      "display:flex;flex-direction:column;gap:8px;background:#fff;}",
+      "#__regoro-agent textarea.__regoro-aeingabe{width:100%;min-height:66px;max-height:180px;",
+      "resize:vertical;border:1px solid #cbd5dc;border-radius:8px;padding:8px 10px;font:inherit;",
+      "font-size:14px;color:#16222e;background:#fff;}",
+      "#__regoro-agent textarea.__regoro-aeingabe:focus{outline:2px solid #e2571e;outline-offset:-1px;}",
+      "#__regoro-agent textarea.__regoro-aeingabe:disabled{background:#f5f8fa;color:#8a99a6;}",
+      "#__regoro-agent .__regoro-azeile{display:flex;gap:8px;align-items:center;}",
+      "#__regoro-agent button.__regoro-abtn{appearance:none;border:1px solid #cbd5dc;background:#f5f8fa;",
+      "color:#16222e;border-radius:999px;padding:8px 16px;font:inherit;font-size:14px;cursor:pointer;}",
+      "#__regoro-agent button.__regoro-abtn:hover{background:#e8eef2;}",
+      "#__regoro-agent button.__regoro-abtn:disabled{opacity:.45;cursor:not-allowed;}",
+      "#__regoro-agent button.__regoro-asenden{background:#e2571e;border-color:#e2571e;color:#fff;",
+      "font-weight:600;flex:1 1 auto;}",
+      "#__regoro-agent button.__regoro-asenden:hover{background:#cf4d18;}",
+      "#__regoro-agent .__regoro-ahinweis{font-size:12.5px;color:#5a6b78;line-height:1.45;}",
+      "#__regoro-agent .__regoro-ahinweis.__regoro-awarn{color:#a83c12;font-weight:600;}",
+      // Punkt-Animation, solange der Agent arbeitet.
+      "#__regoro-agent .__regoro-apuls{display:inline-block;width:8px;height:8px;border-radius:50%;",
+      "background:#e2571e;animation:__regoro-apuls 1.1s ease-in-out infinite;}",
+      "@keyframes __regoro-apuls{0%,100%{opacity:.25}50%{opacity:1}}",
       // Body-Offset, damit der fixe Balken nichts verdeckt
       "body.__regoro-offset{padding-top:52px;}"
     ].join("");
@@ -491,6 +562,12 @@
     ui.btnSave = el("button", { class: "__regoro-btn __regoro-primary", text: "Speichern", type: "button" });
     ui.btnDiscard = el("button", { class: "__regoro-btn", text: "Verwerfen", type: "button" });
     ui.btnVersions = el("button", { class: "__regoro-btn", text: "Versionen", type: "button" });
+    // Nur wenn der Server einen Modellzugang hat. Ohne ihn antworten alle
+    // Agenten-Routen mit 404 — ein Knopf, der zuverlässig nichts tut, ist
+    // schlechter als gar keiner.
+    ui.btnAgent = CFG.ki === true
+      ? el("button", { class: "__regoro-btn", type: "button", title: "Der Website in normalen Sätzen sagen, was sich ändern soll" }, ["KI-Assistent"])
+      : null;
 
     ui.status = el("span", { class: "__regoro-status" });
     var spacer = el("span", { class: "__regoro-spacer" });
@@ -503,6 +580,7 @@
     bar.appendChild(ui.btnSave);
     bar.appendChild(ui.btnDiscard);
     bar.appendChild(ui.btnVersions);
+    if (ui.btnAgent) bar.appendChild(ui.btnAgent);
     bar.appendChild(formatBar);
     bar.appendChild(spacer);
     bar.appendChild(ui.status);
@@ -511,6 +589,7 @@
     ui.btnSave.addEventListener("click", onSave);
     ui.btnDiscard.addEventListener("click", onDiscard);
     ui.btnVersions.addEventListener("click", onVersions);
+    if (ui.btnAgent) ui.btnAgent.addEventListener("click", onAgent);
 
     document.body.appendChild(bar);
     document.body.classList.add("__regoro-offset");
@@ -1814,6 +1893,9 @@
   // Versionen-Panel
   // ---------------------------------------------------------------------------
   function onVersions() {
+    // Beide Panels liegen am selben Bildschirmrand — offen wäre nur eines
+    // sichtbar, und der Kunde klickte ins Unsichtbare.
+    closeAgent();
     // Dirty-Guard (Stufe 1): vor Öffnen warnen.
     if (isDirty() && !window.confirm(
       "Es gibt ungespeicherte Änderungen. Versionen öffnen und Änderungen ignorieren?\n" +
@@ -1955,6 +2037,365 @@
   }
 
   // ---------------------------------------------------------------------------
+  // KI-Seitenleiste
+  //
+  // Der Lauf gehört der WEBSITE, nicht diesem Browserfenster: Ein Reload oder
+  // ein zweiter Tab hängt sich an denselben Lauf, und das Schließen des Panels
+  // bricht nichts ab. Abgebrochen wird ausschließlich über den Knopf, der
+  // /edit/agent/abort ruft. Deshalb fragt das Öffnen immer zuerst den Zustand
+  // ab, statt von „nichts läuft" auszugehen.
+  // ---------------------------------------------------------------------------
+  function onAgent() {
+    if (agentPanel) {
+      closeAgent();
+      return;
+    }
+    closeVersions();
+    openAgent();
+  }
+
+  function closeAgent() {
+    // Den Strom zuerst schließen: Eine offene EventSource verbindet sich sonst
+    // nach jedem Ende von selbst neu, auch wenn das Panel längst weg ist.
+    if (agentQuelle) {
+      agentQuelle.close();
+      agentQuelle = null;
+    }
+    if (agentPanel && agentPanel.parentNode) {
+      agentPanel.parentNode.removeChild(agentPanel);
+    }
+    agentPanel = null;
+  }
+
+  function openAgent() {
+    var panel = el("div", { id: "__regoro-agent" });
+
+    var head = el("div", { class: "__regoro-ahead" }, [
+      el("h2", { text: "KI-Assistent" })
+    ]);
+    var closeBtn = el("button", {
+      class: "__regoro-aclose", text: "\u00d7", type: "button", "aria-label": "Schließen"
+    });
+    closeBtn.addEventListener("click", closeAgent);
+    head.appendChild(closeBtn);
+
+    var quota = el("div", { class: "__regoro-aquota", text: "Kontingent wird geladen…" });
+    // aria-live: Der Verlauf wächst asynchron; ohne das bekommt ein Screenreader
+    // nichts davon mit.
+    var verlauf = el("div", { class: "__regoro-averlauf", role: "log", "aria-live": "polite" });
+
+    var eingabe = el("textarea", {
+      class: "__regoro-aeingabe",
+      placeholder: "Zum Beispiel: Leg eine Unterseite über Badsanierung an und verlink sie in der Navigation.",
+      "aria-label": "Auftrag an den KI-Assistenten"
+    });
+    var senden = el("button", { class: "__regoro-abtn __regoro-asenden", type: "button", text: "Auftrag geben" });
+    var abbrechen = el("button", { class: "__regoro-abtn", type: "button", text: "Abbrechen" });
+    abbrechen.disabled = true;
+    var hinweis = el("div", { class: "__regoro-ahinweis" });
+
+    var form = el("div", { class: "__regoro-aform" }, [
+      eingabe,
+      el("div", { class: "__regoro-azeile" }, [senden, abbrechen]),
+      hinweis
+    ]);
+
+    panel.appendChild(head);
+    panel.appendChild(quota);
+    panel.appendChild(verlauf);
+    panel.appendChild(form);
+    document.body.appendChild(panel);
+    agentPanel = panel;
+
+    ui.agent = {
+      quota: quota, verlauf: verlauf, eingabe: eingabe,
+      senden: senden, abbrechen: abbrechen, hinweis: hinweis
+    };
+
+    senden.addEventListener("click", onAuftragSenden);
+    abbrechen.addEventListener("click", onAuftragAbbrechen);
+    // Strg/Cmd+Enter schickt ab — Enter allein bleibt ein Zeilenumbruch, weil
+    // ein Auftrag oft mehrere Sätze hat.
+    eingabe.addEventListener("keydown", function (e) {
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        onAuftragSenden();
+      }
+    });
+
+    ladeAgentStatus();
+  }
+
+  /** Zustand vom Server holen: Kontingent, und ob gerade schon etwas läuft. */
+  function ladeAgentStatus() {
+    fetch("/edit/agent/status", {
+      credentials: "same-origin",
+      headers: { "Accept": "application/json" }
+    }).then(function (res) {
+      if (!res.ok) throw new Error("Der KI-Assistent ist auf diesem Server nicht eingerichtet.");
+      return res.json();
+    }).then(function (st) {
+      if (!agentPanel) return;                       // zwischenzeitlich geschlossen
+      zeigeKontingent(st && st.kontingent);
+      if (st && st.laeuft) {
+        // Ein Lauf ist schon unterwegs (Reload, zweiter Tab, anderes Gerät).
+        // Anhängen statt einen zweiten zu starten — der zweite bekäme 409.
+        agentNachricht("Es läuft bereits ein Auftrag für diese Website. Ich hänge mich an.", "agent");
+        verbindeStrom();
+      }
+    }).catch(function (err) {
+      if (!agentPanel) return;
+      setAgentHinweis(err && err.message ? err.message : "Zustand nicht abrufbar.", true);
+      ui.agent.senden.disabled = true;
+    });
+  }
+
+  function zeigeKontingent(k) {
+    if (!agentPanel) return;
+    var q = ui.agent.quota;
+    if (!k || typeof k.frei !== "number" || typeof k.gesamt !== "number") {
+      q.textContent = "Kontingent unbekannt.";
+      return;
+    }
+    q.classList.toggle("__regoro-aleer", !!k.erschoepft);
+    if (k.erschoepft) {
+      q.textContent = "Das Monatskontingent ist aufgebraucht. Es setzt sich am Monatsersten zurück.";
+      ui.agent.senden.disabled = true;
+      return;
+    }
+    q.textContent = "Noch " + zahl(k.frei) + " von " + zahl(k.gesamt) + " Zeichen-Einheiten in diesem Monat.";
+  }
+
+  function zahl(n) {
+    try { return Number(n).toLocaleString("de-DE"); } catch (e) { return String(n); }
+  }
+
+  function setAgentHinweis(text, warnend) {
+    if (!agentPanel) return;
+    ui.agent.hinweis.className = "__regoro-ahinweis" + (warnend ? " __regoro-awarn" : "");
+    ui.agent.hinweis.textContent = text || "";
+  }
+
+  /**
+   * Text vom Agenten anhängen — an die laufende Blase, wenn es eine gibt.
+   * Siehe agentTextBlase: Das Modell liefert einzelne Wortstücke.
+   */
+  function agentText(stueck) {
+    if (!agentPanel || !stueck) return;
+    if (!agentTextBlase) {
+      agentTextBlase = agentNachricht(stueck, "agent");
+      return;
+    }
+    agentTextBlase.textContent += stueck;
+    ui.agent.verlauf.scrollTop = ui.agent.verlauf.scrollHeight;
+  }
+
+  /** Eine Zeile in den Verlauf hängen und ans Ende scrollen. */
+  function agentNachricht(text, art) {
+    if (!agentPanel) return null;
+    var klasse = "__regoro-anachricht ";
+    if (art === "kunde") klasse += "__regoro-avon-kunde";
+    else if (art === "fehler") klasse += "__regoro-avon-agent __regoro-afehler";
+    else if (art === "fertig") klasse += "__regoro-avon-agent __regoro-afertig";
+    else klasse += "__regoro-avon-agent";
+    var node = el("div", { class: klasse, text: text });
+    ui.agent.verlauf.appendChild(node);
+    ui.agent.verlauf.scrollTop = ui.agent.verlauf.scrollHeight;
+    return node;
+  }
+
+  function agentWerkzeug(kurz) {
+    if (!agentPanel) return;
+    // Ein Werkzeug beendet den laufenden Satz — der nächste Text ist ein neuer.
+    agentTextBlase = null;
+    var node = el("div", { class: "__regoro-awerkzeug" }, [
+      el("span", { class: "__regoro-apuls" }),
+      el("span", { text: kurz })
+    ]);
+    ui.agent.verlauf.appendChild(node);
+    ui.agent.verlauf.scrollTop = ui.agent.verlauf.scrollHeight;
+  }
+
+  function setAgentLaeuft(laeuft) {
+    agentLaeuft = laeuft;
+    if (!agentPanel) return;
+    ui.agent.senden.disabled = laeuft;
+    ui.agent.eingabe.disabled = laeuft;
+    ui.agent.abbrechen.disabled = !laeuft;
+  }
+
+  function onAuftragSenden() {
+    if (!agentPanel || agentLaeuft) return;
+    var auftrag = (ui.agent.eingabe.value || "").trim();
+    if (!auftrag) {
+      setAgentHinweis("Schreib zuerst, was sich ändern soll.", true);
+      return;
+    }
+    // Ungespeicherte Text-Edits: Der Agent arbeitet auf der Datei auf Platte,
+    // nicht auf dem DOM dieses Fensters. Liefe er los, schriebe er die Datei
+    // neu — und die Änderungen hier im Browser wären beim nächsten Laden weg,
+    // ohne dass jemand es gemerkt hätte. Deshalb ablehnen und den Grund nennen.
+    if (isDirty()) {
+      setAgentHinweis(
+        "Es gibt ungespeicherte Änderungen an dieser Seite. Speichere sie zuerst — sonst " +
+        "gingen sie verloren, sobald der Assistent die Datei neu schreibt.", true);
+      return;
+    }
+
+    setAgentHinweis("");
+    agentTextBlase = null;
+    agentNachricht(auftrag, "kunde");
+    ui.agent.eingabe.value = "";
+    setAgentLaeuft(true);
+
+    fetch("/edit/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({ auftrag: auftrag })
+    }).then(function (res) {
+      return res.json().catch(function () { return null; }).then(function (body) {
+        return { status: res.status, ok: res.ok, body: body };
+      });
+    }).then(function (r) {
+      if (!r.ok) {
+        // Der Server liefert für jeden Fehlerfall einen deutschen Klartextsatz;
+        // 404 hat als einzige keinen Rumpf (die Route existiert dann nicht).
+        var grund = r.body && r.body.grund
+          ? r.body.grund
+          : "Der KI-Assistent ist gerade nicht verfügbar.";
+        agentNachricht(grund, "fehler");
+        setAgentLaeuft(false);
+        ladeAgentStatus();                 // Kontingentanzeige nachziehen
+        return;
+      }
+      verbindeStrom();
+    }).catch(function () {
+      agentNachricht("Der Auftrag konnte nicht abgeschickt werden.", "fehler");
+      setAgentLaeuft(false);
+    });
+  }
+
+  function onAuftragAbbrechen() {
+    ui.agent.abbrechen.disabled = true;
+    fetch("/edit/agent/abort", {
+      method: "POST",
+      credentials: "same-origin"
+    }).catch(function () {
+      /* Ist der Abbruch nicht angekommen, endet der Lauf regulär — kein Grund
+         zur Panik im Browser. Der Strom meldet ohnehin, was passiert ist. */
+    });
+    setAgentHinweis("Abbruch angefordert…");
+  }
+
+  /**
+   * Hängt sich an den Ereignisstrom des laufenden Auftrags.
+   *
+   * EventSource verbindet sich nach jedem Serverende von selbst neu. Nach
+   * `fertig`/`fehler` MUSS deshalb close() folgen — sonst fragt der Browser
+   * endlos nach, bekommt jedes Mal „Kein Lauf aktiv." und der Verlauf füllt
+   * sich mit Fehlermeldungen.
+   */
+  function verbindeStrom() {
+    if (agentQuelle) agentQuelle.close();
+    setAgentLaeuft(true);
+
+    var quelle = new EventSource("/edit/agent/events");
+    agentQuelle = quelle;
+
+    function schliessen() {
+      if (agentQuelle === quelle) agentQuelle = null;
+      quelle.close();
+      setAgentLaeuft(false);
+    }
+
+    quelle.addEventListener("text", function (ev) {
+      var d = parseEreignis(ev);
+      if (d && typeof d.inhalt === "string") agentText(d.inhalt);
+    });
+    quelle.addEventListener("werkzeug", function (ev) {
+      var d = parseEreignis(ev);
+      if (d) agentWerkzeug(d.kurz || d.name || "arbeitet…");
+    });
+    quelle.addEventListener("tokens", function (ev) {
+      if (!agentPanel) return;
+      var d = parseEreignis(ev);
+      if (d && typeof d.frei === "number") {
+        // gesamt kommt aus dem Status; hier zählt nur der neue Rest.
+        var q = ui.agent.quota;
+        q.textContent = "Noch " + zahl(d.frei) + " Zeichen-Einheiten in diesem Monat.";
+      }
+    });
+    quelle.addEventListener("fertig", function (ev) {
+      var d = parseEreignis(ev) || {};
+      schliessen();
+      zeigeFertig(d);      // räumt agentTextBlase selbst auf
+    });
+    quelle.addEventListener("fehler", function (ev) {
+      var d = parseEreignis(ev) || {};
+      schliessen();
+      agentTextBlase = null;
+      agentNachricht(d.grund || "Der Auftrag ist gescheitert.", "fehler");
+      ladeAgentStatus();
+    });
+    quelle.onerror = function () {
+      // Bricht die Verbindung ab, bevor ein Abschluss kam, versucht EventSource
+      // es selbst erneut — das ist gewollt (WLAN-Wackler). Nur wenn der Browser
+      // endgültig aufgegeben hat, ist es ein Fehler für den Kunden.
+      if (quelle.readyState === 2 /* CLOSED */) {
+        schliessen();
+        setAgentHinweis("Die Verbindung zum Assistenten ist abgerissen. Der Auftrag läuft " +
+          "möglicherweise weiter — öffne die Leiste neu, um nachzusehen.", true);
+      }
+    };
+  }
+
+  function parseEreignis(ev) {
+    try {
+      return JSON.parse(ev.data);
+    } catch (e) {
+      return null;                            // fremder Prozess, kaputte Zeile
+    }
+  }
+
+  function zeigeFertig(d) {
+    var zus = String(d.zusammenfassung || "Fertig.").trim();
+    var node;
+    // Der Agent schickt seine Zusammenfassung ERST als text-Ereignisse und
+    // danach noch einmal im fertig-Ereignis. Im Browser gemessen: derselbe
+    // Absatz stand zweimal untereinander, einmal grau und einmal grün — das
+    // sieht aus, als hätte der Assistent gestottert. Deshalb die schon
+    // vorhandene Blase weiterverwenden, statt eine zweite anzuhängen.
+    var laufend = agentTextBlase ? agentTextBlase.textContent.trim() : "";
+    if (laufend && (laufend === zus || laufend.indexOf(zus) !== -1)) {
+      node = agentTextBlase;
+      node.className = "__regoro-anachricht __regoro-avon-agent __regoro-afertig";
+    } else {
+      node = agentNachricht(zus, "fertig");
+    }
+    agentTextBlase = null;
+    var dateien = Array.isArray(d.dateien) ? d.dateien : [];
+    if (node && dateien.length) {
+      var liste = el("ul", { class: "__regoro-adateien" });
+      dateien.forEach(function (name) {
+        liste.appendChild(el("li", { text: String(name) }));
+      });
+      node.appendChild(liste);
+    }
+    // Die Seite im Browser ist jetzt veraltet: Der Agent hat die Datei auf
+    // Platte geändert, dieses DOM kennt den alten Stand. Ein Reload ist kein
+    // Vorschlag, sondern nötig — sonst überschriebe ein späteres Speichern
+    // die Arbeit des Agenten (oder scheiterte am fileHash mit 409).
+    if (node) {
+      var neu = el("button", { class: "__regoro-abtn", type: "button", text: "Seite neu laden" });
+      neu.addEventListener("click", forceReload);
+      node.appendChild(el("div", { class: "__regoro-azeile" }, [neu]));
+    }
+    setAgentHinweis("Die Änderung ist live. Über „Versionen“ lässt sie sich zurücknehmen.");
+    ladeAgentStatus();
+  }
+
+  // ---------------------------------------------------------------------------
   // Dirty-Guard: beforeunload + sicherer Reload
   // ---------------------------------------------------------------------------
   var bypassUnloadGuard = false;
@@ -1984,7 +2425,9 @@
   // __regoro-b/i/link auf [data-edit-idx]-Läufen, __regoro-img-editable auf Bildern).
   // Ein solcher Selektor würde den angeklickten Link-/Button-Text fälschlich als
   // "eigene UI" erkennen und die Navigation NICHT unterdrücken. Eigene UI = nur die
-  // fixe Toolbar, das Versionen-Panel und die aufgelegte Bild-„ersetzen"-Badge.
+  // fixe Toolbar, das Versionen-Panel, die KI-Seitenleiste und die aufgelegte
+  // Bild-„ersetzen"-Badge. Fehlte #__regoro-agent hier, fräße der Navigations-Guard
+  // im Edit-Modus jeden Klick auf „Auftrag geben" — die Leiste wäre stumm.
   function isOwnUI(target) {
     if (!target || typeof target.closest !== "function") return false;
     // Sicherheitsnetz: alles innerhalb eines editierbaren Inhalts-Elements ist
@@ -1995,7 +2438,7 @@
       if (!target.closest(".__regoro-img-badge")) return false;
     }
     return !!target.closest(
-      "#__regoro-bar, #__regoro-versions, .__regoro-img-badge"
+      "#__regoro-bar, #__regoro-versions, #__regoro-agent, .__regoro-img-badge"
     );
   }
 

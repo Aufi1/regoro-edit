@@ -20,6 +20,12 @@ export interface RenderOpts {
   pages?: string[];
   /** Basename der aktuell editierten Seite (z.B. "datenschutz.html"). */
   page?: string;
+  /**
+   * Ist der betreiberweite Modellzugang eingerichtet? Nur dann baut das
+   * Overlay die KI-Seitenleiste überhaupt. Vorgabe false: Wer diese Option
+   * vergisst, bekommt keine Leiste — nicht eine, die ins Leere greift.
+   */
+  ki?: boolean;
 }
 
 /** Schmale Sicht auf einen Text-Node mit Eltern-Referenz (zum Ersetzen). */
@@ -163,6 +169,7 @@ export function renderEditView(html: string, opts: RenderOpts): string {
     fileHash: opts.fileHash,
     pages: opts.pages ?? [],
     page: opts.page ?? "",
+    ki: opts.ki === true,
   }).replace(/</g, "\\u003c");
   const overlayScript = document.createElement("script");
   overlayScript.setAttribute("src", opts.scriptUrl);
