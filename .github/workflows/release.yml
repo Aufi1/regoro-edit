@@ -55,6 +55,7 @@ jobs:
           bun x tsc --noEmit
           bun build src/overlay.client.js --target=browser > /dev/null
           caddy validate --config Caddyfile.example --adapter caddyfile
+          caddy validate --config Caddyfile.multi.example --adapter caddyfile
 
       # Cross-Compile aus einem Runner: bun bringt die Ziel-Runtimes selbst mit.
       # Die Asset-Namen müssen exakt zu install.sh passen (regoro-<os>-<arch>).
@@ -78,10 +79,19 @@ jobs:
           echo "binary=$actual package.json=$expected"
           test "$actual" = "$expected"
 
+      # Die Lizenzhinweise gehören ans Release: Wer nur das Binary herunterlädt,
+      # bekommt sie über `regoro licenses`; wer vor dem Download wissen will, was
+      # drinsteckt, soll sie ohne Ausführen lesen können.
+      - name: Lizenzhinweise ans Release legen
+        run: cp THIRD-PARTY-NOTICES.txt dist/
+
       - name: SHA256SUMS
         working-directory: dist
         run: |
-          sha256sum regoro-* > SHA256SUMS
+          # THIRD-PARTY-NOTICES.txt kommt mit in die Prüfsummen. install.sh
+          # sucht darin nur seinen eigenen Asset-Namen (exakter Vergleich in
+          # awk), zusätzliche Zeilen stören es also nicht.
+          sha256sum regoro-* THIRD-PARTY-NOTICES.txt > SHA256SUMS
           cat SHA256SUMS
 
       # Tag stammt entweder vom push-Trigger oder aus der manuellen Eingabe.
@@ -95,8 +105,10 @@ jobs:
         run: |
           tag="${{ steps.tag.outputs.value }}"
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/regoro-* dist/SHA256SUMS --clobber
+            gh release upload "$tag" dist/regoro-* dist/SHA256SUMS \
+              dist/THIRD-PARTY-NOTICES.txt --clobber
           else
             gh release create "$tag" dist/regoro-* dist/SHA256SUMS \
+              dist/THIRD-PARTY-NOTICES.txt \
               --title "$tag" --generate-notes
           fi

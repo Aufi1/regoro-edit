@@ -45,7 +45,24 @@ import {
   servicePort,
   serviceSlug,
   systemdUnit,
+  apparmorProfil,
 } from "./service.ts";
+import {
+  betreiberConfigPfad,
+  entferneKiConfig,
+  loadKiConfig,
+  schreibeKiConfig,
+  STANDARD_BASE_URL,
+  STANDARD_MODELL,
+} from "./betreiber-config.ts";
+import {
+  alleBrowserHerkuenfte,
+  integrationenPfad,
+  loadIntegrationen,
+  normalisiereHerkunft,
+  schreibeIntegrationen,
+  type Integration,
+} from "./integrationen.ts";
 
 /**
  * Muss der `version` in package.json entsprechen — festgehalten durch einen Test
@@ -76,6 +93,20 @@ Verwendung:
                                   systemd-Unit + Caddy-Block ausgeben
   regoro service <sitesRoot> --multi [--port n] [--systemd|--caddy]
                                   dasselbe für den Sammelbetrieb
+  regoro service --apparmor       AppArmor-Profil für bwrap ausgeben (nötig für
+                                  die KI-Seitenleiste, siehe README)
+  regoro ki --key-stdin | --key-from-proxy [--model m] [--base-url u]
+            [--brave-key-stdin] | --list | --off
+                                  Modellzugang der KI-Seitenleiste. Gilt
+                                  BETREIBERWEIT für alle Kundenwebsites —
+                                  deshalb ohne Site-Argument. Der Schlüssel
+                                  kommt über die Standardeingabe, nie über argv.
+  regoro integration <siteDir> <name> --base-url u --key-stdin
+                     [--pfade "POST /v1/x"] [--browser-herkunft https://…]
+  regoro integration <siteDir> --list | <name> --off
+                                  Benannte fremde APIs für DIESE Website. Die
+                                  Schlüssel gehören dem Kunden und liegen in
+                                  .regoro/integrationen.json (0600).
   regoro licenses                 Lizenzhinweise der Abhängigkeiten ausgeben
   regoro --version                Version ausgeben
 
@@ -449,6 +480,329 @@ function cmdDisable(args: string[]): void {
 }
 
 /**
+ * Liest Geheimnisse zeilenweise von der Standardeingabe.
+ *
+ * Warum nie über argv: `/proc/<pid>/cmdline` ist auf diesem Host für jeden
+ * Prozess lesbar, und die Shell schreibt das Kommando zusätzlich in die
+ * History-Datei. Ein Schlüssel, der einmal in argv stand, ist verbrannt.
+ *
+ * Mehrere Geheimnisse kommen in fester Reihenfolge, eines je Zeile — sonst
+ * bräuchte es zwei Eingabekanäle, und stdin gibt es nur einmal.
+ */
+function lesGeheimnisse(bezeichnungen: string[]): string[] {
+  const zeilen = readFileSync(0, "utf8").split("\n");
+  const werte: string[] = [];
+  for (const [i, was] of bezeichnungen.entries()) {
+    const wert = (zeilen[i] ?? "").trim();
+    if (!wert) {
+      fail(
+        `${was} fehlt auf der Standardeingabe (erwartete Zeile ${i + 1}).\n` +
+          `  Erwartet wird je Zeile ein Wert, in dieser Reihenfolge: ${bezeichnungen.join(", ")}.\n` +
+          `  Beispiel: printf '%s\\n' ${bezeichnungen.map((_, n) => `<wert${n + 1}>`).join(" ")} | regoro ki …`,
+      );
+    }
+    werte.push(wert);
+  }
+  return werte;
+}
+
+/** Wert eines Flags, oder undefined. */
+function flagWert(args: string[], name: string): string | undefined {
+  const i = args.indexOf(name);
+  return i >= 0 ? args[i + 1] : undefined;
+}
+
+/** Alle Werte eines mehrfach angebbaren Flags. */
+function flagWerte(args: string[], name: string): string[] {
+  const werte: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === name) {
+      const wert = args[++i];
+      if (wert === undefined) fail(`${name} braucht einen Wert`);
+      werte.push(wert);
+    }
+  }
+  return werte;
+}
+
+/**
+ * `regoro ki [--key-stdin | --key-from-proxy] [--model m] [--base-url u]
+ *            [--brave-key-stdin] [--list] [--off]`
+ *
+ * Der Modellzugang gilt BETREIBERWEIT, nicht je Website: Ein Zugang bedient
+ * alle Kunden und gehört uns, nicht ihnen. Deshalb kein Site-Argument — und
+ * deshalb lässt `regoro disable` diese Datei unangetastet, sonst schaltete das
+ * Abschalten eines einzelnen Kunden die KI für alle ab.
+ */
+function cmdKi(args: string[]): void {
+  checkFlags("ki", args, [
+    "--key-stdin",
+    "--key-from-proxy",
+    "--brave-key-stdin",
+    "--model",
+    "--base-url",
+    "--list",
+    "--off",
+  ]);
+
+  // Ein Site-Ordner als Argument ist der häufigste Denkfehler (der Plan selbst
+  // macht ihn an einer Stelle). Laut scheitern statt still ignorieren: sonst
+  // glaubt der Betreiber, er habe einen Zugang je Kunde eingerichtet.
+  const werte = new Set(
+    ["--model", "--base-url"].map((f) => flagWert(args, f)).filter((v): v is string => !!v),
+  );
+  const positional = args.filter((a) => !a.startsWith("-") && !werte.has(a));
+  if (positional.length > 0) {
+    fail(
+      `\`ki\` nimmt kein Verzeichnis: ${positional.join(", ")}\n` +
+        "  Der Modellzugang ist betreiberweit und gilt für alle Kundenwebsites,\n" +
+        `  wie /etc/regoro/versand.json. Er liegt in ${betreiberConfigPfad()}.\n` +
+        "  Beispiel: printf '%s\\n' \"$SCHLUESSEL\" | regoro ki --key-stdin",
+    );
+  }
+
+  const pfad = betreiberConfigPfad();
+
+  if (args.includes("--off")) {
+    entferneKiConfig(pfad);
+    console.log(`Modellzugang entfernt: ${pfad}`);
+    console.log("Die KI-Seitenleiste ist damit bei ALLEN Kundenwebsites aus.");
+    console.log("Der Editor selbst läuft unverändert weiter.");
+    return;
+  }
+
+  if (args.includes("--list")) {
+    // Zeigt Zustand, niemals Geheimnisse. Auch nicht gekürzt: bei einem kurzen
+    // Schlüssel sind schon die letzten Zeichen zu viel.
+    console.log(`Modellzugang: ${pfad}`);
+    if (!existsSync(pfad)) {
+      console.log("  nicht eingerichtet — die KI-Seitenleiste erscheint bei keinem Kunden.");
+      return;
+    }
+    const cfg = loadKiConfig(pfad);
+    if (cfg === null) {
+      // Datei da, aber unbrauchbar. Für den Betrieb dasselbe wie „aus"
+      // (fail-closed), für den Betreiber ein wichtiger Unterschied.
+      console.log("  vorhanden, aber unbrauchbar — die KI ist aus.");
+      console.log("  Neu einrichten: printf '%s\\n' \"$SCHLUESSEL\" | regoro ki --key-stdin");
+      return;
+    }
+    console.log(`  Angelegt:   ${statSync(pfad).mtime.toISOString().slice(0, 10)}`);
+    console.log(`  Modell:     ${cfg.model}`);
+    console.log(`  baseUrl:    ${cfg.baseUrl}`);
+    console.log(
+      `  Schlüssel:  ${cfg.keyFromProxy ? "kommt vom ausgehenden Proxy" : "gesetzt"}`,
+    );
+    console.log(`  Websuche:   ${cfg.braveKey ? "eingerichtet" : "nicht eingerichtet"}`);
+    return;
+  }
+
+  const ausStdin = args.includes("--key-stdin");
+  const vomProxy = args.includes("--key-from-proxy");
+  if (ausStdin && vomProxy) {
+    fail(
+      "--key-stdin und --key-from-proxy schließen sich aus.\n" +
+        "  Entweder liegt der Schlüssel hier, oder ein ausgehender Proxy hängt ihn an.",
+    );
+  }
+  if (!ausStdin && !vomProxy) {
+    fail(
+      "kein Schlüssel angegeben.\n" +
+        "  Über die Standardeingabe:  printf '%s\\n' \"$SCHLUESSEL\" | regoro ki --key-stdin\n" +
+        "  Hängt ein ausgehender Proxy die Anmeldung an: regoro ki --key-from-proxy\n" +
+        "  Ein Schlüssel als Kommandozeilen-Argument wird bewusst nicht angeboten —\n" +
+        "  argv liest jeder Prozess dieses Hosts, und die Shell-History speichert ihn.",
+    );
+  }
+
+  const braveAusStdin = args.includes("--brave-key-stdin");
+  const bezeichnungen: string[] = [];
+  if (ausStdin) bezeichnungen.push("Modellschlüssel");
+  if (braveAusStdin) bezeichnungen.push("Brave-Suchschlüssel");
+  const gelesen = bezeichnungen.length > 0 ? lesGeheimnisse(bezeichnungen) : [];
+
+  const apiKey = ausStdin ? gelesen.shift()! : "";
+  const braveKey = braveAusStdin ? gelesen.shift()! : null;
+
+  const cfg = {
+    apiKey,
+    keyFromProxy: vomProxy,
+    braveKey,
+    baseUrl: flagWert(args, "--base-url") ?? STANDARD_BASE_URL,
+    model: flagWert(args, "--model") ?? STANDARD_MODELL,
+  };
+  schreibeKiConfig(cfg, pfad);
+
+  console.log(`Modellzugang geschrieben: ${pfad} (Mode 0600)`);
+  console.log(`  Modell:    ${cfg.model}`);
+  console.log(`  baseUrl:   ${cfg.baseUrl}`);
+  console.log(`  Schlüssel: ${vomProxy ? "kommt vom ausgehenden Proxy" : "gesetzt"}`);
+  console.log(`  Websuche:  ${braveKey ? "eingerichtet" : "nicht eingerichtet (--brave-key-stdin)"}`);
+  console.log("");
+  console.log("Gilt betreiberweit — die Seitenleiste erscheint bei jeder Website mit Editor.");
+  // Ohne diesen Satz sucht jemand den Fehler in der Konfiguration, während in
+  // Wahrheit nur die Sandbox fehlt.
+  console.log("Voraussetzung auf dem Host: bwrap (apt install bubblewrap) samt AppArmor-Profil.");
+  console.log("Profiltext und Dienst-Härtung: regoro service <siteDir>");
+}
+
+/**
+ * `regoro integration <siteDir> <name> --base-url … --key-stdin [...]`
+ * `regoro integration <siteDir> --list`
+ * `regoro integration <siteDir> <name> --off`
+ *
+ * Diese Schlüssel gehören dem KUNDEN und liegen deshalb pro Website — getrennt
+ * von unserem Modellzugang, in eigener Datei mit eigener Lebensdauer. Der Agent
+ * nennt später nur den Namen; die Weiterleitung hängt den Schlüssel an. Er
+ * bekommt ihn nie zu sehen und kann keine Integration erfinden.
+ */
+function cmdIntegration(args: string[]): void {
+  checkFlags("integration", args, [
+    "--base-url",
+    "--key-stdin",
+    "--header-name",
+    "--pfade",
+    "--browser-herkunft",
+    "--list",
+    "--off",
+  ]);
+
+  const werte = new Set(
+    [
+      ...["--base-url", "--header-name"].map((f) => flagWert(args, f)),
+      ...flagWerte(args, "--pfade"),
+      ...flagWerte(args, "--browser-herkunft"),
+    ].filter((v): v is string => !!v),
+  );
+  const positional = args.filter((a) => !a.startsWith("-") && !werte.has(a));
+  if (positional.length === 0) {
+    fail(
+      "integration braucht den Site-Ordner.\n" +
+        "  Anlegen:  regoro integration ./site stripe --base-url https://api.stripe.com --key-stdin\n" +
+        "  Anzeigen: regoro integration ./site --list",
+    );
+  }
+  const siteDir = requireDir(positional[0]);
+  const name = positional[1];
+
+  const befund = pruefeAuthDatei(siteDir);
+  if (befund.art !== "ok") {
+    fail(
+      `${siteDir} ist nicht eingerichtet (${befund.art}).\n` +
+        "  Integrationen liegen neben der Auth-Datei in .regoro/.\n" +
+        "  Zuerst: regoro init " + positional[0],
+    );
+  }
+
+  const integrationen = loadIntegrationen(siteDir);
+
+  if (args.includes("--list")) {
+    if (integrationen.size === 0) {
+      console.log(`Keine Integrationen in ${siteDir}.`);
+      return;
+    }
+    console.log(`Integrationen in ${siteDir} (${integrationen.size}):`);
+    for (const [n, i] of [...integrationen].sort(([a], [b]) => a.localeCompare(b))) {
+      // Der Schlüssel wird NIE ausgegeben, auch nicht gekürzt auf die letzten
+      // Zeichen: bei kurzen Schlüsseln ist das schon zu viel, und eine
+      // Betreiber-Ausgabe landet in Logs und Screenshots.
+      console.log(`  ${n}`);
+      console.log(`    Ziel:       ${i.baseUrl}`);
+      console.log(`    Anmeldung:  ${i.auth.typ === "bearer" ? "Bearer" : `Header ${i.auth.name}`}, gesetzt`);
+      console.log(`    Pfade:      ${i.erlaubtePfade ? i.erlaubtePfade.join(", ") : "alle unterhalb des Ziels"}`);
+      console.log(`    Im Browser: ${i.browserHerkuenfte.length > 0 ? i.browserHerkuenfte.join(", ") : "keine Herkunft frei"}`);
+      console.log(`    Angelegt:   ${i.angelegt}`);
+    }
+    return;
+  }
+
+  if (name === undefined) {
+    fail(
+      "welche Integration? Name fehlt.\n" +
+        "  Beispiel: regoro integration " + positional[0] + " stripe --base-url https://api.stripe.com --key-stdin\n" +
+        "  Vorhandene anzeigen: regoro integration " + positional[0] + " --list",
+    );
+  }
+
+  if (args.includes("--off")) {
+    if (!integrationen.delete(name)) {
+      fail(`keine Integration namens "${name}" in ${siteDir}.`);
+    }
+    schreibeIntegrationen(siteDir, integrationen);
+    console.log(`Integration "${name}" entfernt.`);
+    console.log("Der Agent kann sie ab sofort nicht mehr nennen.");
+    // Die freigeschalteten Herkünfte stehen in der CSP des Caddy-Blocks; die
+    // erzeugt `regoro service` als Text und nicht der laufende Dienst.
+    console.log("Caddy-Block neu erzeugen und nachladen: regoro service " + positional[0]);
+    return;
+  }
+
+  const baseUrlRoh = flagWert(args, "--base-url");
+  if (baseUrlRoh === undefined) fail("--base-url fehlt (absolute https-URL des Dienstes).");
+  let baseUrl: string;
+  try {
+    const u = new URL(baseUrlRoh);
+    // Nur https: Ein Schlüssel des Kunden über http wäre auf jedem Zwischenstück
+    // mitlesbar, und die Weiterleitung hängt ihn bei JEDEM Aufruf an.
+    if (u.protocol !== "https:") throw new Error("kein https");
+    baseUrl = `${u.origin}${u.pathname.replace(/\/+$/, "")}`;
+  } catch {
+    fail(
+      `unbrauchbare --base-url: ${baseUrlRoh}\n` +
+        "  Erwartet wird eine absolute https-URL, z.B. https://api.stripe.com",
+    );
+  }
+
+  const herkuenfte: string[] = [];
+  for (const roh of flagWerte(args, "--browser-herkunft")) {
+    const norm = normalisiereHerkunft(roh);
+    if (norm === null) {
+      fail(
+        `unbrauchbare --browser-herkunft: ${roh}\n` +
+          "  Erwartet wird eine absolute https-Herkunft, z.B. https://js.stripe.com\n" +
+          "  (nur Schema, Host und ggf. Port — kein Pfad, keine Abkürzung).",
+      );
+    }
+    if (!herkuenfte.includes(norm)) herkuenfte.push(norm);
+  }
+
+  if (!args.includes("--key-stdin")) {
+    fail(
+      "--key-stdin fehlt.\n" +
+        "  Der Schlüssel kommt über die Standardeingabe, nie über argv:\n" +
+        `  printf '%s\\n' "$SCHLUESSEL" | regoro integration ${positional[0]} ${name} --base-url ${baseUrlRoh} --key-stdin`,
+    );
+  }
+  const [key] = lesGeheimnisse([`Schlüssel für "${name}"`]);
+
+  const headerName = flagWert(args, "--header-name");
+  const pfade = flagWerte(args, "--pfade");
+
+  const eintrag: Integration = {
+    baseUrl,
+    auth: headerName ? { typ: "header", name: headerName, key: key! } : { typ: "bearer", key: key! },
+    erlaubtePfade: pfade.length > 0 ? pfade : null,
+    browserHerkuenfte: herkuenfte,
+    angelegt: new Date().toISOString().slice(0, 10),
+  };
+  integrationen.set(name, eintrag);
+  schreibeIntegrationen(siteDir, integrationen);
+
+  console.log(`Integration "${name}" angelegt in ${integrationenPfad(siteDir)} (Mode 0600).`);
+  console.log(`  Ziel:      ${baseUrl}`);
+  console.log(`  Pfade:     ${eintrag.erlaubtePfade ? eintrag.erlaubtePfade.join(", ") : "alle unterhalb des Ziels"}`);
+  console.log(`  Im Browser: ${herkuenfte.length > 0 ? herkuenfte.join(", ") : "keine Herkunft frei"}`);
+  if (herkuenfte.length > 0) {
+    console.log("");
+    // Die CSP steht im Caddy-Block, nicht im HTML — der laufende Dienst kann sie
+    // nicht ändern. Ohne diesen Schritt lädt der eingebaute Knopf beim Kunden
+    // nicht, und niemand sieht warum.
+    console.log("Die freigeschalteten Herkünfte stehen in der CSP des Caddy-Blocks.");
+    console.log(`Block neu erzeugen und Caddy nachladen: regoro service ${positional[0]}`);
+  }
+}
+
+/**
  * `regoro licenses` — gibt THIRD-PARTY-NOTICES.txt aus.
  *
  * Rechtspflicht: Das ausgelieferte Binary enthält den gesamten
@@ -483,7 +837,23 @@ function cmdLicenses(args: string[]): void {
  * Der Editor kommt daneben; der Proxy reicht nur /edit* an ihn weiter.
  */
 function cmdService(args: string[]): void {
-  checkFlags("service", args, ["--domain", "--port", "--user", "--systemd", "--caddy", "--multi"]);
+  checkFlags("service", args, [
+    "--domain",
+    "--port",
+    "--user",
+    "--systemd",
+    "--caddy",
+    "--multi",
+    "--apparmor",
+  ]);
+
+  // Das AppArmor-Profil hängt an keiner Site — es gilt für /usr/bin/bwrap auf
+  // dem ganzen Host. Deshalb vor jeder Pfad-Prüfung: `regoro service --apparmor`
+  // muss auch dann etwas ausgeben, wenn man gerade in keinem Site-Ordner steht.
+  if (args.includes("--apparmor")) {
+    process.stdout.write(apparmorProfil());
+    return;
+  }
   const flagValue = (name: string): string | undefined => {
     const i = args.indexOf(name);
     return i >= 0 ? args[i + 1] : undefined;
@@ -536,6 +906,22 @@ function cmdService(args: string[]): void {
     );
   }
 
+  // Die Browser-Herkünfte der Integrationen gehören in die CSP des Caddy-Blocks.
+  // Sie werden HIER gelesen, nicht in service.ts: der Generator bleibt reine
+  // Textausgabe ohne Dateisystem-Zugriff.
+  //
+  // Im Sammelbetrieb je Domain getrennt, nie als gemeinsame Liste — sonst wäre
+  // eine für einen Kunden freigeschaltete Herkunft auf allen Kundenseiten
+  // ladbar (Invariante 10).
+  const herkuenfteJeHost: Record<string, string[]> = {};
+  if (multi) {
+    for (const site of listSites(siteDir)) {
+      if (site.host === null) continue;
+      const h = alleBrowserHerkuenfte(loadIntegrationen(site.siteDir));
+      if (h.length > 0) herkuenfteJeHost[site.host] = h;
+    }
+  }
+
   const opts = {
     siteDir,
     execPath,
@@ -544,6 +930,8 @@ function cmdService(args: string[]): void {
     user: flagValue("--user") ?? (process.env.SUDO_USER || process.env.USER || "www-data"),
     domain,
     multi,
+    browserHerkuenfte: multi ? [] : alleBrowserHerkuenfte(loadIntegrationen(siteDir)),
+    herkuenfteJeHost,
   };
 
   const onlySystemd = args.includes("--systemd");
@@ -753,8 +1141,30 @@ async function main(): Promise<void> {
     cmdService(rest);
     return;
   }
+  if (cmd === "ki") {
+    cmdKi(rest);
+    return;
+  }
+  if (cmd === "integration") {
+    cmdIntegration(rest);
+    return;
+  }
   if (cmd === "licenses") {
     cmdLicenses(rest);
+    return;
+  }
+  // Versteckt und bewusst nicht in USAGE: `agent-worker` ist die
+  // Wiedereinsprungstelle, mit der sich das Binary als abgeschotteter
+  // Agentenprozess selbst startet (bwrap ruft denselben Pfad mit diesem
+  // Argument auf). Kein Bedienbefehl — in der Hilfe zu stehen lüde nur zum
+  // Herumprobieren ein. Die gesamte Steuerung kommt aus der Umgebung, nicht
+  // aus argv: argv liest jeder Prozess dieses Hosts mit.
+  //
+  // Muss VOR der Bare-Form stehen, sonst hielte cmdRun "agent-worker" für
+  // einen Ordnernamen und scheiterte mit einer irreführenden Meldung.
+  if (cmd === "agent-worker") {
+    const { runWorker } = await import("./agent-worker.ts");
+    await runWorker();
     return;
   }
   // Bare-Form: `regoro <siteDir>` (kein bekannter Sub-Befehl).

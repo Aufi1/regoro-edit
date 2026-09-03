@@ -13,8 +13,25 @@ import { createHash } from "node:crypto";
  * Erlaubte Zeichen für `--domain`. Der Wert landet im Caddyfile UND in
  * angezeigten Shell-Befehlen; statt ihn dreifach zu quoten, wird er validiert.
  * Deckt Hostnamen, Wildcards (*.example.com) und `:8099` für lokale Tests ab.
+ *
+ * `http://` ist ausdrücklich erlaubt, weil Caddy die Site sonst als HTTPS führt:
+ * Gemessen antwortet `--domain localhost:18081` beim lokalen Ausprobieren mit
+ * „Client sent an HTTP request to an HTTPS server", selbst bei `auto_https off`.
+ * Mehr als dieses eine Schema nicht — der Wert landet ungeprüft im Caddyfile.
  */
-export const DOMAIN_RE = /^[a-zA-Z0-9.*-]*(:\d{1,5})?$/;
+export const DOMAIN_RE = /^(http:\/\/)?[a-zA-Z0-9.*-]*(:\d{1,5})?$/;
+
+/**
+ * Die URL, unter der der Editor nach der Einrichtung erreichbar ist — für die
+ * `curl`-Zeile der Aktivierungsschritte.
+ *
+ * Bringt die Domain schon ein Schema mit (`http://localhost:18081` beim lokalen
+ * Ausprobieren), darf kein zweites davor: `https://http://…` wäre Unsinn.
+ * Sonst gilt https, denn das Auth-Cookie ist `Secure`.
+ */
+function editorUrl(domain: string): string {
+  return /^https?:\/\//.test(domain) ? domain : `https://${domain}`;
+}
 
 /** Ports, aus denen der Default gewählt wird. 8788 bleibt für `regoro run` frei. */
 const PORT_BASE = 8800;
@@ -61,7 +78,91 @@ export interface ServiceOpts {
    * Caddy-Block für alle Domains. Ohne das Flag bleibt alles wie bisher.
    */
   multi?: boolean;
+  /**
+   * Browser-Herkünfte, die die CSP zusätzlich zulässt — aus
+   * `alleBrowserHerkuenfte()` der Integrationen DIESER Website. Leer oder
+   * fehlend heißt `connect-src 'none'`, also der geschlossene Normalfall.
+   */
+  browserHerkuenfte?: string[];
+  /**
+   * Nur Sammelbetrieb: Herkünfte je Domain. Der Block ist EINER für alle
+   * Kunden, die Freischaltungen sind es nicht — eine Vereinigungsmenge machte
+   * eine für Kunde A freigeschaltete Herkunft auch auf Kundenseite B ladbar
+   * und höhlte damit Invariante 10 aus. Deshalb je betroffener Domain ein
+   * eigener Zweig; wer keine Integration nutzt, bekommt die Standard-CSP und
+   * eine Ausgabe, die zeichengleich mit der von früher ist.
+   */
+  herkuenfteJeHost?: Record<string, string[]>;
 }
+
+/**
+ * Die Content-Security-Policy der ausgelieferten Website — die dritte der drei
+ * Grenzen des KI-Editors, und die einzige, die im Browser des BESUCHERS wirkt.
+ *
+ * Sie steht bewusst hier und nicht im HTML: Der Agent schreibt HTML, also wäre
+ * eine Grenze im HTML eine, die er umschreiben kann. Der Caddy-Block liegt
+ * außerhalb seiner Reichweite.
+ *
+ * `'unsafe-inline'` bei `script-src` ist Absicht und ein bekannter Kompromiss:
+ * Die Fabrik liefert Inline-Skripte aus (gemessen an einer echten Kundenseite:
+ * 13 Inline-Blöcke über vier Seiten, keiner mit `src` — Kopfzeile gegen
+ * Layout-Sprung, JSON-LD). Ohne das wären bestehende Kundenseiten kaputt.
+ *
+ * `connect-src 'none'` ist der Kern: kein fetch, kein XHR, kein sendBeacon,
+ * kein WebSocket. Zusammen mit `img-src 'self' data:` (kein Bild-Beacon) und
+ * `form-action 'self'` sind die stillen Abflüsse zu. Was CSP NICHT verhindert,
+ * ist eine Weiterleitung — dafür gibt es keine Direktive. Das ist ein
+ * sichtbarer Angriff und über die Versionsliste in einem Klick zurückgenommen.
+ */
+export function cspWert(browserHerkuenfte: string[] = []): string {
+  const frei = browserHerkuenfte.join(" ");
+  return [
+    "default-src 'self'",
+    `script-src 'self' 'unsafe-inline'${frei ? ` ${frei}` : ""}`,
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data:",
+    "font-src 'self'",
+    // 'none' neben einer Quelle ist laut Spezifikation ungültig; Browser
+    // verwerfen dann die GANZE Direktive und lassen anschließend alles durch.
+    // Entweder 'none' oder Quellen — nie beides.
+    `connect-src ${frei || "'none'"}`,
+    "form-action 'self'",
+    "frame-src 'none'",
+    "frame-ancestors 'none'",
+    "base-uri 'none'",
+    "object-src 'none'",
+  ].join("; ");
+}
+
+/** Die fertige Caddy-Direktive. Eine Stelle, damit Generator und Vorlagen nicht driften. */
+function cspZeile(browserHerkuenfte: string[] = []): string {
+  return `header Content-Security-Policy "${cspWert(browserHerkuenfte)}"`;
+}
+
+/**
+ * Begründung für `flush_interval -1`, wörtlich gleich in beiden Blöcken und in
+ * beiden Vorlagen.
+ *
+ * Ehrlich gemessen (caddy 2.11.4, Upstream schweigt 4 s): Der KÖRPER wird auch
+ * ohne diese Zeile nicht gepuffert, die Ereignisse kommen einzeln an. Was Caddy
+ * zurückhält, sind die ANTWORT-HEADER — es gibt sie erst mit dem ersten
+ * Körper-Byte heraus, und daran ändert `flush_interval` nichts (4,00 s mit wie
+ * ohne). Die Abhilfe dafür liegt im Editor selbst: Er schickt beim Verbinden
+ * sofort einen SSE-Kommentar. Die Zeile bleibt trotzdem stehen — sie kostet
+ * nichts, schaltet jede spätere Pufferung sicher ab und hält die Absicht fest.
+ */
+const SSE_KOMMENTAR = `            # Der Agentenlauf meldet sich über Server-Sent Events; diese Zeile
+            # schaltet jede Pufferung des Antwortkörpers ab.
+            #
+            # Sie ist NICHT der Grund, warum die Seitenleiste sofort aufgeht.
+            # Gemessen (caddy 2.11.4, Upstream schweigt 4 s): Caddy gibt die
+            # Antwort-HEADER erst mit dem ersten Körper-Byte heraus — 4,00 s,
+            # mit dieser Zeile wie ohne. Dagegen hilft kein Proxy-Schalter.
+            # Der Editor schickt deshalb beim Verbinden sofort einen
+            # SSE-Kommentar (": verbunden\\n", ohne Leerzeile — ein
+            # vollständiger Rahmen erzeugte einen Phantom-Rahmen im Client);
+            # damit sind es 0,002 s.
+            # Wer hier eine Verzögerung sucht, sucht an der falschen Stelle.`;
 
 /**
  * Grammatik, die ein Host-Header erfüllen MUSS, bevor er im Sammelbetrieb in den
@@ -157,8 +258,30 @@ sudo systemctl reload caddy
 # 3. Prüfen — je Kundenwebsite ein Ordner unter ${o.siteDir}
 systemctl status ${unit}
 ls ${shQuote(o.siteDir)}
-curl -sI https://<eine-kundendomain>/edit/login | head -1`;
+curl -sI https://<eine-kundendomain>/edit/login | head -1
+
+${KI_SCHRITTE}`;
 }
+
+/**
+ * Die Schritte, die nur für die KI-Seitenleiste nötig sind — gleich in beiden
+ * Betriebsarten. Ohne bwrap startet kein Agentenlauf; ohne das AppArmor-Profil
+ * startet bwrap auf Ubuntu nicht.
+ */
+const KI_SCHRITTE = `# 4. Nur für die KI-Seitenleiste: Sandbox einrichten
+sudo apt install bubblewrap
+regoro service --apparmor | sudo tee /etc/apparmor.d/bwrap > /dev/null
+sudo apparmor_parser -r /etc/apparmor.d/bwrap
+# Prüfen, dass unprivilegierte Namespaces jetzt gehen (muss "ok" ausgeben):
+bwrap --ro-bind / / --unshare-pid --die-with-parent echo ok
+
+# 5. Modellzugang (BETREIBERWEIT, einmal je Server — nicht je Kunde):
+printf '%s\\n' "$OPENROUTER_SCHLUESSEL" | sudo regoro ki --key-stdin
+
+# HINWEIS: Der Caddy-Block trägt die Content-Security-Policy der Kundenwebsites.
+# Nach jedem \`regoro integration … --browser-herkunft …\` muss er NEU ERZEUGT
+# und Caddy nachgeladen werden — sonst lädt der eingebaute Knopf beim Kunden
+# nicht, und niemand sieht warum.`;
 
 /** Quotet einen Pfad für POSIX-sh (angezeigte Copy-Paste-Befehle). */
 export function shQuote(s: string): string {
@@ -186,18 +309,102 @@ ExecStart=${sdQuote(o.execPath)} ${command} ${sdQuote(o.siteDir)}
 Restart=on-failure
 RestartSec=2
 
+# Arbeitsverzeichnis für Agentenläufe: /run/regoro-${o.slug}, von systemd
+# angelegt und beim Stop geräumt. Unter ProtectSystem=strict ist es automatisch
+# beschreibbar, es gehört NICHT zusätzlich in ReadWritePaths.
+RuntimeDirectory=regoro-${o.slug}
+RuntimeDirectoryMode=0700
+
+# Der Modellzugang. systemd liest die Datei als root und legt sie in ein tmpfs,
+# das nur dieser Dienst sieht ($CREDENTIALS_DIRECTORY). Sie muss für ${o.user}
+# also gar nicht lesbar sein, steht in keinem Prozess-Environment und in keinem
+# /proc-Eintrag.
+#
+# SetCredential ist KEIN Beiwerk: Gemessen auf systemd 255 — fehlt die Datei,
+# bricht LoadCredential den Start mit status=243 ab, das Programm läuft nie an.
+# Ohne die Fallback-Zeile nähme ein Update jedem Betreiber, der die KI nicht
+# eingerichtet hat, den laufenden Editor weg. "{}" ist gültiges JSON ohne "v",
+# loadKiConfig gibt dafür null zurück: KI aus, Dienst läuft. Fail-closed.
+LoadCredential=ki:/etc/regoro/ki.json
+SetCredential=ki:{}
+
 # Der Editor braucht nur seinen Site-Ordner und das git-Binary. Alles andere zu.
+#
+# ProtectSystem=strict wirkt über den Mount-Namespace und damit AUCH FÜR
+# KINDPROZESSE — der Agentenprozess kann es nicht abstreifen. Die Read-only-
+# Flags werden beim Vererben in einen weniger privilegierten Namespace vom
+# Kernel gesperrt (mount_namespaces(7)); selbst mit CAP_SYS_ADMIN im eigenen
+# User-Namespace, den bwrap anlegt, scheitert ein Remount auf rw mit EPERM.
+# Das ist die eigentliche Begründung, warum die Abschottung trägt. Nicht als
+# "unnötig" entfernen.
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ${protectHome}
 ReadWritePaths=${sdQuote(o.siteDir)}
 ProtectKernelTunables=yes
+ProtectKernelModules=yes
 ProtectControlGroups=yes
+ProtectClock=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+LockPersonality=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Notbremse gegen einen entgleisten Agentenlauf. TasksMax gilt für den ganzen
+# Cgroup einschließlich aller Kindprozesse.
+MemoryHigh=2G
+MemoryMax=3G
+TasksMax=512
+CPUQuota=200%
+
+# ZWEI SCHALTER FEHLEN HIER MIT ABSICHT. Beide sehen nach gutem Hardening aus
+# und brechen den Agentenlauf LAUTLOS — der Dienst startet, nur jeder Lauf
+# scheitert, und die Ursache steht nirgends:
+#
+#   RestrictNamespaces=yes   sperrt ALLE Namespace-Typen. bwrap braucht
+#                            mindestens user und mnt (pid je nach --unshare).
+#                            Maximal vertretbar wäre RestrictNamespaces=~cgroup time
+#                            — das ist eine Sperrliste, verbietet also NUR diese
+#                            beiden und lässt den Rest zu.
+#   SystemCallFilter=@system-service
+#                            schließt @mount aus (nachgezählt mit
+#                            "systemd-analyze syscall-filter @system-service":
+#                            kein einziger mount-Syscall darin), und genau die
+#                            braucht bwrap. Wenn überhaupt, dann
+#                            SystemCallFilter=@system-service @mount
+#                            plus SystemCallErrorNumber=EPERM.
+#
+# NoNewPrivileges=yes ist dagegen unbedenklich, solange bwrap nicht setuid ist
+# (Ubuntu 24.04: -rwxr-xr-x, keine File-Capabilities — nachgesehen). Auf einem
+# System mit setuid-bwrap wäre es eines.
 
 [Install]
 WantedBy=multi-user.target
+`;
+}
+
+/**
+ * AppArmor-Profil, ohne das bwrap auf Ubuntu ≥ 23.10 nicht startet.
+ *
+ * Auslieferungszustand dort ist `kernel.apparmor_restrict_unprivileged_userns=1`,
+ * und das Ubuntu-bwrap hat weder Setuid-Bit noch File-Capabilities — es hängt
+ * vollständig an unprivilegierten User-Namespaces. Ohne Profil scheitert jeder
+ * Agentenlauf mit „Creating new namespace failed".
+ *
+ * Der naheliegende Ausweg `sysctl kernel.apparmor_restrict_unprivileged_userns=0`
+ * ist der falsche Handel: Er hebt die Schranke für JEDEN Prozess des Hosts auf,
+ * und auf diesem Host stehen öffentlich erreichbare Kundenwebsites. Ein
+ * gezieltes Profil für genau eine Binärdatei ist das mildere Mittel.
+ */
+export function apparmorProfil(): string {
+  return `# /etc/apparmor.d/bwrap
+abi <abi/4.0>,
+include <tunables/global>
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+  include if exists <local/bwrap>
+}
 `;
 }
 
@@ -223,9 +430,16 @@ export function caddyBlock(o: ServiceOpts): string {
     # Muss isEditorPath() in host.ts spiegeln. \`/edit*\` allein reicht NICHT: es
     # verfehlt die Suffix-Routen \`/impressum.html/edit\` und fängt zugleich
     # öffentliche Seiten wie \`/edit-preise.html\` ein.
+    #
+    # HIER KEINE CSP: \`connect-src 'none'\` blockierte jedes fetch des Overlays.
+    # Der Editor wäre stumm kaputt — Knöpfe reagieren, nichts wird gespeichert,
+    # keine Fehlermeldung.
     @editor path /edit /edit/* /edit-assets/* */edit
     handle @editor {
-        reverse_proxy 127.0.0.1:${o.port}
+        reverse_proxy 127.0.0.1:${o.port} {
+${SSE_KOMMENTAR}
+            flush_interval -1
+        }
     }
 
     # Statische Site: NUR bekannte Dateitypen. Ein Site-Ordner enthält oft mehr
@@ -234,6 +448,7 @@ export function caddyBlock(o: ServiceOpts): string {
     @allowed path / */ *.html *.css *.js *.png *.jpg *.jpeg *.webp *.gif *.ico *.woff *.woff2 *.txt *.xml
     handle @allowed {
         root * ${caddyQuote(o.siteDir)}
+        ${cspZeile(o.browserHerkuenfte)}
         file_server
     }
 
@@ -312,9 +527,15 @@ https:// {
     # Muss isEditorPath() in host.ts spiegeln. \`/edit*\` allein reicht NICHT: es
     # verfehlt die Suffix-Routen \`/impressum.html/edit\` und fängt zugleich
     # öffentliche Seiten wie \`/edit-preise.html\` ein.
+    #
+    # HIER KEINE CSP: \`connect-src 'none'\` blockierte jedes fetch des Overlays.
+    # Der Editor wäre stumm kaputt — Knöpfe reagieren, nichts wird gespeichert.
     @editor path /edit /edit/* /edit-assets/* */edit
     handle @editor {
-        reverse_proxy 127.0.0.1:${o.port}
+        reverse_proxy 127.0.0.1:${o.port} {
+${SSE_KOMMENTAR}
+            flush_interval -1
+        }
     }
 
     # Statische Site: NUR bekannte Dateitypen, aus dem Ordner DIESER Domain.
@@ -325,7 +546,7 @@ https:// {
     @allowed path / */ *.html *.css *.js *.png *.jpg *.jpeg *.webp *.gif *.ico *.woff *.woff2 *.txt *.xml
     handle @allowed {
         root * ${caddyQuote(`${o.siteDir}/{host}`)}
-        file_server
+${cspZweigeMulti(o)}
     }
 
     handle {
@@ -333,6 +554,51 @@ https:// {
     }
 }
 `;
+}
+
+/**
+ * Der Inhalt des statischen Zweigs im Sammelbetrieb: CSP und `file_server`.
+ *
+ * Ohne Integrationen ist das eine Standard-CSP für alle Domains — zeichengleich
+ * mit dem Einzelbetrieb. Hat eine Domain eigene Browser-Herkünfte, bekommt sie
+ * einen eigenen `handle`-Zweig davor. Bewusst geschachtelte `handle`-Blöcke und
+ * nicht zwei `header`-Zeilen mit Matcher: `handle` ist eine sich gegenseitig
+ * ausschließende Gruppe, damit ist per Konstruktion ausgeschlossen, dass eine
+ * Domain zwei CSPs bekommt oder die falsche gewinnt.
+ *
+ * Die Freischaltung gilt so NUR für die Domain, für die sie eingerichtet wurde.
+ * Eine Vereinigungsmenge über alle Kunden wäre bequemer und genau die
+ * Quervermischung, gegen die Invariante 10 steht.
+ */
+function cspZweigeMulti(o: ServiceOpts): string {
+  const jeHost = Object.entries(o.herkuenfteJeHost ?? {})
+    .filter(([, h]) => h.length > 0)
+    .sort(([a], [b]) => a.localeCompare(b));
+
+  if (jeHost.length === 0) {
+    return `        ${cspZeile(o.browserHerkuenfte)}\n        file_server`;
+  }
+
+  const zweige = jeHost.map(([host, herkuenfte]) => {
+    // Der Matcher-Name muss ein Caddy-Bezeichner sein; der Host-Regexp wird
+    // vollständig verankert, damit "kunde.de" nicht auch "boese-kunde.de.tld"
+    // trifft und deren CSP mit aufweicht.
+    const name = `@csp_${host.replace(/[^a-z0-9]+/g, "_")}`;
+    return `        ${name} header_regexp Host ^${host.replace(/[.]/g, "\\.")}$
+        handle ${name} {
+            ${cspZeile(herkuenfte)}
+            file_server
+        }`;
+  });
+
+  return `        # Domains mit eigenen Browser-Herkünften (regoro integration).
+        # Nach jeder Änderung an den Integrationen neu erzeugen und Caddy
+        # nachladen — sonst lädt der eingebaute Knopf beim Kunden nicht.
+${zweige.join("\n")}
+        handle {
+            ${cspZeile(o.browserHerkuenfte)}
+            file_server
+        }`;
 }
 
 /**
@@ -355,5 +621,7 @@ sudo systemctl reload caddy
 
 # 3. Prüfen
 systemctl status ${unit}
-curl -sI https://${o.domain ?? "deine-domain.de"}/edit/login | head -1`;
+curl -sI ${editorUrl(o.domain ?? "deine-domain.de")}/edit/login | head -1
+
+${KI_SCHRITTE}`;
 }
