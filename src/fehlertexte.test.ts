@@ -69,6 +69,20 @@ describe("jeder Grund aus agent.ts wird übersetzt", () => {
     expect(gruendeAusAgent().length).toBeGreaterThanOrEqual(8);
   });
 
+  /**
+   * Geprüft wird die WIRKUNG, nicht die Bauart: Der Test ruft
+   * `agentFehlerText` auf und sieht sich an, was herauskommt. Er weiß nicht,
+   * ob die Übersetzung ein `switch`, eine Tabelle oder etwas Drittes ist.
+   *
+   * Das ist der Unterschied, an dem sich die Sache entschieden hat: Ein
+   * paralleler Wächter in `agent-routes.test.ts` schnitt den RUMPF dieser
+   * Funktion aus dem Quelltext und suchte darin `case`-Zweige. Der hätte
+   * gemeldet, sobald jemand hier von `switch` auf eine Tabelle umstellt —
+   * obwohl sich für den Kunden nichts ändert —, und er sah den Präfix-Zweig
+   * gar nicht, weil der kein `case` ist. Ein Test, der die Implementierung
+   * eines FREMDEN Bereichs festhält, wird irgendwann entfernt statt gepflegt,
+   * und dann ist die Prüfung ganz weg.
+   */
   test.each(gruendeAusAgent().filter((g) => !NUR_START.has(g)))(
     "„%s“ kommt als deutscher Satz beim Kunden an",
     (grund) => {
@@ -108,6 +122,17 @@ describe("jeder Grund aus agent.ts wird übersetzt", () => {
   test("kein toter Fall in der Übersetzung", () => {
     // Ein Fall ohne Erzeuger ist Ballast, der beim Lesen Sicherheit vortäuscht.
     // `ende` stand hier einmal und wurde von nichts erzeugt.
+    //
+    // EHRLICH GESAGT: Diese eine Prüfung liest sehr wohl die Implementierung —
+    // sie sucht `case`-Zweige im Rumpf und bricht, wenn `agentFehlerText`
+    // einmal keine `switch`-Anweisung mehr ist. Das ist derselbe Griff, den
+    // ich oben als falsch beschreibe, und er ist hier trotzdem vertretbar:
+    // Test und Funktion gehören DEMSELBEN Bereich, liegen zwei Dateien
+    // nebeneinander, und ein Umbau ändert beide in einem Zug. Falsch wird der
+    // Griff, wenn er eine Bereichsgrenze überschreitet — dann pflegt ihn
+    // niemand, der ihn ändern müsste. Wer diese Funktion umbaut, passt die
+    // folgende Zeile mit an; wer sie über Bereichsgrenzen kopiert, sollte es
+    // lassen.
     const behandelt = [...(agentFehlerText.toString().matchAll(/case "([a-z-]+)"/g))].map((m) => m[1]!);
     const erzeugt = new Set(gruendeAusAgent().map((g) => g.split(":")[0]!));
     for (const fall of behandelt) {
