@@ -127,7 +127,7 @@ export function sevenioVersand(konfig: SmsKonfig, basis = "https://gateway.seven
           : String(antwort).trim();
       if (erfolg !== "100") {
         throw new Error(
-          `SMS-Versand fehlgeschlagen: ${SEVENIO_FEHLER[erfolg] ?? `Statuscode ${erfolg || "unbekannt"}`}`,
+          `SMS-Versand fehlgeschlagen: ${SEVENIO_FEHLER[erfolg] ?? `Statuscode ${nurCode(erfolg)}`}`,
         );
       }
     },
@@ -189,15 +189,15 @@ function nachrichtentext(code: string): string {
 }
 
 /**
- * Fremdtext, der in eine Fehlermeldung und damit ins Betreiber-Log wandert.
+ * Ein Statuscode des Anbieters, so weit gekürzt, dass er ein Statuscode bleiben
+ * kann und nichts anderes: höchstens zwölf Zeichen, nur Buchstaben und Ziffern.
  *
- * Der Anbieter bestimmt diesen Inhalt, nicht wir. Zeilenumbrüche und
- * Steuerzeichen würden im Log wie eigene Einträge aussehen — ein Angreifer, der
- * die Antwort beeinflussen kann, schriebe sich sonst gefälschte Zeilen hinein.
+ * Ohne diese Klammer stünde bei einer unerwarteten Antwort deren **ganzer Rumpf**
+ * in der Meldung — siehe die Begründung an `ruf()`.
  */
-function entschaerft(roh: string): string {
-  // eslint-disable-next-line no-control-regex
-  return roh.replace(/[\u0000-\u001f\u007f]+/g, " ").trim().slice(0, 200);
+function nurCode(roh: string): string {
+  const geputzt = roh.replace(/[^A-Za-z0-9]/g, "").slice(0, 12);
+  return geputzt || "unbekannt";
 }
 
 async function ruf(was: string, url: string, init: RequestInit): Promise<unknown> {
@@ -214,7 +214,15 @@ async function ruf(was: string, url: string, init: RequestInit): Promise<unknown
   }
   const roh = await antwort.text();
   if (!antwort.ok) {
-    throw new Error(`${was} fehlgeschlagen: HTTP ${antwort.status} — ${entschaerft(roh)}`);
+    // **Nur der Status, nie der Rumpf.** Diese Meldung landet im Betreiber-Log,
+    // und der Rumpf gehört dem Anbieter: Eine 4xx-Antwort spiegelt gern die
+    // gesendete Anfrage zurück — und die enthält den EINMALCODE und den
+    // Empfänger. Ein Filter über Steuerzeichen genügt dafür nicht; er verhindert
+    // gefälschte Log-Zeilen, aber nicht, dass der Code im Log steht. Und
+    // "der Code darf nirgends ins Log" ist eine Invariante ohne Ausnahme
+    // (CLAUDE.md, Invariante 2). Wer die volle Antwort braucht, findet sie im
+    // Dashboard des Anbieters — dort steht sie ohnehin.
+    throw new Error(`${was} fehlgeschlagen: HTTP ${antwort.status}`);
   }
   try {
     return JSON.parse(roh);

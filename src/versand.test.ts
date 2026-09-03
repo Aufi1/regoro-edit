@@ -121,21 +121,35 @@ describe("SMS ueber seven.io", () => {
     s.stop();
   });
 
-  test("Fremdtext aus der Antwort kann keine Log-Zeilen faelschen", async () => {
-    // Der Anbieter bestimmt diesen Text. Zeilenumbrueche saehen im Log wie
-    // eigene Eintraege aus — ein Angreifer schriebe sich gefaelschte hinein.
+  test("der Rumpf der Anbieter-Antwort landet NICHT in der Meldung", async () => {
+    // Diese Meldung geht ins Betreiber-Log. Der Rumpf gehoert dem Anbieter, und
+    // eine 4xx-Antwort spiegelt gern die Anfrage zurueck — die enthaelt den
+    // EINMALCODE und den Empfaenger. Nur der Status darf hinein.
     const s = attrappenServer(() => ({
-      status: 500,
-      body: "kaputt\n[regoro] ALLES GUT: nichts passiert\r\n\u0000",
+      status: 400,
+      body: JSON.stringify({ fehler: "ungueltig", to: "+4915120464812", text: "Code: 424242" }),
     }));
     const v = sevenioVersand({ anbieter: "sevenio", absender: "REGORO" }, s.basis);
-    const fehler = await v.sendeCode(NUMMER, "1").catch((e: Error) => e.message);
-    expect(fehler).not.toContain("\n");
-    expect(fehler).not.toContain("\r");
-    expect(fehler).not.toContain("\u0000");
-    expect(fehler).toContain("kaputt");
+    const fehler = await v.sendeCode(NUMMER, "424242").catch((e: Error) => e.message);
+    expect(fehler).toContain("400");
+    expect(fehler).not.toContain("424242"); // der Code
+    expect(fehler).not.toContain("4915120464812"); // der Empfaenger
+    expect(fehler).not.toContain("ungueltig");
     s.stop();
   });
+
+  test("ein unbekannter Statuscode wird auf einen Statuscode gekuerzt", async () => {
+    // Ohne diese Klammer stuende der ganze Rumpf in der Meldung.
+    const s = attrappenServer(() => ({ body: "999 \n Code: 424242 an +4915120464812" }));
+    const v = sevenioVersand({ anbieter: "sevenio", absender: "REGORO" }, s.basis);
+    const fehler = await v.sendeCode(NUMMER, "424242").catch((e: Error) => e.message);
+    expect(fehler).not.toContain("424242");
+    expect(fehler).not.toContain("4915120464812");
+    expect(fehler).not.toContain("\n");
+    expect(fehler.length).toBeLessThan(80);
+    s.stop();
+  });
+
 });
 
 describe("E-Mail ueber Scaleway", () => {
