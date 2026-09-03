@@ -140,8 +140,10 @@ const Q = {
     "Array.from(document.querySelectorAll('.__regoro-aetitel')).map(function(n){return n.textContent})",
 };
 
-/** Klick auf „Gespräche" im Kopf der Leiste. */
-const LISTE_AUF = "js \"document.querySelector('.__regoro-agespraeche').click()\"";
+/** Klick auf „Verlauf" im Kopf der Leiste (der zweite der beiden Knöpfe). */
+const LISTE_AUF =
+  "js \"Array.from(document.querySelectorAll('.__regoro-akopfbtn'))" +
+  ".find(function(b){return b.textContent==='Verlauf'}).click()\"";
 
 const FAELLE: Record<string, Fall> = {
   "mit-dateien": {
@@ -311,9 +313,9 @@ const FAELLE: Record<string, Fall> = {
   },
 
   "verlauf-waehlen": {
-    tun: "Leiste öffnen, oben rechts auf „Gespräche“ klicken, das ÄLTERE Gespräch anklicken.",
+    tun: "Leiste öffnen, oben rechts auf „Verlauf“ klicken, das ÄLTERE Gespräch anklicken.",
     erwartung:
-      "Die Liste nennt „Neues Gespräch“ und beide Titel. Nach dem Klick auf das ältere " +
+      "Die Liste nennt beide Titel. Nach dem Klick auf das ältere " +
       "steht dessen Inhalt im Chatfenster und der des jüngeren ist WEG — nicht darunter " +
       "gehängt. Zwei Gespräche zu vermischen wäre schlimmer als keines zu zeigen.",
     ki: true,
@@ -343,11 +345,12 @@ const FAELLE: Record<string, Fall> = {
   },
 
   "verlauf-liste": {
-    tun: "Leiste öffnen, oben rechts auf „Gespräche“ klicken.",
+    tun: "Leiste öffnen, oben rechts auf „Verlauf“ klicken.",
     erwartung:
-      "Die Liste klappt auf und beginnt mit „Neues Gespräch“, darunter die gespeicherten " +
-      "Gespräche mit ihrem ersten Satz als Titel. Der Titel ist WÖRTLICHER Kundentext — " +
-      "er darf nie als HTML gedeutet werden. Deshalb steht hier eines mit spitzen Klammern.",
+      "Die Liste klappt auf und zeigt die gespeicherten Gespräche mit ihrem ersten Satz " +
+      "als Titel — „Neu“ ist ein eigener Knopf im Kopf, kein Listeneintrag. Der Titel ist " +
+      "WÖRTLICHER Kundentext und darf nie als HTML gedeutet werden; deshalb steht hier " +
+      "eines mit spitzen Klammern.",
     ki: true,
     gespraeche: [
       {
@@ -361,15 +364,13 @@ const FAELLE: Record<string, Fall> = {
     pruefung:
       `JSON.stringify({titel:${Q.listenTitel},offen:${Q.listeOffen},` +
       "eingeschleust:document.querySelectorAll('#__regoro-agent img').length})",
-    sollwert:
-      '{"titel":["Neues Gespräch","<img src=x onerror=alert(1)>Mach was"],"offen":true,' +
-      '"eingeschleust":0}',
+    sollwert: '{"titel":["<img src=x onerror=alert(1)>Mach was"],"offen":true,"eingeschleust":0}',
     ereignisse: [rahmen("fehler", { grund: "Kein Lauf aktiv." })],
   },
 
   "verlauf-wettlauf": {
     tun:
-      "Leiste öffnen und SOFORT — während das Gespräch noch lädt — „Gespräche“ " +
+      "Leiste öffnen und SOFORT — während das Gespräch noch lädt — „Verlauf“ " +
       "aufklappen und denselben (obersten) Eintrag anklicken.",
     erwartung:
       "Jede Zeile steht GENAU EINMAL da. Zwei Ladevorgänge sind unterwegs, beide " +

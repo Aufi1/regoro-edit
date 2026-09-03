@@ -220,7 +220,22 @@ export async function runWorker(): Promise<void> {
         reasoning: true,
         input: ["text"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 128_000,
+        /**
+         * Vom ELTERNPROZESS erfragt, nicht hier geraten.
+         *
+         * `allowModelNetwork: false` oben ist richtig — der Arbeiter hat kein
+         * Netz (Invariante 11) und darf pi nicht beim Anbieter nachfragen
+         * lassen. Also stand hier jahrelang eine feste 128.000, während das
+         * eingestellte Modell zehnmal so viel konnte: pi verdichtete ab 111.616
+         * Token mitten in großen Aufträgen, jede Verdichtung ein zusätzlicher
+         * abrechenbarer Modellaufruf, und `keepRecentTokens` warf dabei fast
+         * das ganze Gespräch weg. Begründung und Messung: `modell-info.ts`.
+         *
+         * Fehlt die Variable (älterer Elternprozess, Test ohne sie), gilt
+         * wieder der alte Wert — nie 0, denn das hieße „verdichte sofort und
+         * immer".
+         */
+        contextWindow: Number(process.env.REGORO_CONTEXT_WINDOW) || 128_000,
         maxTokens: 16_384,
       },
     ],

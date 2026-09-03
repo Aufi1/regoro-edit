@@ -211,6 +211,22 @@ export function uebernimmSitzung(kopie: string, siteDir: string): { kopiert: num
  * Über die Datei-mtime und nicht über `listAll`: Das Aufräumen soll auch dann
  * greifen, wenn eine Datei so beschädigt ist, dass pi sie nicht mehr einlesen
  * kann — sonst bliebe genau der Müll liegen, den man am ehesten loswerden will.
+ *
+ * ES SIND DAMIT ZWEI VERSCHIEDENE UHREN, und das ist Absicht. Nachgesehen in
+ * `session-manager.js`, nicht angenommen: `SessionInfo.modified` — woran die
+ * Liste und die 24-Stunden-Regel hängen — ist der Zeitstempel der LETZTEN
+ * NACHRICHT IN DER DATEI (`getMessageActivityTime`), mit Rückfall auf den
+ * Header und erst ganz zuletzt auf die mtime. Hier zählt dagegen allein die
+ * mtime.
+ *
+ * Im Betrieb laufen beide zusammen: Wer schreibt, hängt eine Nachricht an UND
+ * fasst die Datei an. Auseinander laufen sie nur in eine ungefährliche
+ * Richtung — `uebernimmSitzung` kopiert auch einen Lauf zurück, der nichts
+ * angehängt hat, und frischt dabei die mtime auf. Ein Verlauf lebt dann länger
+ * als 30 Tage; er verschwindet nie zu früh.
+ *
+ * Wer das umbaut, muss beide Richtungen prüfen: Eine Aufbewahrung, die der
+ * Liste voraus wäre, löschte Gespräche, die die Seitenleiste noch anzeigt.
  */
 export function raeumeAlteVerlaeufe(siteDir: string, jetzt: number = Date.now()): number {
   const dir = verlaufDir(siteDir);

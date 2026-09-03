@@ -346,6 +346,20 @@ Sichern eines Kundenordners gehören sie zu den Kundendaten.
 > die Gespräche nicht. Der Befehl sagt es beim Abschalten dazu und nennt die
 > Anzahl; wer sie behalten will, sichert `.regoro/verlauf/` vorher weg.
 
+### Kontextfenster und Verdichtung
+
+Wie viel Gespräch der Agent gleichzeitig im Kopf behält, bestimmt das
+Kontextfenster des Modells. Regoro **fragt es beim Anbieter ab** (`GET
+<baseUrl>/models`) statt es zu raten — einmal je Modell, danach für Stunden
+gemerkt. Antwortet der Anbieter nicht oder kennt er die Route nicht, gelten
+128.000 Token und der Lauf startet trotzdem.
+
+Ist das Fenster voll, verdichtet der Agent das Gespräch selbst: Er fasst den
+älteren Teil zusammen und arbeitet damit weiter. Das kostet einen zusätzlichen
+Modellaufruf, wird aber **nicht** ins Monatskontingent gebucht — der Deckel ist
+gegen einen Agenten gedacht, der sich verrennt, nicht gegen einen Kunden, der
+lange redet.
+
 ### Kontingent
 
 Jede Website hat ein Monatskontingent von 200.000 Token; es setzt sich am

@@ -568,9 +568,12 @@
       "display:flex;flex-direction:column;",
       "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;}",
       "#__regoro-agent *{box-sizing:border-box;}",
-      "#__regoro-agent .__regoro-ahead{display:flex;align-items:center;justify-content:space-between;",
+      "#__regoro-agent .__regoro-ahead{display:flex;align-items:center;gap:8px;",
       "padding:14px 16px;background:#14324f;color:#fff;flex:0 0 auto;}",
-      "#__regoro-agent .__regoro-ahead h2{margin:0;font-size:16px;font-weight:700;}",
+      // Der Titel nimmt den freien Platz; damit stehen die Knöpfe rechts, ohne
+      // dass jemand `justify-content` und feste Breiten gegeneinander rechnet.
+      "#__regoro-agent .__regoro-ahead h2{margin:0;font-size:16px;font-weight:700;",
+      "flex:1 1 auto;}",
       "#__regoro-agent .__regoro-aclose{appearance:none;background:transparent;border:0;",
       "color:#fff;font-size:22px;line-height:1;cursor:pointer;padding:0 4px;}",
       "#__regoro-agent .__regoro-aquota{flex:0 0 auto;padding:8px 16px;background:#f5f8fa;",
@@ -652,12 +655,12 @@
        * schiebt die Liste den Chat nach unten und bekommt ihren eigenen
        * Scrollbereich; nichts kann sie abschneiden.
        */
-      "#__regoro-agent .__regoro-akopfzeile{display:flex;align-items:center;gap:10px;}",
-      "#__regoro-agent button.__regoro-agespraeche{appearance:none;background:transparent;",
+      "#__regoro-agent .__regoro-akopfbtns{display:flex;gap:6px;flex:0 0 auto;}",
+      "#__regoro-agent button.__regoro-akopfbtn{appearance:none;background:transparent;",
       "border:1px solid rgba(255,255,255,.4);color:#fff;border-radius:999px;padding:4px 12px;",
-      "font:inherit;font-size:12.5px;cursor:pointer;}",
-      "#__regoro-agent button.__regoro-agespraeche:hover{background:rgba(255,255,255,.14);}",
-      "#__regoro-agent button.__regoro-agespraeche[aria-expanded=\"true\"]{background:#fff;color:#14324f;",
+      "font:inherit;font-size:12.5px;cursor:pointer;white-space:nowrap;}",
+      "#__regoro-agent button.__regoro-akopfbtn:hover{background:rgba(255,255,255,.14);}",
+      "#__regoro-agent button.__regoro-akopfbtn[aria-expanded=\"true\"]{background:#fff;color:#14324f;",
       "border-color:#fff;}",
       "#__regoro-agent .__regoro-aliste{flex:0 0 auto;max-height:45%;overflow:auto;",
       "border-bottom:1px solid #e2e8ec;background:#fbfdfe;}",
@@ -670,7 +673,6 @@
       "#__regoro-agent .__regoro-aetitel{display:block;font-size:13.5px;line-height:1.35;",
       "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}",
       "#__regoro-agent .__regoro-aemeta{display:block;font-size:11.5px;color:#7b8b98;margin-top:2px;}",
-      "#__regoro-agent .__regoro-aneu{font-weight:600;color:#14663a;}",
       "#__regoro-agent .__regoro-aleerliste{padding:10px 16px;font-size:12.5px;color:#7b8b98;}",
 
       /** Der Griff nach oben: Ladehinweis am Kopf des Verlaufs. */
@@ -2348,17 +2350,25 @@
   function openAgent() {
     var panel = el("div", { id: "__regoro-agent" });
 
-    // „Gespräche" sitzt oben rechts neben dem Titel — dort, wo der Kunde eine
-    // Historie sucht, und weit weg vom Absenden.
-    var gespraeche = el("button", {
-      class: "__regoro-agespraeche", type: "button", text: "Gespräche",
-      "aria-expanded": "false"
+    /**
+     * Zwei Knöpfe oben rechts: „Neu" und „Verlauf".
+     *
+     * Getrennt und nicht als ein Knopf mit Liste: „Ein neues Gespräch beginnen"
+     * ist die häufigere der beiden Absichten und soll nicht erst durch eine
+     * Liste hindurch. Vorher stand „Neues Gespräch" als erster Eintrag IN der
+     * Liste — zwei Klicks für den einen Klick.
+     */
+    var neuBtn = el("button", {
+      class: "__regoro-akopfbtn", type: "button", text: "Neu",
+      title: "Ein neues Gespräch beginnen"
+    });
+    var verlaufBtn = el("button", {
+      class: "__regoro-akopfbtn", type: "button", text: "Verlauf",
+      title: "Frühere Gespräche", "aria-expanded": "false"
     });
     var head = el("div", { class: "__regoro-ahead" }, [
-      el("div", { class: "__regoro-akopfzeile" }, [
-        el("h2", { text: "KI-Assistent" }),
-        gespraeche
-      ])
+      el("h2", { text: "KI-Assistent" }),
+      el("div", { class: "__regoro-akopfbtns" }, [neuBtn, verlaufBtn])
     ]);
     var closeBtn = el("button", {
       class: "__regoro-aclose", text: "\u00d7", type: "button", "aria-label": "Schließen"
@@ -2419,12 +2429,13 @@
     ui.agent = {
       quota: quota, verlauf: verlauf, eingabe: eingabe,
       senden: senden, abbrechen: abbrechen, hinweis: hinweis,
-      liste: liste, gespraeche: gespraeche
+      liste: liste, neuBtn: neuBtn, verlaufBtn: verlaufBtn
     };
 
     senden.addEventListener("click", onAuftragSenden);
     abbrechen.addEventListener("click", onAuftragAbbrechen);
-    gespraeche.addEventListener("click", onGespraecheToggle);
+    neuBtn.addEventListener("click", function () { waehleGespraech(null); });
+    verlaufBtn.addEventListener("click", onGespraecheToggle);
     verlauf.addEventListener("scroll", onVerlaufScroll);
     // Strg/Cmd+Enter schickt ab — Enter allein bleibt ein Zeilenumbruch, weil
     // ein Auftrag oft mehrere Sätze hat.
@@ -2522,7 +2533,7 @@
     var box = ui.agent.liste;
     var oeffnen = box.hidden;
     box.hidden = !oeffnen;
-    ui.agent.gespraeche.setAttribute("aria-expanded", oeffnen ? "true" : "false");
+    ui.agent.verlaufBtn.setAttribute("aria-expanded", oeffnen ? "true" : "false");
     if (!oeffnen) return;
     // Beim Aufklappen frisch holen: In einem zweiten Tab oder auf dem Handy
     // kann inzwischen ein Lauf ein Gespräch angelegt haben.
@@ -2545,18 +2556,13 @@
     var box = ui.agent.liste;
     box.textContent = "";
 
-    var neu = el("button", { class: "__regoro-aeintrag", type: "button" }, [
-      el("span", { class: "__regoro-aetitel __regoro-aneu", text: "Neues Gespräch" }),
-      el("span", { class: "__regoro-aemeta", text: "Beginnt von vorn, ohne das bisher Gesagte." })
-    ]);
-    if (agentVerlaufNeu) neu.setAttribute("aria-current", "true");
-    neu.addEventListener("click", function () { waehleGespraech(null); });
-    box.appendChild(neu);
-
+    // Kein „Neues Gespräch"-Eintrag mehr: Dafür gibt es den Knopf „Neu" im Kopf.
+    // Zwei Wege zu derselben Sache lassen einen davon veralten.
     var eintraege = (daten && Array.isArray(daten.verlaeufe)) ? daten.verlaeufe : [];
     if (eintraege.length === 0) {
       box.appendChild(el("div", {
-        class: "__regoro-aleerliste", text: "Noch keine gespeicherten Gespräche."
+        class: "__regoro-aleerliste",
+        text: "Noch keine gespeicherten Gespräche. Das hier ist das erste."
       }));
       return;
     }
@@ -2628,7 +2634,7 @@
     ui.agent.verlauf.textContent = "";
     setAgentHinweis("");
     ui.agent.liste.hidden = true;
-    ui.agent.gespraeche.setAttribute("aria-expanded", "false");
+    ui.agent.verlaufBtn.setAttribute("aria-expanded", "false");
     if (!id) return;                 // neues Gespräch: die leere Fläche IST die Antwort
     ladeNachrichten(id, null, meine).catch(function () {
       agentNachricht("Dieses Gespräch lässt sich nicht mehr öffnen.", "fehler");

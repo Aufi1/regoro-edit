@@ -27,6 +27,7 @@ import { startServer } from "./server.ts";
 import { attrappenVersand } from "./versand.ts";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { verlaufDir } from "./verlauf.ts";
+import { STANDARD_CONTEXT_WINDOW, leereModellCache } from "./modell-info.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
 const REAL_SITE = join(REPO_ROOT, "examples", "site");
@@ -579,4 +580,67 @@ describe("die Gesprächswahl erreicht den Arbeiter", () => {
     const env = await umgebungAus();
     expect(env.REGORO_SITZUNG_DATEI ?? "").toContain(frisch.id);
   }, 30_000);
+});
+
+
+// ===========================================================================
+// Das Kontextfenster erreicht den Arbeiter
+//
+// Dass `modell-info.ts` die richtige Zahl aus einer Anbieterantwort fischt,
+// steht in `modell-info.test.ts`. Hier geht es um das Stück dahinter: dass sie
+// bis in die Umgebung des Arbeiters durchkommt. Genau dieses Stück fehlte bei
+// der Gesprächswahl schon einmal ganz, während alle Einzelteile grün waren.
+// ===========================================================================
+describe("das Kontextfenster erreicht den Arbeiter", () => {
+  /** Ein Anbieter, der für `modell` ein Kontextfenster meldet. */
+  function anbieter(modell: string, fenster: number): string {
+    const s = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(req) {
+        if (!new URL(req.url).pathname.endsWith("/models")) return new Response("nein", { status: 404 });
+        return Response.json({ data: [{ id: modell, top_provider: { context_length: fenster } }] });
+      },
+    });
+    anbieterServer.push(s);
+    return `http://127.0.0.1:${s.port}/v1`;
+  }
+  const anbieterServer: { stop(): void }[] = [];
+
+  afterAll(() => {
+    for (const s of anbieterServer) s.stop();
+  });
+
+  async function umgebungMit(kiConfig: HostCtx["ki"]): Promise<Record<string, string>> {
+    leereModellCache();
+    const eigenerCtx = { ...ctx, ki: kiConfig };
+    starteLauf(eigenerCtx as HostCtx, "umgebung-melden", {
+      workerBefehl: [process.execPath, "run", ATTRAPPE],
+    });
+    const alle = await sammle();
+    const text = alle
+      .filter((e): e is Extract<AgentEreignis, { t: "text" }> => e.t === "text")
+      .map((e) => e.inhalt)
+      .join("");
+    return (JSON.parse(text) as { env: Record<string, string> }).env;
+  }
+
+  test.skipIf(!haveBwrap())("die gemeldete Zahl landet in REGORO_CONTEXT_WINDOW", async () => {
+    const modell = "test/grosses-modell";
+    const env = await umgebungMit({ ...KI, baseUrl: anbieter(modell, 1_048_576), model: modell });
+    expect(env.REGORO_CONTEXT_WINDOW).toBe("1048576");
+  }, 30_000);
+
+  test.skipIf(!haveBwrap())("ein toter Anbieter gibt den Vorgabewert — der Lauf startet trotzdem", async () => {
+    // Die Abfrage ist eine Stellschraube, keine Voraussetzung. Ein Anbieter
+    // ohne `/models` darf keinen Auftrag verhindern.
+    const env = await umgebungMit({ ...KI, baseUrl: "http://127.0.0.1:1/v1" });
+    expect(env.REGORO_CONTEXT_WINDOW).toBe(String(STANDARD_CONTEXT_WINDOW));
+  }, 30_000);
+
+  test.skipIf(!haveBwrap())("Gegenprobe: die beiden Werte sind wirklich verschieden", () => {
+    // Ohne sie wären beide Prüfungen oben auch dann grün, wenn die Umgebung
+    // IMMER denselben Wert trüge und die Abfrage gar nichts bewirkte.
+    expect(String(STANDARD_CONTEXT_WINDOW)).not.toBe("1048576");
+  });
 });
