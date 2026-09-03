@@ -140,6 +140,11 @@ const Q = {
     "Array.from(document.querySelectorAll('.__regoro-aetitel')).map(function(n){return n.textContent})",
 };
 
+/** Klick auf „Neu“ im Kopf der Leiste. */
+const NEU_KLICK =
+  "js \"Array.from(document.querySelectorAll('.__regoro-akopfbtn'))" +
+  ".find(function(b){return b.textContent==='Neu'}).click()\"";
+
 /** Klick auf „Verlauf" im Kopf der Leiste (der zweite der beiden Knöpfe). */
 const LISTE_AUF =
   "js \"Array.from(document.querySelectorAll('.__regoro-akopfbtn'))" +
@@ -403,6 +408,45 @@ const FAELLE: Record<string, Fall> = {
     sollwert:
       '{"zeilen":["Renn-Zeile 1","Renn-Zeile 2","Renn-Zeile 3"],"dubletten":0}',
     ereignisse: [rahmen("fehler", { grund: "Kein Lauf aktiv." })],
+  },
+
+  "verlauf-neu-waehrend-laden": {
+    tun:
+      "Leiste öffnen und SOFORT — während das Gespräch noch lädt — auf „Neu“ klicken.",
+    erwartung:
+      "Das Chatfenster bleibt LEER. Der Kunde hat ein neues Gespräch verlangt; " +
+      "weder die Zeilen des alten noch der AUSGANG des letzten Laufs " +
+      "(„Der letzte Auftrag hat diese Dateien geändert“) dürfen darin landen. " +
+      "Zwei Läufe in "  +
+      "einem Verlauf sind schlimmer als ein leeres Fenster, weil nichts daran " +
+      "danach aussieht.",
+    ki: true,
+    nachlese: true,
+    verlaufVerzoegerungMs: 1500,
+    sofort: true,
+    gespraeche: [
+      {
+        id: "g-vorher",
+        titel: "Das Gespräch von vorhin",
+        vorMs: 60_000,
+        zeilen: [
+          { von: "kunde", text: "ALT: Auftrag" },
+          { von: "agent", text: "ALT: Antwort" },
+        ],
+      },
+    ],
+    schritte: [NEU_KLICK, "sleep 5"],
+    pruefung: `JSON.stringify({zeilen:${Q.zeilen}})`,
+    sollwert: '{"zeilen":[]}',
+    // Genau die Folge, die ohne Wächter in das neue Gespräch fiele.
+    ereignisse: [
+      rahmen("text", { inhalt: "Ich habe die Seite gebaut." }),
+      rahmen("fertig", {
+        zusammenfassung: "Ich habe die Seite gebaut.",
+        dateien: ["alt.html"],
+        commit: "a1b2c3d",
+      }),
+    ],
   },
 
   "verlauf-fehlt": {

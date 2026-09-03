@@ -2556,7 +2556,12 @@
        * aber immer richtig. Sie ist die Antwort auf genau die Frage, die hier
        * zählt — „steht da schon etwas?".
        */
-      ladeAgentStatus(false, { nurAbschluss: ui.agent.verlauf.children.length > 0 });
+      ladeAgentStatus(false, {
+        nurAbschluss: ui.agent.verlauf.children.length > 0,
+        // Die Generation reist mit: Hat der Kunde inzwischen gewechselt, darf
+        // die Nachlese eines FREMDEN Laufs nicht mehr in dieses Gespräch fallen.
+        generation: meine
+      });
     });
   }
 
@@ -2805,7 +2810,26 @@
         // Reload, gegen den das Nachreichen antritt — und sähe bei einem
         // gescheiterten Lauf gar nicht, DASS er gescheitert ist. Er versuchte
         // es dann noch einmal und bezahlte denselben Fehlschlag zweimal.
-        verbindeStrom({ nachlese: true, nurAbschluss: !!(opts && opts.nurAbschluss) });
+        /**
+         * NUR, WENN DIE ANFRAGE NOCH GILT.
+         *
+         * Der Ablauf, den das verhindert: Die Leiste geht auf und lädt ihr
+         * Gespräch; noch während die Antwort unterwegs ist, klickt der Kunde
+         * „Neu" oder wählt ein anderes Gespräch. Die alte Kette läuft weiter
+         * und hängte den AUSGANG des vorigen Laufs in das frisch gewählte
+         * Gespräch — zwei Läufe in einem Verlauf, ohne dass etwas danach
+         * aussieht.
+         *
+         * Bewusst NUR die Nachlese und nicht die ganze Kette: Ein laufender
+         * Auftrag (Zweig darüber) gehört weiter angehängt, und die
+         * Kontingentanzeige ist schon gesetzt. Wer hier vorher aussteigt,
+         * tauscht einen Fehler gegen einen kleineren — eine Leiste ohne
+         * Kontingent und ohne Anschluss an den laufenden Auftrag.
+         */
+        var meine = opts && opts.generation;
+        if (meine === undefined || meine === null || meine === agentLadeGeneration) {
+          verbindeStrom({ nachlese: true, nurAbschluss: !!(opts && opts.nurAbschluss) });
+        }
       }
     }).catch(function (err) {
       if (!agentPanel) return;
