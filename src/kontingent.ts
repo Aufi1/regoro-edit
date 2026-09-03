@@ -17,14 +17,29 @@ import { join } from "node:path";
 import { AUTH_DIR_NAME } from "./auth.ts";
 
 /**
- * 200.000 Token je Website und Monat.
+ * 1.000.000 Token je Website und Monat. **Vorläufiger Wert.**
  *
- * Bewusst niedrig: Bei einem günstigen Modell sind das rund 17 Cent im Monat.
  * Die Grenze soll einen entgleisten Lauf abschneiden, nicht den Normalgebrauch
- * einrahmen — und lieber einmal zu früh greifen als eine Rechnung erzeugen, die
- * niemand erwartet hat.
+ * einrahmen. Gemessen an echten Läufen:
+ *
+ *   kleiner Auftrag (Text ändern, Abschnitt ergänzen)   16.000 – 24.000
+ *   „neue Unterseite" auf der Beispielseite                     8.403
+ *   dieselbe Aufgabe auf einer echten Fabrik-Seite             205.120
+ *
+ * **Die Spannweite hängt an der Seitengröße, nicht an der Aufgabe.** Der Agent
+ * liest die Seite, die er ändert; eine gebaute Kundenseite mit Inline-Styles und
+ * Design-Tokens ist ein Vielfaches der Beispielseite. Deshalb war die frühere
+ * Grenze von 200.000 die falsche Zahl: Sie hätte einem echten Kunden **einen**
+ * Auftrag im Monat erlaubt, und der wäre knapp durchgegangen.
+ *
+ * Die Kosten bleiben unkritisch: Bei `z-ai/glm-5.3-flash` (0,075 / 0,250 $ je
+ * Million) sind eine Million Token grob 8 bis 25 Cent je Website und Monat.
+ *
+ * Die endgültige Festlegung kommt, wenn mehr Läufe gemessen sind — wer sie
+ * ändert, sollte die Zahlen oben mit aktualisieren, damit die nächste Änderung
+ * eine Grundlage hat statt eines Bauchgefühls.
  */
-export const TOKEN_KONTINGENT = 200_000;
+export const TOKEN_KONTINGENT = 1_000_000;
 
 export type Kontingent = {
   frei: number;
