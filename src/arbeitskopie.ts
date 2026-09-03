@@ -221,6 +221,16 @@ function* kopieDateien(
  * Stellen das Optimistic Locking, eine andere Ausgabe bräche laufende
  * Editor-Sitzungen mit 409.
  */
+/**
+ * Byte-Hash einer Datei — exportiert, weil `agent.ts` unmittelbar vor dem
+ * Schreiben noch einmal prüfen muss, ob die Datei sich seit dem Vergleich
+ * geändert hat. Diesselbe Funktion, damit beide Seiten nie verschiedene Hashes
+ * über dieselbe Datei bilden.
+ */
+export function byteHashDatei(pfad: string): string {
+  return byteHash(pfad);
+}
+
 function byteHash(pfad: string): string {
   return createHash("sha256").update(readFileSync(pfad)).digest("hex");
 }

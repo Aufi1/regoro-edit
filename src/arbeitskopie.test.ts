@@ -17,6 +17,8 @@ import { tmpdir } from "node:os";
 import { join, relative, sep } from "node:path";
 import { createHash } from "node:crypto";
 
+import { ersteKollision } from "./agent.ts";
+
 import {
   runtimeWurzel,
   legeArbeitskopieAn,
@@ -413,5 +415,58 @@ describe("arbeitskopie.ts — Aufräumen", () => {
   test("raeumeVerwaisteAuf wirft nicht, wenn es die Wurzel nicht gibt", () => {
     process.env.RUNTIME_DIRECTORY = join(tmpdir(), "regoro-gibt-es-nicht-" + Date.now());
     expect(() => raeumeVerwaisteAuf()).not.toThrow();
+  });
+});
+
+describe("die letzte Prüfung vor dem Schreiben (ersteKollision)", () => {
+  /**
+   * WAS SIE SCHLIESST. Die Fremdänderungs-Prüfung liest den Stand der Website
+   * EINMAL; danach läuft die gesamte Validierung — Dateien lesen, HTML parsen,
+   * Regeln anwenden. Bei mehreren Dateien sind das leicht einige hundert
+   * Millisekunden. Speichert der Kunde in genau diesem Fenster, ist die Prüfung
+   * längst durch und der Schreibvorgang überschreibt trotzdem.
+   *
+   * Das Zeitfenster selbst ist nicht ehrlich testbar — man müsste zwischen zwei
+   * Anweisungen treffen. Geprüft wird deshalb die LOGIK.
+   */
+  function feld(dir: string, name: string) {
+    return [{ rel: name, ziel: join(dir, name) }];
+  }
+
+  test("unverändert seit dem Ausgangsstand → keine Kollision", () => {
+    const site = makeSite();
+    const stand = leseStand(site);
+    expect(ersteKollision(feld(site, "index.html"), stand)).toBeNull();
+  });
+
+  test("inzwischen von Hand geändert → Kollision mit dem Dateinamen", () => {
+    const site = makeSite();
+    const stand = leseStand(site);
+    writeFileSync(join(site, "index.html"), "<html>vom Kunden, mitten im Lauf</html>");
+    expect(ersteKollision(feld(site, "index.html"), stand)).toBe("fremd-geaendert:index.html");
+  });
+
+  test("inzwischen gelöscht → ebenfalls Kollision", () => {
+    // Sonst legte die Übernahme eine Datei wieder an, die der Kunde gerade
+    // entfernt hat.
+    const site = makeSite();
+    const stand = leseStand(site);
+    rmSync(join(site, "index.html"));
+    expect(ersteKollision(feld(site, "index.html"), stand)).toBe("fremd-geaendert:index.html");
+  });
+
+  test("eine NEUE Datei des Agenten ist keine Kollision", () => {
+    // Beidseitig „gibt es nicht" ist ein gültiger Gleichstand — sonst käme kein
+    // Auftrag durch, der eine Unterseite anlegt.
+    const site = makeSite();
+    const stand = leseStand(site);
+    expect(ersteKollision(feld(site, "ganz-neu.html"), stand)).toBeNull();
+  });
+
+  test("ohne Ausgangsstand gilt jede existierende Datei als Kollision", () => {
+    // Fail-closed: Wer die Funktion ohne Ausgangsstand ruft, hat keinen
+    // Vergleichspunkt — dann lieber ablehnen als blind überschreiben.
+    const site = makeSite();
+    expect(ersteKollision(feld(site, "index.html"), null)).toBe("fremd-geaendert:index.html");
   });
 });

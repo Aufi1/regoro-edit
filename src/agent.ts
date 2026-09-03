@@ -28,6 +28,7 @@ import { commitEdit, git } from "./git.ts";
 import { AUTH_DIR_NAME } from "./auth.ts";
 import { bwrapVerfuegbar, sandboxArgv, standardVerstecke } from "./sandbox.ts";
 import {
+  byteHashDatei,
   ermittleAenderungen,
   legeArbeitskopieAn,
   leseStand,
@@ -847,6 +848,27 @@ function uebernehmen(
     zuSchreiben.push({ rel, ziel, inhalt });
   }
 
+  /**
+   * LETZTE PRÜFUNG UNMITTELBAR VOR DEM SCHREIBEN.
+   *
+   * Die Fremdänderungs-Prüfung oben liest den Stand der Website EINMAL — und
+   * danach läuft die gesamte Validierung: Dateien lesen, HTML parsen, Regeln
+   * anwenden. Bei mehreren Dateien sind das leicht einige hundert Millisekunden.
+   * Speichert der Kunde in genau diesem Fenster, ist die Prüfung längst durch
+   * und der Schreibvorgang überschreibt trotzdem.
+   *
+   * Deshalb hier noch einmal, Datei für Datei, direkt vor dem Schreiben. Das
+   * Fenster schrumpft damit von „die ganze Validierung" auf „zwischen Hash und
+   * Write" — echte Atomarität gäbe es nur mit einer Sperre über den ganzen
+   * Schreibweg, und die brächte einen Zustand mit sich, den ein abgestürzter
+   * Lauf hinterlassen könnte.
+   *
+   * Abgebrochen wird VOR dem ersten Schreiben, nicht mittendrin: Sonst bliebe
+   * die Website halb übernommen — der schlechteste aller Ausgänge.
+   */
+  const kollision = ersteKollision(zuSchreiben, ausgang);
+  if (kollision) return { ok: false, grund: kollision };
+
   for (const { ziel, inhalt } of zuSchreiben) {
     mkdirSync(dirname(ziel), { recursive: true });
     writeFileSync(ziel, inhalt);
@@ -863,4 +885,37 @@ function uebernehmen(
     /* ohne Hash ist der Lauf trotzdem gelungen */
   }
   return { ok: true, dateien, commit };
+}
+
+
+/**
+ * Prüft unmittelbar vor dem Schreiben, ob eine Zieldatei noch dem Ausgangsstand
+ * entspricht. Liefert den Ablehnungsgrund oder `null`.
+ *
+ * WARUM ALS EIGENE FUNKTION: Das Zeitfenster, das sie schließt, lässt sich nicht
+ * ehrlich end-to-end testen — man müsste zwischen zwei Anweisungen treffen.
+ * Ein Test, der das versucht, wäre entweder flatterhaft oder er könnte gar nicht
+ * anschlagen, und ein Nachweis, der nicht anschlagen kann, beweist durch sein
+ * Ausbleiben nichts. Prüfbar ist dagegen die LOGIK: gleicher Hash → durch,
+ * anderer oder verschwundener → Kollision. Das steht als Test da.
+ *
+ * `undefined` auf beiden Seiten ist ein gültiger Gleichstand: Die Datei gab es
+ * beim Kopieren nicht und gibt es jetzt nicht — genau der Fall „der Agent legt
+ * eine neue Datei an".
+ */
+export function ersteKollision(
+  zuSchreiben: { rel: string; ziel: string }[],
+  ausgang: Ausgangsstand | null,
+): string | null {
+  for (const { rel, ziel } of zuSchreiben) {
+    const erwartet = ausgang?.get(rel);
+    let jetzt: string | undefined;
+    try {
+      jetzt = existsSync(ziel) ? byteHashDatei(ziel) : undefined;
+    } catch {
+      return `unlesbar:${rel}`;
+    }
+    if (jetzt !== erwartet) return `fremd-geaendert:${rel}`;
+  }
+  return null;
 }
