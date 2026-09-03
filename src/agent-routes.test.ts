@@ -479,6 +479,21 @@ describe("GET /edit/agent/events (echter Server)", () => {
     expect(existsSync(join(site, "leistungen.html"))).toBe(true);
   }, 40_000);
 
+  test.skipIf(!haveBwrap())("ein Lauf ohne Änderung liefert dateien:[] und commit:null im Rahmen", async () => {
+    // Die Seitenleiste liest den RAHMEN, nicht das interne Ereignis. Sie kann
+    // „hat etwas geändert" von „hat nichts geändert" nur an diesen zwei Feldern
+    // unterscheiden — meldet sie hier grün samt „Seite neu laden", sucht der
+    // Kunde eine Änderung, die es nicht gibt.
+    const { site, base, cookie: c } = await bootMitKi(KI);
+    starteLauf(ctxFuer(site), "nichts-tun", { workerBefehl: [process.execPath, "run", ATTRAPPE] });
+
+    const rahmen = await liesSse(`${base}/edit/agent/events`, { cookie: c });
+    expect(rahmen.at(-1)!.event).toBe("fertig");
+    const fertig = JSON.parse(rahmen.at(-1)!.data) as { dateien: string[]; commit: string | null };
+    expect(fertig.dateien).toEqual([]);
+    expect(fertig.commit).toBeNull();
+  }, 40_000);
+
   test.skipIf(!haveBwrap())("ein abgelehnter Lauf endet mit fehler, nicht mit fertig", async () => {
     const { site, base, cookie: c } = await bootMitKi(KI);
     starteLauf(ctxFuer(site), "inline-skript", { workerBefehl: [process.execPath, "run", ATTRAPPE] });

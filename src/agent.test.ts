@@ -18,7 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AUTH_DIR_NAME, createAuthFile } from "./auth.ts";
 import type { KiConfig } from "./betreiber-config.ts";
-import { ensureRepo } from "./git.ts";
+import { countCommits, ensureRepo } from "./git.ts";
 import type { HostCtx } from "./host.ts";
 import { bwrapPfad } from "./sandbox.ts";
 import { brichAb, ereignisse, laufAktiv, starteLauf, type AgentEreignis } from "./agent.ts";
@@ -78,6 +78,7 @@ function haveBwrap(): boolean {
 let siteDir: string;
 let runtime: string;
 let ctx: HostCtx;
+let commitsVorher: number | null;
 
 beforeEach(async () => {
   siteDir = tmp("regoro-agent-site-");
@@ -85,6 +86,7 @@ beforeEach(async () => {
   ensureRepo(siteDir);
   await createAuthFile(siteDir, [NUMMER]);
   runtime = tmp("regoro-agent-run-");
+  commitsVorher = countCommits(siteDir);
   process.env.RUNTIME_DIRECTORY = runtime;
   ctx = { repoRoot: siteDir, siteDir, pageWhitelist: PAGES, auth: null, sitePrefix: "", ki: KI };
 });
@@ -169,6 +171,25 @@ describe.skipIf(!haveBwrap())("das Worker-Protokoll", () => {
     const e = await sammle();
     expect(JSON.stringify(e)).not.toContain("[attrappe]");
     expect(JSON.stringify(e)).not.toContain(runtime);
+  }, 30_000);
+
+  test("ein Lauf, der nichts ändert, ist als solcher erkennbar", async () => {
+    // Das kommt in Wirklichkeit oft vor: Das Modell liest die Website, hält den
+    // Wunsch für schon erfüllt und meldet fertig. Für den Elternprozess ist das
+    // ein Erfolg — für den Kunden nicht, und die Seitenleiste kann die beiden
+    // nur an DIESEN zwei Feldern auseinanderhalten.
+    //
+    // Ohne die Zusicherung meldet sie grün „fertig!" für eine Website, an der
+    // sich nichts geändert hat, samt „Seite neu laden" für nichts. Das ist
+    // schlimmer als eine Fehlermeldung: Der Kunde sucht die Änderung.
+    expect(start("nichts-tun").ok).toBe(true);
+    const e = await sammle();
+
+    const f = e.at(-1) as { t: string; dateien: string[]; commit: string | null };
+    expect(f.t).toBe("fertig");
+    expect(f.dateien).toEqual([]);
+    expect(f.commit).toBeNull();
+    expect(countCommits(siteDir)).toBe(commitsVorher); // und wirklich kein Commit
   }, 30_000);
 
   test("eine unverständliche Zeile des Workers bringt den Lauf nicht zum Absturz", async () => {

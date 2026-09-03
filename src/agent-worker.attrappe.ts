@@ -246,6 +246,18 @@ async function lauf(): Promise<void> {
       return;
     }
 
+    // Der Lauf, der NICHTS ändert. Kommt in Wirklichkeit oft vor: Das Modell
+    // liest die Website, hält den Wunsch für schon erfüllt und meldet fertig.
+    // Der Elternprozess muss das an `dateien: []` und `commit: null` erkennbar
+    // machen — sonst kann die Seitenleiste einen Erfolg nicht von einem
+    // Nichts unterscheiden und meldet grün für eine unveränderte Website.
+    case "nichts-tun": {
+      sende({ t: "werkzeug", name: "read_file", kurz: "liest index.html" });
+      sende({ t: "tokens", gesamt: 800 });
+      sende({ t: "fertig", zusammenfassung: "Die Seite enthält das schon." });
+      return;
+    }
+
     // Sendet eine Weile GAR NICHTS — wie ein Modell, das erst nachdenkt. Nur
     // damit ist die Frage „kommt das erste Byte sofort?" überhaupt eine Frage
     // (Contract §13.21): Ein Szenario, das gleich etwas sendet, beantwortet sie
