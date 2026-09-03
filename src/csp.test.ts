@@ -122,6 +122,31 @@ describe("die CSP sitzt ausschließlich im statischen Zweig", () => {
         expect(handleBlock(block, "@editor")).toContain("reverse_proxy");
       });
 
+      test("die Kopfzeilen des Editors gehören NICHT pauschal in den statischen Zweig", () => {
+        // WARUM DAS EIN EIGENER TEST IST: Der Bun-Host setzt drei Kopfzeilen
+        // (`SECURITY_HEADERS` in host.ts). Genau eine davon gehört auch auf die
+        // öffentliche Website. Der Satz „die anderen nach derselben Logik mit"
+        // ist naheliegend, wurde in diesem Projekt schon einmal gesagt — und
+        // wäre teuer gewesen:
+        //
+        //   X-Robots-Tag: noindex, nofollow  →  nimmt JEDE Kundenwebsite aus
+        //       dem Suchindex. Der Schaden fällt erst nach Wochen auf, wenn die
+        //       Anfragen ausbleiben, und ist bis dahin nicht mehr zuzuordnen.
+        //       Für /edit* ist die Zeile richtig: Editor-Seiten gehören nicht
+        //       in den Index.
+        //   Cache-Control: no-store          →  nimmt Besuchern jeden Cache.
+        //       Für /edit* richtig (Sitzungsinhalte), für Bilder und CSS einer
+        //       Kundenwebsite falsch.
+        //   X-Content-Type-Options: nosniff  →  gehört auf BEIDE Seiten.
+        //
+        // Die Menge ist also nicht einheitlich, und deshalb trägt „nach
+        // derselben Logik" nicht. Wer eine der beiden ersten hier ergänzt, soll
+        // an diesem Test scheitern und den Grund gleich mitlesen.
+        const statisch = handleBlock(block, "@allowed");
+        expect(statisch).not.toContain("X-Robots-Tag");
+        expect(statisch).not.toContain("no-store");
+      });
+
       test("der Editor-Zweig schaltet die Pufferung ab", () => {
         // ACHTUNG, die naheliegende Begründung ist FALSCH und wurde gemessen
         // (caddy 2.11.4): `flush_interval -1` ändert an der Zeit bis zum ersten
@@ -240,6 +265,15 @@ describe("die Caddyfile-Vorlagen spiegeln die CSP des Generators", () => {
     }
   });
 
+  test("in keiner Vorlage steht noindex im statischen Zweig", () => {
+    for (const datei of ["Caddyfile.example", "Caddyfile.multi.example"]) {
+      const statisch = handleBlock(readFileSync(join(REPO_ROOT, datei), "utf8"), "@allowed");
+      // Nur die ausgelieferte Kopfzeile, nicht der Warnkommentar daneben.
+      const kopfzeilen = statisch.split("\n").filter((z) => /^\s*header /.test(z)).join("\n");
+      expect(`${datei}: ${kopfzeilen}`).not.toContain("X-Robots-Tag");
+    }
+  });
+
   test("beide Vorlagen setzen nosniff im statischen Zweig", () => {
     // Dieselbe Begründung wie bei der CSP: Der dokumentierte Weg ist „Block aus
     // der Vorlage kopieren". Eine Vorlage ohne die Zeile heißt eine
@@ -348,6 +382,9 @@ describe.skipIf(!haveCaddy())("der erzeugte Block auf der Leitung", () => {
         // Auf der Leitung, nicht nur im Text: Ein `header`, das im Block steht
         // und nicht ankommt, wäre derselbe Ausfall wie eine fehlende Zeile.
         expect(`${pfad}: ${r.headers.get("x-content-type-options")}`).toBe(`${pfad}: nosniff`);
+        // Und das, was NICHT ankommen darf — auf der Leitung geprüft, weil ein
+        // Kommentar im Block niemanden davon abhält, die Zeile zu ergänzen.
+        expect(`${pfad}: ${r.headers.get("x-robots-tag")}`).toBe(`${pfad}: null`);
         await r.text();
       }
 
