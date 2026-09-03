@@ -62,6 +62,14 @@ export type KiConfig = {
   keyFromProxy: boolean;
   /** null = keine Websuche. */
   braveKey: string | null;
+  /**
+   * Schlüssel für den Seitenabruf (Firecrawl). null = kein Seitenabruf.
+   *
+   * Eigener Schlüssel neben `braveKey`, weil Suchen und Abrufen zwei Dienste
+   * sind: Ohne ihn kann der Agent weiter suchen, nur keine gefundene Seite mehr
+   * öffnen — statt dass die ganze Recherche ausfällt.
+   */
+  firecrawlKey: string | null;
   baseUrl: string;
   model: string;
 };
@@ -132,6 +140,7 @@ export function loadKiConfig(pfad: string = betreiberConfigPfad()): KiConfig | n
     // Ihn wegzunormalisieren hieße: keine Websuche, ohne Fehler, ohne Logzeile,
     // ohne dass irgendetwas rot wird. Es scheitert nicht, es wirkt nur nicht.
     braveKey: typeof obj.braveKey === "string" ? obj.braveKey : null,
+    firecrawlKey: typeof obj.firecrawlKey === "string" ? obj.firecrawlKey : null,
     baseUrl: typeof obj.baseUrl === "string" && obj.baseUrl !== "" ? obj.baseUrl : STANDARD_BASE_URL,
     model: typeof obj.model === "string" && obj.model !== "" ? obj.model : STANDARD_MODELL,
   };
@@ -151,6 +160,7 @@ export function schreibeKiConfig(cfg: KiConfig, pfad: string = betreiberConfigPf
     apiKey: cfg.apiKey,
     keyFromProxy: cfg.keyFromProxy,
     braveKey: cfg.braveKey,
+    firecrawlKey: cfg.firecrawlKey,
     baseUrl: cfg.baseUrl,
     model: cfg.model,
   };
