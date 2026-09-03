@@ -418,25 +418,24 @@ async function begleiteWorker(
      * meldete 200, ohne dass je etwas endete. Die Website war für weitere
      * Aufträge gesperrt, bis der Server neu startete.
      *
-     * Die Gnadenfrist nach `exited` ist der Grund, warum das nichts abschneidet:
-     * Bereits gepufferte Zeilen lösen `read()` sofort auf und gewinnen das
-     * Rennen; erst wenn nichts mehr nachkommt, greift der Ausgang. Ohne sie
-     * ginge im Normalfall das abschließende `fertig` verloren.
+     * WARUM NICHT gegen jeden `read()` gerennt wird: Ein einmal erzeugter
+     * Timer ist nach Ablauf DAUERHAFT erfüllt und gewinnt danach jedes Rennen.
+     * Liegen die letzten Bytes noch in der OS-Pipe statt im Puffer des Stroms,
+     * bleibt `read()` hängen, der Timer gewinnt — und die letzte Zeile ist weg.
+     * Stattdessen wird bis `done` LEERGELESEN; die Gesamtfrist wirkt nur als
+     * Notausgang, indem sie den Leser abbricht. Das kann ein Enkelprozess, der
+     * das Schreibende offen hält, nicht aushebeln.
      */
-    const exitAusgang = proc.exited.then(async () => {
+    const wachhund = proc.exited.then(async () => {
       await Bun.sleep(EXIT_GNADENFRIST_MS);
-      return null;
+      // Bricht ein hängendes `read()` auf — sonst stünde die Schleife still.
+      await leser.cancel().catch(() => {});
     });
-    while (true) {
-      const gelesen = await Promise.race([leser.read(), exitAusgang]);
-      if (gelesen === null || gelesen.done) break;
-      const stueck = gelesen.value;
-      puffer += dec.decode(stueck, { stream: true });
-      let bruch: number;
-      while ((bruch = puffer.indexOf("\n")) >= 0) {
-        const zeile = puffer.slice(0, bruch);
-        puffer = puffer.slice(bruch + 1);
-        if (!zeile.trim()) continue;
+    void wachhund;
+
+    /** Eine JSONL-Zeile des Workers verarbeiten. */
+    const verarbeite = (zeile: string): void => {
+        if (!zeile.trim()) return;
 
         let n: Record<string, unknown>;
         try {
@@ -446,7 +445,7 @@ async function begleiteWorker(
           // Eingabe. Ein JSON.parse ohne Netz darum wäre ein Serverabsturz,
           // ausgelöst von genau diesem Teil.
           process.stderr.write(`[agent] unverständliche Zeile vom Worker\n`);
-          continue;
+          return;
         }
 
         switch (n.t) {
@@ -483,8 +482,26 @@ async function begleiteWorker(
             grund ??= String(n.meldung ?? "lauf-gescheitert");
             break;
         }
+    };
+
+    while (true) {
+      const gelesen = await leser.read();
+      if (gelesen.done) break;
+      puffer += dec.decode(gelesen.value, { stream: true });
+      let bruch: number;
+      while ((bruch = puffer.indexOf("\n")) >= 0) {
+        verarbeite(puffer.slice(0, bruch));
+        puffer = puffer.slice(bruch + 1);
       }
     }
+
+    // Was ohne abschließenden Umbruch im Puffer bleibt, ist trotzdem eine Zeile.
+    // Kein Prozess ist verpflichtet, seinen letzten Umbruch zu schreiben — und
+    // verloren ginge ausgerechnet das Abschlussereignis. Der Schaden wäre ein
+    // GELUNGENER Lauf, der als gescheitert gemeldet wird: Die Website ist
+    // geändert, die Seitenleiste sagt das Gegenteil, der Kunde versucht es
+    // erneut und bezahlt denselben Lauf zweimal.
+    verarbeite(puffer + dec.decode());
 
     const code = await proc.exited;
     // Ein Absturz mitten im Lauf zählt nicht als Erfolg, auch wenn vorher eine
@@ -518,7 +535,11 @@ async function beantworte(n: Record<string, unknown>, ki: NonNullable<HostCtx["k
     if (!ki.braveKey) throw new Error("Die Websuche ist für diesen Server nicht eingerichtet.");
     return await sucheImNetz(String(n.q ?? ""), ki.braveKey);
   }
-  if (n.art === "fetch_page") return await holeSeite(String(n.url ?? ""));
+  // `firecrawlKey` wird durchgereicht, nicht hier geprüft: `null` heißt „nicht
+  // eingerichtet" und `""` heißt „ein ausgehender Proxy hängt die Anmeldung an".
+  // Diesen Unterschied kennt `holeSeite`; eine zweite Prüfung hier würde ihn
+  // früher oder später anders auslegen.
+  if (n.art === "fetch_page") return await holeSeite(String(n.url ?? ""), ki.firecrawlKey);
   throw new Error("Diese Anfrage kennt der Server nicht.");
 }
 
