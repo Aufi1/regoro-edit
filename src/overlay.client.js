@@ -2197,6 +2197,38 @@
   // /edit/agent/abort ruft. Deshalb fragt das Öffnen immer zuerst den Zustand
   // ab, statt von „nichts läuft" auszugehen.
   // ---------------------------------------------------------------------------
+  /**
+   * Merkt sich, ob die KI-Seitenleiste offen war — über den Seitenwechsel hinweg.
+   *
+   * Der Editor läuft auf jeder Seite der Website neu an; ohne dieses Merkzeichen
+   * ist das Panel nach jedem Wechsel über die Seitenauswahl zu. Der Verlauf
+   * selbst überlebt längst (er liegt beim Server), aber der Kunde musste die
+   * Leiste jedes Mal von Hand wieder aufklappen — und hielt das Gespräch beim
+   * ersten Mal für verloren.
+   *
+   * `sessionStorage` und nicht `localStorage`: Das gilt für DIESEN Tab und
+   * diese Sitzung. Wer den Editor morgen neu öffnet, soll eine ruhige Seite
+   * sehen und nicht ein Fenster, das er vor Tagen einmal aufgeklappt hat.
+   *
+   * Alles in try/catch: In einem privaten Fenster oder bei gesperrten
+   * Website-Daten wirft schon der Zugriff. Das darf den Editor nicht kosten —
+   * dann bleibt die Leiste eben zu.
+   */
+  var AGENT_MERK = "regoro-agent-offen";
+  function merkeAgentOffen(offen) {
+    try {
+      if (offen) window.sessionStorage.setItem(AGENT_MERK, "1");
+      else window.sessionStorage.removeItem(AGENT_MERK);
+    } catch (e) { /* egal */ }
+  }
+  function warAgentOffen() {
+    try {
+      return window.sessionStorage.getItem(AGENT_MERK) === "1";
+    } catch (e) {
+      return false;
+    }
+  }
+
   function onAgent() {
     if (agentPanel) {
       closeAgent();
@@ -2218,6 +2250,7 @@
     }
     agentPanel = null;
     document.body.classList.remove("__regoro-agent-offen");
+    merkeAgentOffen(false);
   }
 
   function openAgent() {
@@ -2268,6 +2301,7 @@
     // Erst JETZT, nicht vorher: Der Body soll nicht Platz freihalten für ein
     // Panel, das wegen eines Fehlers im Aufbau gar nicht erscheint.
     document.body.classList.add("__regoro-agent-offen");
+    merkeAgentOffen(true);
 
     agentGesperrt = false;
     agentGesamt = null;
@@ -2812,6 +2846,10 @@
     collectElements();
     collectImages();
     buildBar();
+    // War sie vor dem Seitenwechsel offen, geht sie wieder auf. `ui.btnAgent`
+    // fehlt, wenn der Server keinen Modellzugang hat — dann gibt es nichts zu
+    // öffnen, und das Merkzeichen bleibt folgenlos liegen.
+    if (ui.btnAgent && warAgentOffen()) openAgent();
     window.addEventListener("beforeunload", onBeforeUnload);
     document.addEventListener("click", onCaptureClick, true);
     document.addEventListener("submit", onCaptureSubmit, true);
