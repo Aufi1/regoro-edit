@@ -21,7 +21,7 @@ import {
 } from "./auth.ts";
 import { maskiereKennung, normalisiereKennung, type Kanal } from "./kennung.ts";
 import { erzeugeCode, merkeCode, pruefeCode } from "./codes.ts";
-import { pruefeBremse, wartezeitText } from "./bremse.ts";
+import { entsperreKennung, pruefeBremse, wartezeitText } from "./bremse.ts";
 import type { Versand } from "./versand.ts";
 import type { KiConfig } from "./betreiber-config.ts";
 import { renderEditView, renderVersionPreview } from "./serve.ts";
@@ -538,6 +538,12 @@ async function route(
         // nicht entstanden sein — die Prüfung ist trotzdem da, weil sie billig ist.
         if (!kennungHinterlegt(auth, kennung.wert)) return abweisen();
         if (pruefeCode(ctx.siteDir, kennung.wert, codeRoh) !== "ok") return abweisen();
+
+        // Ab hier ist die Anmeldung nachgewiesen. Die Bremse begrenzt Kosten
+        // durch Anfragen von jemandem, der sich NICHT anmelden kann — wer einen
+        // gültigen Code vorgelegt hat, gehört nicht dazu. Ohne diesen Schnitt
+        // wartet der Kunde, der sich soeben ausgewiesen hat, am zweiten Gerät.
+        entsperreKennung(ctx.siteDir, kennung.wert);
 
         return new Response(null, {
           status: 302,

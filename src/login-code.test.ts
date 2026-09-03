@@ -13,7 +13,7 @@ import * as host from "./host.ts";
 import { createAuthFile, loadAuthFile, cookieName } from "./auth.ts";
 import { attrappenVersand, type Attrappe } from "./versand.ts";
 import { vergisseAlleCodes, CODE_GUELTIG_MS, MAX_VERSUCHE } from "./codes.ts";
-import { vergisseBremse, MAX_PRO_KENNUNG } from "./bremse.ts";
+import { vergisseBremse } from "./bremse.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
 const REAL_SITE = join(REPO_ROOT, "examples", "site");
@@ -211,6 +211,14 @@ describe("Der Code selbst", () => {
   test("ein zweiter angeforderter Code entwertet den ersten", async () => {
     await post({ kennung: NUMMER, weg: "sms" });
     const ersterCode = versand.gesendet[0]!.code;
+    // Die Bremse steht der zweiten Anfrage jetzt im Weg — hier geht es aber um
+    // `codes.ts` (merkeCode ersetzt), nicht um sie. Deshalb wird sie gezielt
+    // vergessen, statt den Test auf ein bequemeres Verhalten umzuschreiben.
+    //
+    // Nebenbei zeigt der Umweg, was die wachsende Wartezeit mit erledigt: Genau
+    // dieses versehentliche „noch mal senden" kostete vorher eine zweite
+    // Nachricht UND machte die erste tot. Jetzt ist es eine Minute Warten.
+    vergisseBremse();
     await post({ kennung: NUMMER, weg: "sms" });
     expect((await post({ kennung: NUMMER, weg: "sms", code: ersterCode })).status).toBe(401);
   });
@@ -228,10 +236,8 @@ describe("Der Code selbst", () => {
 });
 
 describe("Die Bremse", () => {
-  test("der vierte Code fuer dieselbe Nummer wird abgelehnt, BEVOR etwas rausgeht", async () => {
-    for (let i = 0; i < MAX_PRO_KENNUNG; i++) {
-      expect((await post({ kennung: NUMMER, weg: "sms" })).status).toBe(200);
-    }
+  test("die zweite Anfrage im selben Moment wird abgelehnt, BEVOR etwas rausgeht", async () => {
+    expect((await post({ kennung: NUMMER, weg: "sms" })).status).toBe(200);
     const gesendetVorher = versand.gesendet.length;
     const antwort = await post({ kennung: NUMMER, weg: "sms" });
     expect(antwort.status).toBe(429);
@@ -243,15 +249,15 @@ describe("Die Bremse", () => {
   });
 
   test("sie greift auch fuer eine NICHT hinterlegte Nummer — sonst waere sie umgehbar", async () => {
-    for (let i = 0; i < MAX_PRO_KENNUNG; i++) await post({ kennung: "+4917099999999", weg: "sms" });
+    await post({ kennung: "+4917099999999", weg: "sms" });
     expect((await post({ kennung: "+4917099999999", weg: "sms" })).status).toBe(429);
   });
 
   test("eine geflutete Nummer sperrt die hinterlegte ADRESSE nicht mit", async () => {
-    // Wer die Geschaeftsnummer aus dem Impressum kennt, kann mit drei Anfragen
-    // je Stunde ihre Codes aufbrauchen. Der zweite Kontaktweg hat einen eigenen
-    // Zaehler und bleibt offen — das ist der Grund, beide zu hinterlegen.
-    for (let i = 0; i <= MAX_PRO_KENNUNG; i++) await post({ kennung: NUMMER, weg: "sms" });
+    // Wer die Geschaeftsnummer aus dem Impressum kennt, kann ihre Codes
+    // ausbremsen. Der zweite Kontaktweg hat einen eigenen Zaehler und bleibt
+    // offen — das ist der Grund, bei jedem Kunden beide zu hinterlegen.
+    await post({ kennung: NUMMER, weg: "sms" });
     expect((await post({ kennung: NUMMER, weg: "sms" })).status).toBe(429);
 
     const ueberMail = await melde(ADRESSE, "email");
