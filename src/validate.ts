@@ -350,6 +350,48 @@ function entkommeJs(roh: string): string {
   );
 }
 
+/**
+ * Ladewege aus einer .js-Datei.
+ *
+ * In HTML lehnt dieser Validator dasselbe längst ab (`<script src>`, `<link
+ * href>`); aus einer .js-Datei ging es bisher durch. Die CSP blockt alle drei
+ * im Browser — aber der Plan trägt auf drei Grenzen, von denen keine die andere
+ * ersetzt, und hier trug bisher nur die dritte.
+ *
+ * Geprüft wird mit **derselben** Herkunftsprüfung wie in HTML, ausdrücklich kein
+ * zweiter Mechanismus.
+ */
+const LADE_GRUND =
+  "Fremden Code oder fremde Dateien aus einem Skript nachzuladen ist nicht zulässig. " +
+  'Lege die Datei in den Website-Ordner (etwa nach "assets/") und lade sie von dort relativ.';
+
+const JS_IMPORT_DYNAMISCH_RE = /\bimport\s*\(\s*([^,)]*)/gi;
+const JS_IMPORT_STATISCH_RE = /\bimport\s+(?:[^'"();]*?\sfrom\s+)?(['"][^'"]*['"])/gi;
+const JS_IMPORTSCRIPTS_RE = /\bimportScripts\s*\(\s*([^)]*)/gi;
+
+/**
+ * `document.createElement("script")` — der Ursprung des dritten Ladewegs.
+ *
+ * Geprüft wird das Erzeugen, nicht das spätere `.src = …`. Am `.src` liegt die
+ * Grenze falsch: `bild.src = bilder[i]` ist gewöhnlicher Galerie-Code, und ihn
+ * abzulehnen kostete den Kunden einen Lauf für nichts. Ein Skript-Element in
+ * Kundencode zu erzeugen hat dagegen nur einen Zweck — Code nachzuladen —, und
+ * die Elementart steht hier im Klartext da, während sie am `.src` meist nicht
+ * mehr zu erkennen ist (`const el = createElement(t); el.src = x`).
+ */
+const JS_CREATE_SCRIPT_RE = /\bcreateElement\s*\(\s*(['"])\s*script\s*\1/gi;
+
+/**
+ * `a.href = fremd; a.click()` — neben `location =` der zweite Navigationsweg.
+ *
+ * Beide Teile müssen in derselben Datei stehen. Ein `.href`-Zuweisung allein ist
+ * alltäglich (ein Link, dessen Ziel aus Daten kommt); erst der programmatische
+ * Klick macht daraus eine Navigation, die niemand angefordert hat. Die
+ * Verknüpfung hält die Regel treffsicher, statt legitimen Code mitzunehmen.
+ */
+const JS_HREF_ZUWEISUNG_RE = /\.\s*href\s*=(?![=>])\s*([^;\n]*)/gi;
+const JS_CLICK_RE = /\.\s*click\s*\(\s*\)/;
+
 /** Der Wert eines alleinstehenden String-Literals, oder null bei allem anderen. */
 function stringLiteral(ausdruck: string): string | null {
   const t = ausdruck.trim();
@@ -377,6 +419,31 @@ function jsVerstoesse(js: string, erlaubt: Set<string>): Verstoss[] {
       // Exfiltrationsweg.
       if (literal !== null && navZielErlaubt(literal, erlaubt)) continue;
       raus.push({ schluessel: `js-nav:${ausdruck.replace(/\s+/g, "")}`, grund: NAV_GRUND });
+    }
+  }
+
+  // Ladewege: dieselbe Herkunftsprüfung wie in HTML, kein zweiter Mechanismus.
+  for (const re of [JS_IMPORT_DYNAMISCH_RE, JS_IMPORT_STATISCH_RE, JS_IMPORTSCRIPTS_RE]) {
+    for (const m of js.matchAll(re)) {
+      const ausdruck = (m[1] ?? "").trim();
+      const literal = stringLiteral(ausdruck);
+      // Ein zusammengesetzter Pfad ist statisch nicht entscheidbar — wie bei der
+      // Navigation ist genau das der Weg nach draußen.
+      if (literal !== null && pruefeRessource(literal, erlaubt, false) === null) continue;
+      raus.push({ schluessel: `js-lade:${ausdruck.replace(/\s+/g, "")}`, grund: LADE_GRUND });
+    }
+  }
+  for (const m of js.matchAll(JS_CREATE_SCRIPT_RE)) {
+    raus.push({ schluessel: `js-createscript:${m[0].replace(/\s+/g, "")}`, grund: LADE_GRUND });
+  }
+
+  // Der zweite Navigationsweg — nur wenn beide Hälften beisammen sind.
+  if (JS_CLICK_RE.test(js)) {
+    for (const m of js.matchAll(JS_HREF_ZUWEISUNG_RE)) {
+      const ausdruck = (m[1] ?? "").trim();
+      const literal = stringLiteral(ausdruck);
+      if (literal !== null && navZielErlaubt(literal, erlaubt)) continue;
+      raus.push({ schluessel: `js-klicknav:${ausdruck.replace(/\s+/g, "")}`, grund: NAV_GRUND });
     }
   }
   return raus;
