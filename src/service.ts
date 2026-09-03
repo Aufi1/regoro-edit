@@ -104,9 +104,12 @@ export interface ServiceOpts {
  * außerhalb seiner Reichweite.
  *
  * `'unsafe-inline'` bei `script-src` ist Absicht und ein bekannter Kompromiss:
- * Die Fabrik liefert Inline-Skripte aus (gemessen an einer echten Kundenseite:
- * 13 Inline-Blöcke über vier Seiten, keiner mit `src` — Kopfzeile gegen
- * Layout-Sprung, JSON-LD). Ohne das wären bestehende Kundenseiten kaputt.
+ * Die Fabrik liefert Inline-Skripte aus — Kopfzeile gegen Layout-Sprung,
+ * JSON-LD. An echten Kundenseiten dreimal unabhängig nachgezählt, mit
+ * unterschiedlichen Zahlen (8, 12, 13 Blöcke) und einem gleichbleibenden
+ * Befund: **keiner davon hat ein `src`**. Die genaue Zahl schwankt je
+ * Fabrik-Seite und ist nicht die Aussage; die Aussage ist „alle inline".
+ * Ohne `'unsafe-inline'` wäre jeder einzelne davon tot.
  *
  * `connect-src 'none'` ist der Kern: kein fetch, kein XHR, kein sendBeacon,
  * kein WebSocket. Zusammen mit `img-src 'self' data:` (kein Bild-Beacon) und

