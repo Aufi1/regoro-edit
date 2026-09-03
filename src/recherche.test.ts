@@ -379,7 +379,14 @@ describe("holeSeite() ist fail-closed und verbrennt kein Guthaben", () => {
     // Jeder Abruf kostet, auch der für Müll. Das ist der billigste Filter überhaupt.
     const s = attrappe();
     try {
-      for (const url of ["file:///etc/passwd", "javascript:alert(1)", "", "keine-url"]) {
+      for (const url of [
+        "file:///etc/passwd",
+        "javascript:alert(1)",
+        "",
+        "keine-url",
+        // Zugangsdaten gingen sonst an einen fremden Dienst weiter.
+        "https://nutzer:geheim@example.de/x",
+      ]) {
         await expect(holeSeite(url, "fc-x", s.basis)).rejects.toThrow();
       }
       expect(s.empfangen.length).toBe(0);
@@ -452,12 +459,42 @@ describe("holeSeite() — die Fehlerlagen sind unterscheidbar, der Schlüssel bl
     [403, /abgelehnt/],
     [402, /aufgebraucht/],
     [429, /ausgelastet/],
+    [408, /rechtzeitig/],
+    [500, /konnte nicht abgerufen/],
   ])("Status %s ergibt eine eigene Meldung", async (status, muster) => {
     const s = attrappe(() => ({ status: status as number, body: JSON.stringify({ success: false }) }));
     try {
       await expect(holeSeite("https://example.de/x", "fc-x", s.basis)).rejects.toThrow(muster as RegExp);
     } finally {
       s.stop();
+    }
+  });
+
+  test("SCRAPE_TIMEOUT wird als Zeitüberschreitung gemeldet, nicht als allgemeiner Fehler", async () => {
+    // Der Agent soll wissen, was er ändern kann: eine langsame Seite lohnt einen
+    // zweiten Versuch, ein abgelehnter Zugang nicht.
+    const s = attrappe(() => ({ status: 500, body: JSON.stringify({ success: false, code: "SCRAPE_TIMEOUT" }) }));
+    try {
+      await expect(holeSeite("https://example.de/x", "fc-x", s.basis)).rejects.toThrow(/rechtzeitig/);
+    } finally {
+      s.stop();
+    }
+  });
+
+  test("bei JEDER Fehlerlage bleibt der Schlüssel drin, nicht nur bei 401", async () => {
+    for (const status of [401, 402, 403, 408, 429, 500]) {
+      const s = attrappe(() => ({
+        status,
+        body: JSON.stringify({ success: false, error: "fc-geheim-123 im Echo" }),
+      }));
+      try {
+        await holeSeite("https://example.de/x", "fc-geheim-123", s.basis);
+        throw new Error("hätte werfen müssen");
+      } catch (e) {
+        expect((e as Error).message).not.toContain("fc-geheim-123");
+      } finally {
+        s.stop();
+      }
     }
   });
 
