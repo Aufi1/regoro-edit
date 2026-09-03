@@ -158,9 +158,28 @@ describe("die Deckel über den Nachbarn", () => {
     expect(mitVorgabe).toContain("--tmpfs");
     expect(mitVorgabe).toContain("--remount-ro");
 
+    // Gefragt ist die Abwesenheit der DECKEL, nicht die Abwesenheit jedes
+    // `--remount-ro`: `/var/tmp` wird unabhängig davon festgezogen (siehe
+    // Test darunter). Ein Zählen über die ganze Zeile prüfte das mit und
+    // bräche, sobald jemand einen festen Einhängepunkt ergänzt — ein Test, der
+    // an einer richtigen Änderung scheitert, wird beim nächsten Mal entfernt.
     const ohne = sandboxArgv("/bin/true", [], "/run/regoro-sites/lauf-1", null, []);
-    expect(ohne).not.toContain("--tmpfs /home");
-    expect(ohne.filter((a) => a === "--remount-ro")).toHaveLength(0);
+    for (const versteckt of standardVerstecke("/run/regoro-sites")) {
+      expect(paarIndex(ohne, "--tmpfs", versteckt)).toBe(-1);
+      expect(paarIndex(ohne, "--remount-ro", versteckt)).toBe(-1);
+    }
+  });
+
+  test("auch das Kritzelverzeichnis /var/tmp ist nur lesbar", () => {
+    // Ein beschreibbares Verzeichnis irgendwo in der Sandbox bräche die
+    // Zusicherung, auf der alles andere ruht: „außerhalb der Arbeitskopie
+    // schlägt jeder Schreibversuch fehl". Ein blankes `--tmpfs` ist
+    // beschreibbar — es versteckt nur.
+    const argv = sandboxArgv("/bin/true", [], "/run/lauf-1", null, []);
+    expect(paarIndex(argv, "--tmpfs", "/var/tmp")).toBeGreaterThanOrEqual(0);
+    expect(paarIndex(argv, "--remount-ro", "/var/tmp")).toBeGreaterThan(
+      paarIndex(argv, "--tmpfs", "/var/tmp"),
+    );
   });
 
   test("die Deckel werden erst NACH dem Skill-Mount festgezogen", () => {
@@ -269,15 +288,20 @@ describe("bwrap sperrt wirklich ein", () => {
   test.skipIf(!haveBwrap())("außerhalb schlägt jeder Schreibversuch mit EROFS fehl", async () => {
     const kopie = tmp("regoro-sbx-");
     const fremd = tmp("regoro-sbx-fremd-");
+    // `/var/tmp` und `/tmp` sind bewusst dabei: Ein Kritzelverzeichnis ist die
+    // naheliegendste Stelle, an der jemand doch etwas beschreibbar lässt —
+    // und ein beschreibbarer Fleck irgendwo in der Sandbox bräche die
+    // Zusicherung, auf der alles andere ruht.
     const r = await inSandbox(
-      `for (const p of ["/etc/regoro-probe", "/home/regoro-probe", ${JSON.stringify(join(fremd, "x"))}]) {
+      `for (const p of ["/etc/regoro-probe", "/home/regoro-probe", "/var/tmp/regoro-probe",
+                        "/tmp/regoro-probe", ${JSON.stringify(join(fremd, "x"))}]) {
          try { await Bun.write(p, "x"); console.log("SCHRIEB", p); }
          catch (e) { console.log("blockiert", (e as Error).message.slice(0, 6)); }
        }`,
       kopie,
     );
     expect(r.out).not.toContain("SCHRIEB");
-    expect(r.out.match(/blockiert EROFS/g)).toHaveLength(3);
+    expect(r.out.match(/blockiert EROFS/g)).toHaveLength(5);
     // Gegenprobe auf der Platte: der Nachbarordner ist wirklich unberührt.
     expect(existsSync(join(fremd, "x"))).toBe(false);
   }, 20_000);
