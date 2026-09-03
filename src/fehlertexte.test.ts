@@ -119,6 +119,51 @@ describe("jeder Grund aus agent.ts wird übersetzt", () => {
     expect(agentFehlerText(satz)).toBe(satz);
   });
 
+  test("die Antwort eines Modellanbieters geht NIE an den Kunden", () => {
+    /**
+     * WÖRTLICH DAS, was ein Handwerksbetrieb in der Seitenleiste zu sehen bekam,
+     * als das OpenRouter-Guthaben leer war. Der Vorgabezweig reichte damals
+     * jeden unbekannten Grund unverändert durch — das dritte Mal, dass genau
+     * diese Zeile dem Kunden Maschinentext zeigte („worker-abgestuerzt",
+     * „abgebrochen", jetzt eine ganze JSON-Antwort).
+     *
+     * Ein leeres Guthaben ist ein BETREIBER-Problem: Der Kunde kann daran
+     * nichts ändern, er soll nur wissen, dass seine Website unberührt ist.
+     * Der Grund selbst gehört ins Log — deshalb steht er hier auch nicht als
+     * eigener `case`, sondern fällt in den sicheren Vorgabezweig.
+     */
+    const echt =
+      '402: {"message":"This request requires more credits, or fewer max_tokens. ' +
+      "You requested up to 16384 tokens, but can only afford 7798. To increase, visit " +
+      'https://openrouter.ai/settings/credits and add more credits","code":402}';
+    const text = agentFehlerText(echt);
+
+    expect(text).not.toBe(echt);
+    // Kein Anbietername, keine Abrechnungsadresse, keine Rohdaten, kein Englisch.
+    expect(text).not.toContain("openrouter");
+    expect(text).not.toContain("credits");
+    expect(text).not.toContain("max_tokens");
+    expect(text).not.toContain("http");
+    expect(text).not.toContain("{");
+    expect(text).not.toContain("402");
+    // Und was der Kunde wirklich wissen muss.
+    expect(text).toContain("Website");
+  });
+
+  test("Gegenprobe: der Filter schluckt nicht einfach alles", () => {
+    // Ohne diesen Fall wäre der Test darüber auch dann grün, wenn der
+    // Vorgabezweig JEDE Meldung durch denselben Satz ersetzte — und dann wäre
+    // der Test „frei formulierte Meldungen gehen unverändert durch" die einzige
+    // Bremse dagegen. Diese beiden Sätze sind echte Ausgaben von Validator und
+    // Recherche; sie sind für den Kunden brauchbar und müssen ankommen.
+    for (const satz of [
+      "Die Datei enthält ein neues Inline-Skript.",
+      "Interne Adressen werden nicht abgerufen.",
+    ]) {
+      expect(agentFehlerText(satz)).toBe(satz);
+    }
+  });
+
   test("kein toter Fall in der Übersetzung", () => {
     // Ein Fall ohne Erzeuger ist Ballast, der beim Lesen Sicherheit vortäuscht.
     // `ende` stand hier einmal und wurde von nichts erzeugt.

@@ -979,8 +979,55 @@ export function agentFehlerText(grund: string): string {
     case "abgeschaltet":
       return "Der Zugang wurde vom Betreiber beendet.";
     default:
-      return grund;
+      /**
+       * NICHTS UNBEKANNTES GEHT AN DEN BROWSER. Hier stand `return grund;`, und
+       * das ist dreimal schiefgegangen: erst „worker-abgestuerzt", dann
+       * „abgebrochen", zuletzt — bei leerem Guthaben — die komplette
+       * OpenRouter-Antwort als englischer JSON-Rohtext, mitsamt dem Namen
+       * unseres Modellanbieters und einem Link auf UNSERE Abrechnungsseite.
+       * Ein Handwerksbetrieb bekam das wörtlich in der Seitenleiste zu sehen.
+       *
+       * Zweimal wurde daraufhin der Einzelfall ergänzt. Das war die falsche
+       * Ebene: Die Menge der Gründe ist offen — jede Anbieter-Antwort, jeder
+       * neue Zustand landet hier. Deshalb ist der Vorgabezweig jetzt der
+       * SICHERE, und ein neuer Grund kostet eine Log-Zeile statt eines Lecks.
+       *
+       * Die Trennlinie dahinter: Ein leeres Guthaben ist ein BETREIBER-Problem.
+       * Der Kunde kann daran nichts ändern, also erfährt er nur, dass seine
+       * Website unberührt ist; der Betreiber findet den Grund im Log.
+       */
+      if (istEigenerKlartext(grund)) return grund;
+      console.error(`[regoro] Agentenlauf gescheitert: ${grund}`);
+      return "Der Assistent ist gerade nicht verfügbar. An der Website wurde nichts geändert.";
   }
+}
+
+/**
+ * Trennt EIGENEN deutschen Klartext von FREMDEM Maschinentext.
+ *
+ * Beide erreichen den Vorgabezweig oben, und beide müssen unterschiedlich
+ * behandelt werden — das ist der Grund, warum dort kein einfacher Deckel steht:
+ *
+ *   durchlassen  „Die Datei enthält ein neues Inline-Skript."   (Validator)
+ *                „Interne Adressen werden nicht abgerufen."      (Recherche)
+ *   schlucken    `402: {"message":"This request requires more credits …`
+ *
+ * Beide Sorten sind frei formuliert, eine Liste hilft also nicht. Geprüft wird
+ * deshalb die FORM eines Satzes, den wir selbst geschrieben haben. Die Regel
+ * ist bewusst streng: Wer sich irrt, schluckt einen brauchbaren Hinweis und
+ * schreibt ihn ins Log — wer zu lax ist, stellt dem Kunden fremde Rohdaten in
+ * die Seitenleiste. Der erste Fehler kostet Bequemlichkeit, der zweite Vertrauen.
+ */
+function istEigenerKlartext(s: string): boolean {
+  // Anbieter-Antworten sind JSON, tragen Anführungszeichen und verlinken auf
+  // fremde Abrechnungsseiten. Nichts davon steht je in einem unserer Sätze.
+  if (/[{}"<>]|https?:\/\//.test(s)) return false;
+  // Ein Satz, kein Datenfeld: beginnt groß, endet mit Satzzeichen, hat Wörter.
+  if (!/^[A-ZÄÖÜ]/.test(s)) return false;
+  if (!/[.!?]$/.test(s.trimEnd())) return false;
+  if (!s.includes(" ")) return false;
+  // Deutlich länger als jeder unserer Sätze heißt: da hängt etwas dran.
+  return s.length <= 200;
 }
 
 async function handleAgentStart(req: Request, ctx: HostCtx): Promise<Response> {
