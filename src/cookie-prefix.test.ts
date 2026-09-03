@@ -18,13 +18,11 @@ import {
   MAX_SESSION_COOKIES,
   issueCookie,
   checkCookie,
-  hashPassword,
   type AuthConfig,
 } from "./auth.ts";
 import { handleEditorRequest, type HostCtx } from "./host.ts";
 
 const TEST_SECRET = "test-secret-aaaaaaaaaaaaaaaaaaaa";
-const TEST_PASSWORD = "geheim123";
 const REPO_ROOT = join(import.meta.dir, "..");
 const REAL_SITE = join(REPO_ROOT, "examples", "site");
 
@@ -50,7 +48,7 @@ describe("auth.ts — __Host--Cookie-Präfix", () => {
   });
 
   test("Set-Cookie erfüllt die __Host--Bedingungen: Secure, Path=/, kein Domain", () => {
-    const sc = inSubprocess(null, 'a.issueCookie({hash:"x",secret:"sub-secret-aaaaaaaaaaaa"})');
+    const sc = inSubprocess(null, 'a.issueCookie({nummern:["+4915120464812"],emails:[],secret:"sub-secret-aaaaaaaaaaaa"})');
     expect(sc).toStartWith("__Host-regoro_edit=");
     expect(sc).toContain("Secure");
     expect(sc).toContain("Path=/");
@@ -58,7 +56,7 @@ describe("auth.ts — __Host--Cookie-Präfix", () => {
   });
 
   test("ohne Secure kein Präfix und kein Secure-Flag", () => {
-    const sc = inSubprocess("1", 'a.issueCookie({hash:"x",secret:"sub-secret-aaaaaaaaaaaa"})');
+    const sc = inSubprocess("1", 'a.issueCookie({nummern:["+4915120464812"],emails:[],secret:"sub-secret-aaaaaaaaaaaa"})');
     expect(sc).toStartWith("regoro_edit=");
     expect(sc).not.toContain("Secure");
   });
@@ -116,7 +114,7 @@ describe("auth.ts — readCookieTokens liest ALLE gleichnamigen Cookies", () => 
  */
 describe("host.ts — Warnung vor unsicherem Origin auf der Login-Seite", () => {
   async function loginPage(host: string, headers: Record<string, string> = {}) {
-    const auth: AuthConfig = { hash: await hashPassword(TEST_PASSWORD), secret: TEST_SECRET };
+    const auth: AuthConfig = { nummern: ["+4915120464812"], emails: [], secret: TEST_SECRET };
     const ctx: HostCtx = {
       repoRoot: REPO_ROOT,
       siteDir: REAL_SITE,
@@ -163,7 +161,7 @@ describe("host.ts — untergeschobenes Cookie sperrt die echte Session nicht aus
   let ctx: HostCtx;
 
   async function setup() {
-    auth = { hash: await hashPassword(TEST_PASSWORD), secret: TEST_SECRET };
+    auth = { nummern: ["+4915120464812"], emails: [], secret: TEST_SECRET };
     ctx = {
       repoRoot: REPO_ROOT,
       siteDir: REAL_SITE,
@@ -213,7 +211,7 @@ describe("host.ts — untergeschobenes Cookie sperrt die echte Session nicht aus
 
   test("ein Token mit fremdem Secret wird abgelehnt (kein Bypass durch Tossing)", async () => {
     await setup();
-    const fremd: AuthConfig = { hash: auth.hash, secret: "ein-voellig-anderes-secret-xxxx" };
+    const fremd: AuthConfig = { ...auth, secret: "ein-voellig-anderes-secret-xxxx" };
     const fremdToken = issueCookie(fremd).split(";")[0]!.split("=").slice(1).join("=");
     expect(checkCookie(auth, fremdToken)).toBe(false);
 

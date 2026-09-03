@@ -44,9 +44,9 @@ function runInit(siteDir: string): { exitCode: number; stderr: string } {
   const res = Bun.spawnSync({
     // process.execPath = die laufende bun-Binary (robust gegen PATH-Unterschiede,
     // gleiches Muster wie der Subprozess-Test in v2.test.ts).
-    cmd: [process.execPath, CLI_PATH, "init", siteDir, "--password-stdin"],
+    cmd: [process.execPath, CLI_PATH, "init", siteDir, "--stdin"],
     cwd: REPO_ROOT,
-    stdin: Buffer.from("testpw123456\n"),
+    stdin: Buffer.from("+4915120464812\n"),
     stdout: "pipe",
     stderr: "pipe",
   });

@@ -175,7 +175,7 @@ describe("buildCtx", () => {
     const root = makeRoot("regoro-ctx-");
     const siteDir = join(root, "kunde-a.test");
     cpSync(REAL_SITE, siteDir, { recursive: true });
-    if (withAuth) await createAuthFile(siteDir, "geheim1234");
+    if (withAuth) await createAuthFile(siteDir, ["+4915120464812"]);
     return { root, siteDir };
   }
 

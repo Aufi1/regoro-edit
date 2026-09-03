@@ -25,9 +25,9 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const TEST_PASSWORD = "testpw";
 const TEST_SECRET = "testsecret-aaaaaaaaaaaaaaaaaaaaaaaa";
-const TEST_AUTH = { hash: await (await import("./auth.ts")).hashPassword(TEST_PASSWORD), secret: TEST_SECRET };
+const TEST_NUMMER = "+4915120464812";
+const TEST_AUTH = { nummern: [TEST_NUMMER], emails: [], secret: TEST_SECRET };
 
 const REPO_ROOT = join(import.meta.dir, "..");
 const REAL_SITE = join(REPO_ROOT, "examples", "site");
@@ -459,9 +459,10 @@ describe("auth.ts — fail-closed bei fehlender Auth-Konfig (C1)", () => {
     auth = await import("./auth.ts");
   });
 
-  test("verifyPassword(null, ...) → false (auch für Leerstring-Kandidat)", async () => {
-    expect(await auth.verifyPassword(null, "")).toBe(false); // nicht: leer == leer
-    expect(await auth.verifyPassword(null, "irgendwas")).toBe(false);
+  test("kennungHinterlegt lehnt Leerstring und Fremdes ab", () => {
+    // Nicht: leer == leer. Eine leere Eingabe darf nie treffen.
+    expect(auth.kennungHinterlegt(TEST_AUTH, "")).toBe(false);
+    expect(auth.kennungHinterlegt(TEST_AUTH, "irgendwas")).toBe(false);
   });
 
   test("checkCookie(null, token) → false, selbst für sonst gültiges Token", () => {

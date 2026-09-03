@@ -16,9 +16,9 @@ import { mkdtempSync, rmSync, mkdirSync, cpSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const TEST_PASSWORD = "testpw";
 const TEST_SECRET = "testsecret-aaaaaaaaaaaaaaaaaaaaaaaa";
-const TEST_AUTH = { hash: await (await import("./auth.ts")).hashPassword(TEST_PASSWORD), secret: TEST_SECRET };
+const TEST_NUMMER = "+4915120464812";
+const TEST_AUTH = { nummern: [TEST_NUMMER], emails: [], secret: TEST_SECRET };
 
 const REPO_ROOT = join(import.meta.dir, "..");
 const REAL_SITE = join(REPO_ROOT, "examples", "site");

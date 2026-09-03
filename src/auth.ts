@@ -1,16 +1,28 @@
 /**
  * Contract B — Host: signierte Session ohne DB, datei-basierte Auth.
  *
- * Auth-Konfig (Passwort-Hash + HMAC-Secret) liegt in <siteDir>/.regoro/auth.json.
- * Token = `v1.<exp>.<hmac>`. Kein Server-State: Signatur + Ablauf werden
- * timing-safe geprüft. Passwort via argon2id (Bun.password). KEINE Env-Auth mehr.
+ * Auth-Konfig liegt in <siteDir>/.regoro/auth.json: die hinterlegten
+ * Kontaktwege (Telefonnummern und E-Mail-Adressen) plus das HMAC-Secret der
+ * Website. Token = `v1.<exp>.<hmac>`. Kein Server-State: Signatur + Ablauf
+ * werden timing-safe geprüft.
+ *
+ * **Es gibt kein Passwort mehr.** Der Nachweis ist ein Einmalcode an einen
+ * hinterlegten Kontaktweg (`codes.ts`, `versand.ts`). Damit entfällt auch
+ * argon2id — und mit ihm ein Überlastungshebel: Jeder Anmeldeversuch kostete
+ * rund 64 MB Arbeitsspeicher, ungebremst und von außen auslösbar.
  */
 import { createHmac, timingSafeEqual, randomBytes } from "node:crypto";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 
 const COOKIE_BASE = "regoro_edit";
-const DEFAULT_MAX_AGE_SEC = 60 * 60 * 8; // 8 Stunden
+/**
+ * 30 Tage. Der Normalfall soll „gar keine Nachricht" sein: Ein Betrieb, der
+ * seine Seite viermal im Jahr anfasst, bekommt sonst jedes Mal eine SMS, die
+ * Geld kostet und Zeit. Der Ausgleich dafür ist, dass der Betreiber eine
+ * Sitzung sofort beenden kann, indem er das Secret erneuert (`init --force`).
+ */
+const DEFAULT_MAX_AGE_SEC = 60 * 60 * 24 * 30;
 
 /** true = Cookie bekommt das Secure-Flag (Prod). Nur EDITOR_INSECURE_COOKIE=1 schaltet es ab. */
 export function useSecureCookie(): boolean {
@@ -58,8 +70,31 @@ export function cookieName(): string {
 }
 
 export interface AuthConfig {
-  hash: string;
+  /** Hinterlegte Telefonnummern, normalisiert (E.164). */
+  nummern: string[];
+  /** Hinterlegte E-Mail-Adressen, normalisiert (kleingeschrieben). */
+  emails: string[];
   secret: string;
+}
+
+/** Alle hinterlegten Kontaktwege einer Website, in einer Liste. */
+export function alleKennungen(auth: AuthConfig): string[] {
+  return [...auth.nummern, ...auth.emails];
+}
+
+/**
+ * Ist dieser Kontaktweg für diese Website hinterlegt?
+ *
+ * Konstantzeit-Vergleich gegen jeden Eintrag, ohne früh abzubrechen: Über die
+ * Laufzeit soll nicht abzulesen sein, wie viele Kennungen hinterlegt sind oder
+ * wie weit eine geratene übereinstimmt.
+ */
+export function kennungHinterlegt(auth: AuthConfig, wert: string): boolean {
+  let treffer = false;
+  for (const eintrag of alleKennungen(auth)) {
+    if (safeEqual(eintrag, wert)) treffer = true;
+  }
+  return treffer;
 }
 
 export const MIN_SECRET_LEN = 16;
@@ -70,8 +105,12 @@ export function authFilePath(siteDir: string): string {
   return join(siteDir, AUTH_DIR_NAME, "auth.json");
 }
 
-/** Konstantzeit-Vergleich zweier Strings (länge-tolerant durch Hash-Wrapping). */
-function safeEqual(a: string, b: string): boolean {
+/**
+ * Konstantzeit-Vergleich zweier Strings (länge-tolerant durch Hash-Wrapping).
+ * Exportiert, weil der Einmalcode denselben Vergleich braucht (`codes.ts`) —
+ * ein `===` dort verriete über die Laufzeit, wie viele Stellen stimmen.
+ */
+export function safeEqual(a: string, b: string): boolean {
   // Über SHA-256 wrappen, damit timingSafeEqual gleichlange Buffer bekommt
   // (Längenunterschiede sollen nicht über die Laufzeit leaken).
   const ha = createHmac("sha256", "len").update(a).digest();
@@ -79,46 +118,93 @@ function safeEqual(a: string, b: string): boolean {
   return timingSafeEqual(ha, hb);
 }
 
-/** Hasht ein Klartext-Passwort mit argon2id (für auth.json). */
-export function hashPassword(password: string): Promise<string> {
-  return Bun.password.hash(password, { algorithm: "argon2id" });
-}
+/**
+ * Was in <siteDir>/.regoro/auth.json steht — unterschieden, damit der Betreiber
+ * beim Start eine brauchbare Meldung bekommt. Der Anfrage-Pfad braucht das
+ * nicht und benutzt `loadAuthFile`.
+ */
+export type AuthBefund =
+  | { art: "ok"; auth: AuthConfig }
+  | { art: "fehlt" }
+  /** Altes Passwort-Format (v1). Wird NICHT stillschweigend weiterbetrieben. */
+  | { art: "veraltet" }
+  | { art: "ungueltig"; grund: string };
 
 /**
- * Liest + validiert <siteDir>/.regoro/auth.json. null bei fehlend/ungültig.
- * Validierung: Objekt, hash String mit "$argon2"-Präfix, secret String ≥ MIN_SECRET_LEN.
+ * Liest + prüft die Auth-Datei. Fail-closed: Alles, was nicht eindeutig gültig
+ * ist, sperrt den Editor.
+ *
+ * Eine `v: 1`-Datei (Passwort-Hash) wird abgelehnt statt migriert. Zwei
+ * parallele Anmeldeverfahren wären teurer als ein sauberer Schnitt, und der
+ * Weg heraus ist ein Befehl: `regoro kennung <site> --add <nummer-oder-mail>`.
  */
-export function loadAuthFile(siteDir: string): AuthConfig | null {
+export function pruefeAuthDatei(siteDir: string): AuthBefund {
   let raw: string;
   try {
     raw = readFileSync(authFilePath(siteDir), "utf8");
   } catch {
-    return null;
+    return { art: "fehlt" };
   }
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return null;
+    return { art: "ungueltig", grund: "kein gültiges JSON" };
   }
-  if (typeof parsed !== "object" || parsed === null) return null;
+  if (typeof parsed !== "object" || parsed === null) {
+    return { art: "ungueltig", grund: "erwartet wird ein Objekt" };
+  }
   const obj = parsed as Record<string, unknown>;
-  const { hash, secret } = obj;
-  if (typeof hash !== "string" || !hash.startsWith("$argon2")) return null;
-  if (typeof secret !== "string" || secret.length < MIN_SECRET_LEN) return null;
-  return { hash, secret };
+  if (obj.v === 1 || typeof obj.hash === "string") return { art: "veraltet" };
+  if (obj.v !== 2) return { art: "ungueltig", grund: 'erwartet wird "v": 2' };
+
+  const nummern = stringListe(obj.nummern);
+  const emails = stringListe(obj.emails);
+  if (nummern === null || emails === null) {
+    return { art: "ungueltig", grund: "nummern/emails müssen Listen von Zeichenketten sein" };
+  }
+  // Leere Liste heißt NICHT „jeder darf", sondern „niemand kommt hinein".
+  if (nummern.length + emails.length === 0) {
+    return { art: "ungueltig", grund: "kein Kontaktweg hinterlegt" };
+  }
+  const { secret } = obj;
+  if (typeof secret !== "string" || secret.length < MIN_SECRET_LEN) {
+    return { art: "ungueltig", grund: "secret fehlt oder ist zu kurz" };
+  }
+  return { art: "ok", auth: { nummern, emails, secret } };
+}
+
+function stringListe(roh: unknown): string[] | null {
+  if (roh === undefined) return [];
+  if (!Array.isArray(roh)) return null;
+  if (!roh.every((e) => typeof e === "string" && e.length > 0)) return null;
+  return roh as string[];
+}
+
+/** Die Auth-Konfig, oder null bei fehlend/ungültig/veraltet. */
+export function loadAuthFile(siteDir: string): AuthConfig | null {
+  const befund = pruefeAuthDatei(siteDir);
+  return befund.art === "ok" ? befund.auth : null;
 }
 
 /**
- * Erzeugt <siteDir>/.regoro/auth.json mit argon2id-Hash + frischem 32-Byte-Secret.
- * Dir-Mode 0700, Datei-Mode 0600. Hängt ".regoro/" idempotent an siteDir/.gitignore.
- * Gibt { path, secret }. KEIN git-init.
+ * Erzeugt <siteDir>/.regoro/auth.json mit den hinterlegten Kontaktwegen und
+ * einem frischen 32-Byte-Secret. Dir-Mode 0700, Datei-Mode 0600. Hängt
+ * ".regoro/" idempotent an siteDir/.gitignore. KEIN git-init.
+ *
+ * Überschreibt eine bestehende Datei kommentarlos — deshalb guardet `cmdInit`
+ * dagegen und verlangt `--force`. Ein neues Secret beendet alle laufenden
+ * Sitzungen; genau das ist der Weg, jemanden sofort auszusperren.
  */
 export async function createAuthFile(
   siteDir: string,
-  password: string,
+  kennungen: string[],
 ): Promise<{ path: string; secret: string }> {
-  const hash = await hashPassword(password);
+  const nummern = kennungen.filter((k) => !k.includes("@"));
+  const emails = kennungen.filter((k) => k.includes("@"));
+  if (nummern.length + emails.length === 0) {
+    throw new Error("mindestens ein Kontaktweg (Telefonnummer oder E-Mail-Adresse) nötig");
+  }
   const secret = randomBytes(32).toString("hex"); // 64 Hex-Zeichen
 
   const dir = join(siteDir, AUTH_DIR_NAME);
@@ -126,8 +212,9 @@ export async function createAuthFile(
 
   const path = authFilePath(siteDir);
   const payload = {
-    v: 1,
-    hash,
+    v: 2,
+    nummern,
+    emails,
     secret,
     createdAt: new Date().toISOString(),
   };
@@ -139,11 +226,34 @@ export async function createAuthFile(
 }
 
 /**
+ * Schreibt die Kontaktwege einer bestehenden Website neu — **ohne** das Secret
+ * anzufassen. Genau das unterscheidet `kennung --add/--remove` von `init
+ * --force`: Eine hinzugefügte Nummer soll nicht alle laufenden Sitzungen beenden.
+ */
+export function schreibeKennungen(siteDir: string, kennungen: string[]): void {
+  const befund = pruefeAuthDatei(siteDir);
+  if (befund.art !== "ok") {
+    throw new Error("keine gültige Auth-Datei vorhanden — zuerst `regoro init` ausführen");
+  }
+  if (kennungen.length === 0) {
+    throw new Error("die letzte Kennung lässt sich nicht entfernen — nutze `regoro disable`");
+  }
+  const payload = {
+    v: 2,
+    nummern: kennungen.filter((k) => !k.includes("@")),
+    emails: kennungen.filter((k) => k.includes("@")),
+    secret: befund.auth.secret,
+    updatedAt: new Date().toISOString(),
+  };
+  writeFileSync(authFilePath(siteDir), JSON.stringify(payload, null, 2), { mode: 0o600 });
+}
+
+/**
  * Hängt ".regoro/" idempotent an <siteDir>/.gitignore an (mit trailing newline).
  *
  * Exportiert, weil `regoro init` es aufrufen muss, BEVOR der Baseline-Commit
  * entsteht — und der Baseline-Commit entsteht, bevor auth.json geschrieben wird
- * (siehe cmdInit). Dadurch scheitert ein kaputtes git, ohne ein Passwort zu
+ * (siehe cmdInit). Dadurch scheitert ein kaputtes git, ohne eine Auth-Datei zu
  * hinterlassen, und das Secret kann gar nicht erst in den Commit geraten.
  */
 export function ensureGitignore(siteDir: string): void {
@@ -166,21 +276,6 @@ function appendGitignore(siteDir: string): void {
   if (next.length > 0 && !next.endsWith("\n")) next += "\n";
   next += `${entry}\n`;
   writeFileSync(gitignorePath, next);
-}
-
-/** Prüft ein Klartext-Passwort gegen den argon2id-Hash der Auth-Konfig. */
-export async function verifyPassword(
-  auth: AuthConfig | null,
-  candidate: string,
-): Promise<boolean> {
-  // Fail-closed: ohne Auth-Konfig/Hash oder ohne Kandidat NIE akzeptieren.
-  if (!auth || !auth.hash) return false;
-  if (!candidate) return false;
-  try {
-    return await Bun.password.verify(candidate, auth.hash);
-  } catch {
-    return false;
-  }
 }
 
 function sign(payload: string, secret: string): string {

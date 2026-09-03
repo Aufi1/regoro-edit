@@ -1,7 +1,7 @@
 /**
  * `regoro disable` bei LAUFENDEM Server.
  *
- * startServer lädt auth.json einmalig in den ctx. Verschwindet die Datei danach,
+ * startServer lädt auth.json im Einzelbetrieb einmalig in den ctx. Verschwindet die Datei danach,
  * muss der Editor sofort aus sein — sonst editieren gültige Cookies weiter,
  * obwohl der Betreiber den Zugang entzogen hat. Der Guard sitzt in server.ts
  * (nicht im Router), deshalb wird hier gegen einen echten Server getestet.
@@ -12,10 +12,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startServer } from "./server.ts";
 import { createAuthFile, AUTH_DIR_NAME } from "./auth.ts";
+import { attrappenVersand } from "./versand.ts";
+import { meldeAn } from "./anmeldung.testhelfer.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
 const REAL_SITE = join(REPO_ROOT, "examples", "site");
-const PASSWORD = "geheim1234";
+const KENNUNG_PASSWORD = "+4915120464812";
 const dirs: string[] = [];
 
 afterAll(() => {
@@ -28,18 +30,12 @@ async function bootSite() {
   cpSync(REAL_SITE, siteDir, { recursive: true });
   // Öffentliche Seite, deren Name mit "edit" beginnt — darf keine Editor-Route sein.
   writeFileSync(join(siteDir, "edit-preise.html"), "<html><body><p>Preise</p></body></html>");
-  await createAuthFile(siteDir, PASSWORD);
+  await createAuthFile(siteDir, [KENNUNG_PASSWORD]);
 
-  const { port } = startServer({ siteDir, repoRoot: siteDir, port: 0 });
+  const versand = attrappenVersand();
+  const { port } = startServer({ siteDir, repoRoot: siteDir, port: 0, versand });
   const base = `http://localhost:${port}`;
-
-  const login = await fetch(`${base}/edit/login`, {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: `password=${PASSWORD}`,
-    redirect: "manual",
-  });
-  const cookie = login.headers.get("set-cookie")!.split(";")[0]!;
+  const cookie = await meldeAn(base, KENNUNG_PASSWORD, versand);
 
   return { siteDir, base, cookie };
 }
@@ -91,7 +87,7 @@ describe("disable bei laufendem Server", () => {
     dirs.push(siteDir);
     cpSync(REAL_SITE, siteDir, { recursive: true });
 
-    const { port } = startServer({ siteDir, repoRoot: siteDir, port: 0 });
+    const { port } = startServer({ siteDir, repoRoot: siteDir, port: 0, versand: attrappenVersand() });
     const base = `http://localhost:${port}`;
 
     expect(await status(base, "/edit")).toBe(404);

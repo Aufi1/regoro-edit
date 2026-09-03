@@ -6,3 +6,4 @@ node_modules/
 dist/
 # gstack-Workspace (Pläne/Reviews) — Symlink, nicht committen:
 docs/gstack
+.gstack/

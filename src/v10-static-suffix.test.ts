@@ -28,6 +28,9 @@ import { join } from "node:path";
 
 import * as auth from "./auth.ts";
 import * as host from "./host.ts";
+import { attrappenVersand } from "./versand.ts";
+
+const TEST_NUMMER = "+4915120464812";
 
 // Kontrollierte pristine Seiten-Inhalte (markant, für rohen-Body-Vergleich).
 const INDEX_HTML = `<!doctype html><html lang="de"><head><meta charset="utf-8"><title>Home</title>
@@ -68,9 +71,9 @@ function makeCtx(opts: { withIndex?: boolean; authValue?: auth.AuthConfig | null
   };
 }
 
-const TEST_PASSWORD = "testpw";
 const TEST_AUTH: auth.AuthConfig = {
-  hash: await auth.hashPassword(TEST_PASSWORD),
+  nummern: ["+4915120464812"],
+  emails: [],
   secret: "testsecret-aaaaaaaaaaaaaaaaaaaaaaaa",
 };
 
@@ -250,14 +253,27 @@ describe("M3 — Login-return Open-Redirect-Schutz", () => {
     ctx = makeCtx();
   });
 
-  function loginWithReturn(returnVal: string): Promise<Response> {
-    return call(ctx, "POST", "/edit/login?return=" + encodeURIComponent(returnVal), {
+  /**
+   * Beide Stufen mit `?return=`. Der Open-Redirect-Schutz muss an der ZWEITEN
+   * greifen — dort wird das Cookie ausgestellt und weitergeleitet.
+   */
+  async function loginWithReturn(returnVal: string): Promise<Response> {
+    const versand = attrappenVersand();
+    const mitVersand = { ...ctx, versand };
+    const feld = (extra = "") =>
+      `kennung=${encodeURIComponent(TEST_NUMMER)}&weg=sms&return=${encodeURIComponent(returnVal)}${extra}`;
+    await call(mitVersand, "POST", "/edit/login", {
       headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: "password=" + encodeURIComponent(TEST_PASSWORD),
+      body: feld(),
+    });
+    const code = versand.gesendet.at(-1)!.code;
+    return call(mitVersand, "POST", "/edit/login", {
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: feld(`&code=${code}`),
     });
   }
 
-  test("richtiges PW + return=/datenschutz.html/edit → 302 dorthin", async () => {
+  test("richtiger Code + return=/datenschutz.html/edit → 302 dorthin", async () => {
     const res = await loginWithReturn("/datenschutz.html/edit");
     expect(res.status).toBe(302);
     expect(res.headers.get("location")).toBe("/datenschutz.html/edit");
@@ -287,16 +303,16 @@ describe("M3 — Login-return Open-Redirect-Schutz", () => {
 // ===========================================================================
 describe("M3 — Sicherheit: Auth-Datei-/Dotfile-Web-Block", () => {
   let ctx: host.HostCtx;
-  let argonHash: string;
+  let geheimnis: string;
 
   beforeEach(async () => {
     const siteDir = makeTmpDir("regoro-v10-sec-");
     writeFileSync(join(siteDir, "index.html"), INDEX_HTML, "utf8");
     writeFileSync(join(siteDir, "styles.css"), STYLES_CSS, "utf8");
     // Echte .regoro/auth.json anlegen.
-    await auth.createAuthFile(siteDir, "site-pw");
+    await auth.createAuthFile(siteDir, ["+4915120464812"]);
     const loaded = auth.loadAuthFile(siteDir)!;
-    argonHash = loaded.hash;
+    geheimnis = loaded.secret;
     // .git/config-Fixture.
     mkdirSync(join(siteDir, ".git"), { recursive: true });
     writeFileSync(join(siteDir, ".git", "config"), "[core]\n  bare = false\n");
@@ -307,11 +323,12 @@ describe("M3 — Sicherheit: Auth-Datei-/Dotfile-Web-Block", () => {
     const res = await call(ctx, "GET", path);
     expect(res.status).toBe(404);
     const body = await res.text();
-    expect(body).not.toContain(argonHash);
-    expect(body).not.toContain("$argon2");
+    expect(body).not.toContain(geheimnis);
+    // Auch keine hinterlegte Kennung — die Auth-Datei enthält jetzt beides.
+    expect(body).not.toContain(TEST_NUMMER);
   }
 
-  test("GET /.regoro/auth.json → 404, Hash nicht im Body", async () => {
+  test("GET /.regoro/auth.json → 404, Secret nicht im Body", async () => {
     await expectBlocked("/.regoro/auth.json");
   });
 

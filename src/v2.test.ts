@@ -16,9 +16,9 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const TEST_PASSWORD = "testpw";
 const TEST_SECRET = "testsecret-aaaaaaaaaaaaaaaaaaaaaaaa";
-const TEST_AUTH = { hash: await (await import("./auth.ts")).hashPassword(TEST_PASSWORD), secret: TEST_SECRET };
+const TEST_NUMMER = "+4915120464812";
+const TEST_AUTH = { nummern: [TEST_NUMMER], emails: [], secret: TEST_SECRET };
 
 const REPO_ROOT = join(import.meta.dir, "..");
 const REAL_SITE = join(REPO_ROOT, "examples", "site");
@@ -599,7 +599,7 @@ describe("auth.ts — EDITOR_INSECURE_COOKIE-Toggle (Secure-Flag)", () => {
     // Das EDITOR_INSECURE_COOKIE-Env steuert das Secure-Flag.
     const script =
       `import {issueCookie} from ${JSON.stringify(authPath)}; ` +
-      `process.stdout.write(issueCookie({ hash: "x", secret: "sub-secret-aaaaaaaaaaaa" }));`;
+      `process.stdout.write(issueCookie({ nummern: ["+4915120464812"], emails: [], secret: "sub-secret-aaaaaaaaaaaa" }));`;
     const res = Bun.spawnSync({
       cmd: [process.execPath, "-e", script],
       env,
