@@ -95,14 +95,39 @@ export function siteIsUnderHome(siteDir: string): boolean {
 /**
  * Quotet einen Pfad für systemd-Unit-Dateien.
  *
- * systemd zerlegt `ExecStart=`, `WorkingDirectory=` und `ReadWritePaths=` an
- * Leerzeichen. Ein Ordner „/srv/sites/Meine Firma/site" startete sonst
- * `regoro run /srv/sites/Meine` — der Dienst liefe auf dem falschen Pfad oder
- * gar nicht. systemd akzeptiert doppelte Anführungszeichen, \\ und " werden
- * darin escaped.
+ * systemd zerlegt `ExecStart=` und `ReadWritePaths=` an Leerzeichen. Ein Ordner
+ * „/srv/sites/Meine Firma/site" startete sonst `regoro run /srv/sites/Meine` —
+ * der Dienst liefe auf dem falschen Pfad oder gar nicht. systemd akzeptiert
+ * dort doppelte Anführungszeichen, \\ und " werden darin escaped.
+ *
+ * NICHT für `WorkingDirectory=` benutzen — siehe sdPfad().
  */
 export function sdQuote(s: string): string {
   return `"${s.replace(/(["\\])/g, "\\$1")}"`;
+}
+
+/**
+ * Pfad für Direktiven, die GENAU EINEN Pfad nehmen (`WorkingDirectory=`) —
+ * also unverändert, ohne Anführungszeichen.
+ *
+ * Gemessen auf systemd 255, beide Wege:
+ *   WorkingDirectory="/tmp"  → systemd-analyze verify: „path is not absolute",
+ *                              systemd-run: „Failed to start transient service
+ *                              unit: WorkingDirectory= expects an absolute path".
+ *                              Die Unit startet NICHT.
+ *   WorkingDirectory=/tmp/mit raum → läuft, Leerzeichen und alles.
+ *
+ * Der Grund: Quoting gilt in Unit-Dateien für Einstellungen, die eine LISTE
+ * lesen. `WorkingDirectory=` nimmt den Rest der Zeile wörtlich — die
+ * Anführungszeichen werden Teil des Pfades, und der beginnt dann mit `"`
+ * statt mit `/`. Leerzeichen sind hier gerade deshalb unproblematisch.
+ *
+ * Nicht „vereinheitlichen": Für `ExecStart=` sind die Anführungszeichen
+ * umgekehrt zwingend (dort nachgemessen: ungequotet bricht ein Pfad mit
+ * Leerzeichen mit „Command /tmp/claude-1002/mit is not executable").
+ */
+export function sdPfad(s: string): string {
+  return s;
 }
 
 /**
@@ -155,7 +180,7 @@ After=network.target
 [Service]
 Type=simple
 User=${o.user}
-WorkingDirectory=${sdQuote(o.siteDir)}
+WorkingDirectory=${sdPfad(o.siteDir)}
 Environment=PORT=${o.port}
 ExecStart=${sdQuote(o.execPath)} ${command} ${sdQuote(o.siteDir)}
 Restart=on-failure
