@@ -68,6 +68,18 @@ const PUFFER_GRENZE = 500;
  */
 const EXIT_GNADENFRIST_MS = 200;
 
+/**
+ * Wie lange nach dem Ende des Workers höchstens auf `done` gewartet wird, bevor
+ * der Leser abgebrochen wird.
+ *
+ * Das ist ein NOTAUSGANG und kein Normalweg: Ist der Worker beendet, ist das
+ * Schreibende der Pipe zu und `read()` liefert von selbst zügig `done`. Gebraucht
+ * wird der Abbruch nur, wenn ein ENKELPROZESS das Schreibende offen hält — und
+ * dafür sind Sekunden angemessen. Mit einer kurzen Frist wäre er der Normalweg
+ * und würfe unter Last genau die letzten Bytes weg, um die es hier geht.
+ */
+const LESER_ABBRUCH_MS = 2_000;
+
 /** So viel vom stderr des Workers wird für den Fehlerfall aufgehoben. */
 const STDERR_MITSCHNITT_BYTES = 8192;
 
@@ -422,12 +434,14 @@ async function begleiteWorker(
      * Timer ist nach Ablauf DAUERHAFT erfüllt und gewinnt danach jedes Rennen.
      * Liegen die letzten Bytes noch in der OS-Pipe statt im Puffer des Stroms,
      * bleibt `read()` hängen, der Timer gewinnt — und die letzte Zeile ist weg.
-     * Stattdessen wird bis `done` LEERGELESEN; die Gesamtfrist wirkt nur als
-     * Notausgang, indem sie den Leser abbricht. Das kann ein Enkelprozess, der
-     * das Schreibende offen hält, nicht aushebeln.
+     * Stattdessen wird bis `done` LEERGELESEN; die Gesamtfrist (`LESER_ABBRUCH_MS`)
+     * wirkt nur als Notausgang, indem sie den Leser abbricht — und ist deshalb
+     * bewusst um eine Größenordnung länger als die Gnadenfrist für stderr. Eine
+     * kurze Frist hätte das Rennen nur verschoben statt beseitigt: Sind die
+     * letzten Bytes noch nicht beim Leser, wirft `cancel()` sie weg.
      */
     const wachhund = proc.exited.then(async () => {
-      await Bun.sleep(EXIT_GNADENFRIST_MS);
+      await Bun.sleep(LESER_ABBRUCH_MS);
       // Bricht ein hängendes `read()` auf — sonst stünde die Schleife still.
       await leser.cancel().catch(() => {});
     });
