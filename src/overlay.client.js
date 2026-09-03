@@ -71,6 +71,13 @@
   // Blase daraus zu machen wäre unlesbar; sie werden deshalb in EINE Blase
   // geschrieben, bis ein anderes Ereignis dazwischenkommt.
   var agentTextBlase = null;
+  // Dauerhafte Sperre der Eingabe, unabhängig davon, ob gerade etwas läuft:
+  // erschöpftes Kontingent oder ein Server, der keinen Zustand liefert. Ohne
+  // dieses Flag hob `setAgentLaeuft(false)` am Ende jedes Stroms die Sperre
+  // wieder auf — im Prüfstand gemessen: Nach der stillen Nachlese beim Öffnen
+  // war „Auftrag geben" trotz aufgebrauchtem Kontingent wieder anklickbar, und
+  // der Kunde lief in eine 429 statt in eine Erklärung.
+  var agentGesperrt = false;
   // Bild-Austausch-State.
   var images = [];          // [{ img, imgIdx, badge, imgClickHandler }]
   var fileInput = null;     // verstecktes <input type="file">, lazily erzeugt
@@ -2107,6 +2114,7 @@
     document.body.appendChild(panel);
     agentPanel = panel;
 
+    agentGesperrt = false;
     ui.agent = {
       quota: quota, verlauf: verlauf, eingabe: eingabe,
       senden: senden, abbrechen: abbrechen, hinweis: hinweis
@@ -2168,7 +2176,8 @@
     }).catch(function (err) {
       if (!agentPanel) return;
       setAgentHinweis(err && err.message ? err.message : "Zustand nicht abrufbar.", true);
-      ui.agent.senden.disabled = true;
+      agentGesperrt = true;
+      setAgentLaeuft(agentLaeuft);
     });
   }
 
@@ -2180,9 +2189,10 @@
       return;
     }
     q.classList.toggle("__regoro-aleer", !!k.erschoepft);
+    agentGesperrt = !!k.erschoepft;
+    setAgentLaeuft(agentLaeuft);   // Sperre sofort auf den Knopf anwenden
     if (k.erschoepft) {
       q.textContent = "Das Monatskontingent ist aufgebraucht. Es setzt sich am Monatsersten zurück.";
-      ui.agent.senden.disabled = true;
       return;
     }
     q.textContent = "Noch " + zahl(k.frei) + " von " + zahl(k.gesamt) + " Zeichen-Einheiten in diesem Monat.";
@@ -2241,7 +2251,9 @@
   function setAgentLaeuft(laeuft) {
     agentLaeuft = laeuft;
     if (!agentPanel) return;
-    ui.agent.senden.disabled = laeuft;
+    // `agentGesperrt` überlebt das Ende eines Laufs — ein aufgebrauchtes
+    // Kontingent wird nicht dadurch wieder voll, dass ein Strom zu Ende ist.
+    ui.agent.senden.disabled = laeuft || agentGesperrt;
     ui.agent.eingabe.disabled = laeuft;
     ui.agent.abbrechen.disabled = !laeuft;
   }
