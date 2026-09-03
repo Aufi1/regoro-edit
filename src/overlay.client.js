@@ -163,6 +163,46 @@
     return node;
   }
 
+  /**
+   * Ein Strich-Symbol als SVG.
+   *
+   * ÜBER createElementNS UND NICHT ÜBER innerHTML. Die Zeichenketten hier sind
+   * zwar unsere eigenen und harmlos — aber `el(..., {html})` ist der einzige
+   * Weg in dieser Datei, auf dem Markup ins DOM kommt, und je weniger
+   * Aufrufstellen er hat, desto leichter bleibt er zu überblicken (Invariante
+   * 1a). Für zwei Pfade lohnt die Abkürzung nicht.
+   *
+   * `stroke: currentColor` heißt: Das Symbol nimmt die Schriftfarbe seines
+   * Knopfes an — auch im umgekehrten Zustand, wenn „Verlauf" aufgeklappt ist
+   * und weiß auf blau zu blau auf weiß wird.
+   */
+  function symbol(pfade) {
+    var NS = "http://www.w3.org/2000/svg";
+    var svg = document.createElementNS(NS, "svg");
+    svg.setAttribute("viewBox", "0 0 16 16");
+    svg.setAttribute("width", "13");
+    svg.setAttribute("height", "13");
+    svg.setAttribute("fill", "none");
+    svg.setAttribute("stroke", "currentColor");
+    svg.setAttribute("stroke-width", "1.7");
+    svg.setAttribute("stroke-linecap", "round");
+    svg.setAttribute("stroke-linejoin", "round");
+    // Das Symbol wiederholt nur, was daneben steht — für einen Screenreader
+    // wäre es Lärm.
+    svg.setAttribute("aria-hidden", "true");
+    pfade.forEach(function (d) {
+      var pfad = document.createElementNS(NS, "path");
+      pfad.setAttribute("d", d);
+      svg.appendChild(pfad);
+    });
+    return svg;
+  }
+
+  /** Plus — „noch eines dazu". */
+  var SYMBOL_NEU = ["M8 3.4v9.2", "M3.4 8h9.2"];
+  /** Zifferblatt mit Zeigern — „was war vorher". */
+  var SYMBOL_VERLAUF = ["M8 2.6a5.4 5.4 0 1 1 0 10.8 5.4 5.4 0 0 1 0-10.8", "M8 5.1V8.2l2.2 1.5"];
+
   // Format eines Laufs aus seinen DOM-Vorfahren ableiten (ganzer Lauf).
   // Liest <strong>/<b>, <em>/<i>, <u>, <a href> und eine inline gesetzte Textfarbe.
   function readFmt(node) {
@@ -657,8 +697,11 @@
        */
       "#__regoro-agent .__regoro-akopfbtns{display:flex;gap:6px;flex:0 0 auto;}",
       "#__regoro-agent button.__regoro-akopfbtn{appearance:none;background:transparent;",
-      "border:1px solid rgba(255,255,255,.4);color:#fff;border-radius:999px;padding:4px 12px;",
-      "font:inherit;font-size:12.5px;cursor:pointer;white-space:nowrap;}",
+      "border:1px solid rgba(255,255,255,.4);color:#fff;border-radius:999px;padding:4px 11px;",
+      "font:inherit;font-size:12.5px;cursor:pointer;white-space:nowrap;",
+      "display:inline-flex;align-items:center;gap:5px;}",
+      // `flex:0 0 auto`, damit das Symbol beim Schrumpfen nicht zur Ellipse wird.
+      "#__regoro-agent button.__regoro-akopfbtn svg{flex:0 0 auto;}",
       "#__regoro-agent button.__regoro-akopfbtn:hover{background:rgba(255,255,255,.14);}",
       "#__regoro-agent button.__regoro-akopfbtn[aria-expanded=\"true\"]{background:#fff;color:#14324f;",
       "border-color:#fff;}",
@@ -2359,13 +2402,12 @@
      * Liste — zwei Klicks für den einen Klick.
      */
     var neuBtn = el("button", {
-      class: "__regoro-akopfbtn", type: "button", text: "Neu",
-      title: "Ein neues Gespräch beginnen"
-    });
+      class: "__regoro-akopfbtn", type: "button", title: "Ein neues Gespräch beginnen"
+    }, [symbol(SYMBOL_NEU), el("span", { text: "Neu" })]);
     var verlaufBtn = el("button", {
-      class: "__regoro-akopfbtn", type: "button", text: "Verlauf",
+      class: "__regoro-akopfbtn", type: "button",
       title: "Frühere Gespräche", "aria-expanded": "false"
-    });
+    }, [symbol(SYMBOL_VERLAUF), el("span", { text: "Verlauf" })]);
     var head = el("div", { class: "__regoro-ahead" }, [
       el("h2", { text: "KI-Assistent" }),
       el("div", { class: "__regoro-akopfbtns" }, [neuBtn, verlaufBtn])
