@@ -918,12 +918,46 @@ async function handleRestore(req: Request, ctx: HostCtx): Promise<Response> {
 const MAX_AUFTRAG_ZEICHEN = 4000;
 
 /**
- * Maschinenlesbare Gründe aus `agent.ts` in Sätze übersetzen, die ein
- * Handwerksbetrieb versteht. Alles Unbekannte geht unverändert durch: Der
- * Validator und die Recherche liefern bereits deutschen Klartext, und den
- * hier noch einmal zu übersetzen hieße, ihn zu verlieren.
+ * Die technischen Ablehnungen beim Übernehmen. `agent.ts` baut sie als
+ * `<grund>:<pfad>`; der Pfad ist für den Betreiber gedacht, nicht für den Kunden.
  */
-function agentFehlerText(grund: string): string {
+const UEBERNAHME_ABLEHNUNGEN = new Set([
+  "symlink",
+  "geloescht",
+  "unlesbar",
+  "ausserhalb-kopie",
+  "ausserhalb-site",
+]);
+
+/**
+ * Maschinenlesbare Gründe aus `agent.ts` in Sätze übersetzen, die ein
+ * Handwerksbetrieb versteht.
+ *
+ * JEDER Grund, den `agent.ts` erzeugen kann, muss hier ankommen — sonst steht
+ * das Schlüsselwort wörtlich in der roten Sprechblase. Nachgemessen ist das
+ * zweimal passiert (`worker-abgestuerzt`, und beim Abbrechen-Knopf las der
+ * Kunde schlicht „abgebrochen"). `src/fehlertexte.test.ts` liest die Gründe
+ * aus `agent.ts` und bricht, sobald einer dazukommt, der hier fehlt.
+ *
+ * Nur frei formulierte Meldungen gehen unverändert durch: Validator und
+ * Recherche liefern bereits deutschen Klartext, und den hier noch einmal zu
+ * übersetzen hieße, ihn zu verlieren.
+ */
+export function agentFehlerText(grund: string): string {
+  // `<grund>:<pfad>` — der Pfad gehört ins Betreiber-Log, nicht in den Browser.
+  // Dem Kunden sagt er nichts, und im ungünstigen Fall verrät er die Struktur
+  // eines Ausbruchsversuchs an genau den, der ihn ausgelöst hat. `agent.ts`
+  // schreibt selbst nichts ins Log (kein einziges console.*), also passiert es
+  // hier — sonst ginge die einzige Spur verloren, die eine Störung erklärt.
+  const trenner = grund.indexOf(":");
+  if (trenner > 0 && UEBERNAHME_ABLEHNUNGEN.has(grund.slice(0, trenner))) {
+    console.error(`[regoro] Übernahme abgelehnt: ${grund}`);
+    return (
+      "Der Assistent hat etwas erzeugt, das die Sicherheitsprüfung nicht übernimmt. " +
+      "An der Website wurde nichts geändert."
+    );
+  }
+
   switch (grund) {
     case "kein-lauf":
       return "Kein Lauf aktiv.";
@@ -938,8 +972,12 @@ function agentFehlerText(grund: string): string {
       return "Der Assistent hat sich unerwartet beendet. An der Website wurde nichts geändert.";
     case "kontingent-erschoepft":
       return "Das Monatskontingent ist mitten im Auftrag aufgebraucht. Es wurde nichts geändert; am Monatsersten geht es weiter.";
-    case "ende":
-      return "Der Auftrag wurde abgebrochen.";
+    case "abgebrochen":
+      // Der meistbenutzte Weg überhaupt — der Abbrechen-Knopf. Ohne diesen Fall
+      // stand dort ein rotes Feld mit dem Wort „abgebrochen".
+      return "Der Auftrag wurde abgebrochen. An der Website wurde nichts geändert.";
+    case "abgeschaltet":
+      return "Der Zugang wurde vom Betreiber beendet.";
     default:
       return grund;
   }

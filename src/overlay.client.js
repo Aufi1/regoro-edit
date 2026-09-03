@@ -78,6 +78,11 @@
   // war „Auftrag geben" trotz aufgebrauchtem Kontingent wieder anklickbar, und
   // der Kunde lief in eine 429 statt in eine Erklärung.
   var agentGesperrt = false;
+  // Das Monatskontingent aus der letzten Status-Abfrage. Die tokens-Ereignisse
+  // eines Laufs tragen nur `frei`; ohne den gemerkten Gesamtwert müsste die
+  // Anzeige mitten im Lauf das Format wechseln („noch X" statt „noch X von Y"),
+  // und das sähe aus wie ein Fehler.
+  var agentGesamt = null;
   // Bild-Austausch-State.
   var images = [];          // [{ img, imgIdx, badge, imgClickHandler }]
   var fileInput = null;     // verstecktes <input type="file">, lazily erzeugt
@@ -2115,6 +2120,7 @@
     agentPanel = panel;
 
     agentGesperrt = false;
+    agentGesamt = null;
     ui.agent = {
       quota: quota, verlauf: verlauf, eingabe: eingabe,
       senden: senden, abbrechen: abbrechen, hinweis: hinweis
@@ -2184,10 +2190,11 @@
   function zeigeKontingent(k) {
     if (!agentPanel) return;
     var q = ui.agent.quota;
-    if (!k || typeof k.frei !== "number" || typeof k.gesamt !== "number") {
+    if (!k || typeof k.frei !== "number") {
       q.textContent = "Kontingent unbekannt.";
       return;
     }
+    if (typeof k.gesamt === "number") agentGesamt = k.gesamt;
     q.classList.toggle("__regoro-aleer", !!k.erschoepft);
     agentGesperrt = !!k.erschoepft;
     setAgentLaeuft(agentLaeuft);   // Sperre sofort auf den Knopf anwenden
@@ -2195,7 +2202,10 @@
       q.textContent = "Das Monatskontingent ist aufgebraucht. Es setzt sich am Monatsersten zurück.";
       return;
     }
-    q.textContent = "Noch " + zahl(k.frei) + " von " + zahl(k.gesamt) + " Zeichen-Einheiten in diesem Monat.";
+    var gesamt = typeof k.gesamt === "number" ? k.gesamt : agentGesamt;
+    q.textContent = gesamt === null
+      ? "Noch " + zahl(k.frei) + " Zeichen-Einheiten in diesem Monat."
+      : "Noch " + zahl(k.frei) + " von " + zahl(gesamt) + " Zeichen-Einheiten in diesem Monat.";
   }
 
   function zahl(n) {
@@ -2363,11 +2373,14 @@
     quelle.addEventListener("tokens", function (ev) {
       if (!agentPanel) return;
       var d = parseEreignis(ev);
-      if (d && typeof d.frei === "number") {
-        // gesamt kommt aus dem Status; hier zählt nur der neue Rest.
-        var q = ui.agent.quota;
-        q.textContent = "Noch " + zahl(d.frei) + " Zeichen-Einheiten in diesem Monat.";
-      }
+      if (!d || typeof d.frei !== "number") return;
+      // Durch dieselbe Anzeige wie die Status-Abfrage, nicht an ihr vorbei.
+      // Vorher schrieb dieser Zweig direkt in die Zeile: Das Format sprang
+      // mitten im Lauf (das „von Y" fiel weg), und eine WÄHREND des Laufs
+      // erreichte Erschöpfung färbte die Leiste nicht — sie zog erst nach,
+      // wenn der Strom endete. `frei: 0` heißt aufgebraucht; der Server
+      // klammert mit Math.max(0, …), negativ wird es also nie.
+      zeigeKontingent({ frei: d.frei, gesamt: agentGesamt, erschoepft: d.frei <= 0 });
     });
     quelle.addEventListener("fertig", function (ev) {
       var d = parseEreignis(ev) || {};
