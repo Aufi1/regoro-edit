@@ -548,43 +548,18 @@ describe("GET /edit/agent/events (echter Server)", () => {
   // Kein Schlüsselwort darf roh im Chatfenster landen
   // =========================================================================
   /**
-   * `agent.ts` liefert maschinenlesbare Gründe, `agentFehlerText` in `host.ts`
-   * übersetzt sie an der HTTP-Grenze (Contract §10). Der `default`-Zweig dort
-   * gibt den Grund aber UNVERÄNDERT zurück — ein Grund, den niemand in die
-   * Tabelle eingetragen hat, steht damit wörtlich im Chatfenster des Kunden.
+   * Die Vollständigkeit der Übersetzungstabelle prüft `fehlertexte.test.ts` —
+   * gründlicher, als ich es hier könnte (auch Vorlagen-Gründe wie
+   * `symlink:${pfad}` und tote Fälle). Hier steht deshalb nur, was dort NICHT
+   * geht: was der Kunde am ENDE DER LEITUNG wirklich zu sehen bekommt, über
+   * den echten Server, auf den zwei Wegen, die er tatsächlich geht.
    *
-   * Das ist kein Gedankenspiel: Genau so stand schon einmal „worker-abgestuerzt"
-   * beim Kunden, bis Dev-Web den Fall nachgetragen hat. Die Kopplung liegt
-   * zwischen zwei Dateien und wird von nichts sonst erzwungen.
+   * Beides ist nötig. Ein vollständiger Tabellen-Abgleich sagt nichts darüber,
+   * ob die Antwort auch durch `sseRahmen` bis in den Browser kommt; ein
+   * Leitungstest deckt nur die Gründe ab, die er auslösen kann.
    */
-  function schluesselwoerterAus(datei: string): string[] {
-    const quelle = readFileSync(join(REPO_ROOT, "src", datei), "utf8");
-    return [...quelle.matchAll(/grund\s*(?:\?\?=|=|:)\s*"([a-z][a-z-]*)"/g)].map((m) => m[1]!);
-  }
-
   /** Ein roher Schlüssel: klein, mit Bindestrich, ohne Leerzeichen und Satzzeichen. */
   const istSchluessel = (text: string): boolean => /^[a-z]+(-[a-z]+)*$/.test(text.trim());
-
-  test("jeder Grund aus agent.ts hat eine Übersetzung in host.ts", () => {
-    // Die Gründe des STARTS (laeuft-bereits, kontingent, keine-sandbox) laufen
-    // über die Statuscodes und haben dort eigene Sätze; die des Ereignisstroms
-    // müssen durch agentFehlerText.
-    const nurStart = new Set(["laeuft-bereits", "kontingent", "keine-sandbox"]);
-    const ausAgent = schluesselwoerterAus("agent.ts").filter((g) => !nurStart.has(g));
-    expect(ausAgent.length).toBeGreaterThan(3); // Voraussetzung: die Ernte hat geklappt
-
-    // NUR der Rumpf von agentFehlerText. host.ts hat weitere switch-Blöcke
-    // (etwa den für die Statuscodes des Starts); gegen die ganze Datei zu
-    // prüfen wäre zu großzügig — der Test wäre grün, weil das Schlüsselwort
-    // irgendwo anders vorkommt.
-    const host = readFileSync(join(REPO_ROOT, "src", "host.ts"), "utf8");
-    const beginn = host.indexOf("function agentFehlerText");
-    expect(beginn).toBeGreaterThan(0);
-    const rumpf = host.slice(beginn, host.indexOf("\n}", beginn));
-    const uebersetzt = new Set([...rumpf.matchAll(/case "([a-z][a-z-]*)":/g)].map((m) => m[1]!));
-    const fehlend = [...new Set(ausAgent)].filter((g) => !uebersetzt.has(g)).sort();
-    expect(fehlend).toEqual([]);
-  });
 
   test.skipIf(!haveBwrap())("ein abgebrochener Lauf zeigt einen Satz, kein Schlüsselwort", async () => {
     // Der häufigste Abbruch überhaupt: Der Kunde drückt auf „Abbrechen".
