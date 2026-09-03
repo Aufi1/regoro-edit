@@ -71,7 +71,7 @@ Ein einzelner Bun-Prozess, der eine **bestehende statische Website** ausliefert 
 ## Testen / Checks
 ```bash
 export PATH="$HOME/.bun/bin:$PATH"
-bun test                 # 671 Tests (Fixtures kopieren examples/site in tmp-Dirs)
+bun test                 # ~1280 Tests (Fixtures kopieren examples/site in tmp-Dirs)
 bun x tsc --noEmit       # Typecheck (tsconfig include: src/**/*.ts)
 bun build src/overlay.client.js --target=browser >/dev/null   # Syntax-Check des Client-JS (tsc erfasst es NICHT)
 caddy validate --config Caddyfile.example --adapter caddyfile        # Proxy-Vorlage Einzelbetrieb
@@ -79,6 +79,14 @@ caddy validate --config Caddyfile.multi.example --adapter caddyfile  # Proxy-Vor
 bun scripts/gen-notices.ts --check   # Lizenzhinweise aktuell? (roter Release-Build sonst)
 bun build --compile src/cli.ts --outfile /tmp/regoro           # Binary — bricht bei Asset-Fehlern NICHT, erst zur Laufzeit
 ```
+- **Ein Nachweis, der nicht anschlagen kann, beweist durch sein Ausbleiben nichts.** An einem Tag dreimal dieselbe Fehlerklasse, jedes Mal an anderer Stelle und von jemand anderem gefunden:
+  - `test.skipIf` wertet beim **Einsammeln** aus, vor jedem `beforeAll` — vier Binary-Tests waren dauerhaft übersprungen und meldeten **grün**.
+  - Zwei `service.test.ts`-Zusicherungen nagelten die **kaputte** Form von `WorkingDirectory=` fest; deshalb erzeugte der dokumentierte Deploy-Weg nie eine startfähige Unit, und niemand sah es.
+  - Die Prüfung „Agent-Routen geben 404 ohne `ki.json`" lief zuerst **unangemeldet** — dort geben sie ohnehin 404 (Invariante 4). Das erwartete Ergebnis kam aus dem falschen Grund.
+
+  Zeichenketten-Prüfungen halten fest, was wir für richtig **halten**; ein Vergleich mit der eigenen Erwartung kann einen Irrtum in der Erwartung grundsätzlich nicht finden. **Wo ein Test eine Abwesenheit behauptet** („kein fatal error", „kein Proxy-Durchgriff", „keine Datei außerhalb"), gehört deshalb eine Gegenprobe daneben, die den Messapparat selbst prüft. Die drei, die dafür im Repo stehen: das absichtlich wieder eingebaute Quoting, das `systemd-analyze` als `fatal error` sehen **muss**; das Kind mit geerbter Umgebung, das durch den Attrappen-Proxy **durchkommen muss**, bevor gezeigt wird, dass der echte Lauf scheitert; und die Attrappe, die meldet, dass sie den Ausbruch **wirklich versucht** hat und an EROFS gescheitert ist — ohne sie wäre der wichtigste Test dieser Arbeit auch dann grün, wenn sie gar nichts täte.
+
+  Und wo es geht: **das echte Werkzeug fragen**, statt die erzeugte Zeichenkette zu vergleichen — `systemd-analyze verify`, echtes `caddy` auf der Leitung, kompiliertes Binary ohne `bun` im PATH. Genau diese drei Prüfungen haben die drei teuersten Fehler gefunden.
 - **Das Binary muss nach jeder Änderung an Asset-Laden/Pfaden echt geprüft werden**, `bun test` deckt nur den dev-Pfad ab. Minimal: Binary bauen, `PATH=/usr/bin:/bin` (kein bun), `regoro init` + `run` auf einer tmp-Kopie, dann `/edit-assets/overlay.js` → muss 200 + ~91 KB liefern, nicht 404. Dasselbe für die Lizenzdatei: `regoro licenses | wc -c` muss ~620.000 liefern, nicht 0. Das Binary ist ~90 MB.
 - **Die erzeugte systemd-Unit gegen echtes systemd prüfen**, nicht nur per String-Vergleich: `regoro service <site> --systemd > /tmp/x.service && systemd-analyze verify /tmp/x.service`. Ein Textvergleich hat jahrelang eine Unit durchgewinkt, die wegen des gequoteten `WorkingDirectory=` gar nicht startete. `systemd-run --user -p …` prüft einzelne Direktiven ohne root.
 - **Der SSE-Strom hängt nicht an Caddy, sondern am ersten Byte.** Gemessen (caddy 2.11.4): Caddy gibt die Antwort-Header erst mit dem ersten Körper-Byte heraus — 4,00 s Verzögerung, wenn der Lauf 4 s schweigt, und `flush_interval -1` ändert daran **nichts**. Deshalb schickt der Editor beim Verbinden sofort einen SSE-Kommentar (`: verbunden`); damit sind es 0,002 s. Nicht entfernen, und die Verzögerung nicht im Proxy suchen.
