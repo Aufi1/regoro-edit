@@ -2126,8 +2126,21 @@
     ladeAgentStatus();
   }
 
-  /** Zustand vom Server holen: Kontingent, und ob gerade schon etwas läuft. */
-  function ladeAgentStatus() {
+  /**
+   * Der Satz, mit dem der Server „es gibt hier nichts zu sehen" ausdrückt.
+   * Bewusst wörtlich verglichen: Die Fehlerform ist auf `{grund}` festgelegt,
+   * ein zusätzliches Feld zur Unterscheidung gäbe es nicht. Ändert sich der
+   * Wortlaut in host.ts, muss er hier mit — sonst zeigt eine frisch geöffnete
+   * Leiste eine Fehlermeldung, wo nur nichts passiert ist.
+   */
+  var KEIN_LAUF = "Kein Lauf aktiv.";
+
+  /**
+   * Zustand vom Server holen: Kontingent, und ob gerade schon etwas läuft.
+   * `nurKontingent` = nur die Anzeige auffrischen, nicht erneut anhängen
+   * (sonst öffnete jeder Abschluss einen zweiten Strom auf sich selbst).
+   */
+  function ladeAgentStatus(nurKontingent) {
     fetch("/edit/agent/status", {
       credentials: "same-origin",
       headers: { "Accept": "application/json" }
@@ -2137,11 +2150,20 @@
     }).then(function (st) {
       if (!agentPanel) return;                       // zwischenzeitlich geschlossen
       zeigeKontingent(st && st.kontingent);
+      if (nurKontingent) return;
       if (st && st.laeuft) {
         // Ein Lauf ist schon unterwegs (Reload, zweiter Tab, anderes Gerät).
         // Anhängen statt einen zweiten zu starten — der zweite bekäme 409.
         agentNachricht("Es läuft bereits ein Auftrag für diese Website. Ich hänge mich an.", "agent");
         verbindeStrom();
+      } else {
+        // Auch OHNE laufenden Auftrag anhängen: Der Server reicht den zuletzt
+        // beendeten Lauf noch einmal aus. Ohne das verlöre der Kunde
+        // Zusammenfassung und Dateiliste durch genau den versehentlichen
+        // Reload, gegen den das Nachreichen antritt — und sähe bei einem
+        // gescheiterten Lauf gar nicht, DASS er gescheitert ist. Er versuchte
+        // es dann noch einmal und bezahlte denselben Fehlschlag zweimal.
+        verbindeStrom({ nachlese: true });
       }
     }).catch(function (err) {
       if (!agentPanel) return;
@@ -2266,7 +2288,7 @@
           : "Der KI-Assistent ist gerade nicht verfügbar.";
         agentNachricht(grund, "fehler");
         setAgentLaeuft(false);
-        ladeAgentStatus();                 // Kontingentanzeige nachziehen
+        ladeAgentStatus(true);             // nur die Kontingentanzeige nachziehen
         return;
       }
       verbindeStrom();
@@ -2296,12 +2318,21 @@
    * endlos nach, bekommt jedes Mal „Kein Lauf aktiv." und der Verlauf füllt
    * sich mit Fehlermeldungen.
    */
-  function verbindeStrom() {
+  function verbindeStrom(opts) {
+    // Nachlese = die Leiste wurde gerade geöffnet und es läuft nichts. Dann ist
+    // alles, was kommt, die Wiederholung eines beendeten Laufs — und die
+    // Antwort „Kein Lauf aktiv." bedeutet schlicht „es gab noch keinen".
+    // Die darf NICHT als Fehler im Chatfenster landen: Wer die Leiste zum
+    // ersten Mal öffnet, hat nichts falsch gemacht.
+    var nachlese = !!(opts && opts.nachlese);
     if (agentQuelle) agentQuelle.close();
-    setAgentLaeuft(true);
+    // Im Nachlese-Modus bleibt die Eingabe offen: Es läuft ja nichts, was ein
+    // zweiter Auftrag stören könnte.
+    if (!nachlese) setAgentLaeuft(true);
 
     var quelle = new EventSource("/edit/agent/events");
     agentQuelle = quelle;
+    var etwasGesehen = false;
 
     function schliessen() {
       if (agentQuelle === quelle) agentQuelle = null;
@@ -2311,11 +2342,11 @@
 
     quelle.addEventListener("text", function (ev) {
       var d = parseEreignis(ev);
-      if (d && typeof d.inhalt === "string") agentText(d.inhalt);
+      if (d && typeof d.inhalt === "string") { etwasGesehen = true; agentText(d.inhalt); }
     });
     quelle.addEventListener("werkzeug", function (ev) {
       var d = parseEreignis(ev);
-      if (d) agentWerkzeug(d.kurz || d.name || "arbeitet…");
+      if (d) { etwasGesehen = true; agentWerkzeug(d.kurz || d.name || "arbeitet…"); }
     });
     quelle.addEventListener("tokens", function (ev) {
       if (!agentPanel) return;
@@ -2328,15 +2359,22 @@
     });
     quelle.addEventListener("fertig", function (ev) {
       var d = parseEreignis(ev) || {};
+      etwasGesehen = true;
       schliessen();
       zeigeFertig(d);      // räumt agentTextBlase selbst auf
     });
     quelle.addEventListener("fehler", function (ev) {
       var d = parseEreignis(ev) || {};
+      var grund = d.grund || "Der Auftrag ist gescheitert.";
       schliessen();
       agentTextBlase = null;
-      agentNachricht(d.grund || "Der Auftrag ist gescheitert.", "fehler");
-      ladeAgentStatus();
+      // Der eine Fall, der schweigt: frisch geöffnete Leiste, nie ein Lauf.
+      // Ein gescheiterter Lauf wird dagegen sehr wohl nachgereicht — sonst
+      // versuchte es der Kunde noch einmal und bezahlte denselben Fehlschlag
+      // ein zweites Mal.
+      if (nachlese && !etwasGesehen && grund === KEIN_LAUF) return;
+      agentNachricht(grund, "fehler");
+      ladeAgentStatus(true);
     });
     quelle.onerror = function () {
       // Bricht die Verbindung ab, bevor ein Abschluss kam, versucht EventSource
@@ -2344,6 +2382,8 @@
       // endgültig aufgegeben hat, ist es ein Fehler für den Kunden.
       if (quelle.readyState === 2 /* CLOSED */) {
         schliessen();
+        // Im Nachlese-Modus lief nichts, was hätte abreißen können.
+        if (nachlese && !etwasGesehen) return;
         setAgentHinweis("Die Verbindung zum Assistenten ist abgerissen. Der Auftrag läuft " +
           "möglicherweise weiter — öffne die Leiste neu, um nachzusehen.", true);
       }
@@ -2360,6 +2400,18 @@
 
   function zeigeFertig(d) {
     var zus = String(d.zusammenfassung || "Fertig.").trim();
+    var dateien = Array.isArray(d.dateien) ? d.dateien : [];
+    // KEINE geänderte Datei heißt: Es ist nichts passiert. Das darf nicht wie
+    // ein Erfolg aussehen.
+    //
+    // Im Browser gemessen, an einem Lauf gegen einen toten Modellzugang: Die
+    // Leiste meldete grün „Der Auftrag wurde bearbeitet." und „Die Änderung ist
+    // live", während die Website byteidentisch blieb und kein Commit entstand.
+    // Der Kunde hätte die Seite neu geladen, nichts gefunden und den Editor für
+    // kaputt gehalten. Ein misslungener Lauf muss sich anfühlen wie „hat nicht
+    // geklappt, nichts passiert" — genau das ist hier die Wahrheit, also wird
+    // sie auch gesagt.
+    var nichtsGeaendert = dateien.length === 0;
     var node;
     // Der Agent schickt seine Zusammenfassung ERST als text-Ereignisse und
     // danach noch einmal im fertig-Ereignis. Im Browser gemessen: derselbe
@@ -2369,30 +2421,39 @@
     var laufend = agentTextBlase ? agentTextBlase.textContent.trim() : "";
     if (laufend && (laufend === zus || laufend.indexOf(zus) !== -1)) {
       node = agentTextBlase;
-      node.className = "__regoro-anachricht __regoro-avon-agent __regoro-afertig";
+      node.className = "__regoro-anachricht __regoro-avon-agent" +
+        (nichtsGeaendert ? "" : " __regoro-afertig");
     } else {
-      node = agentNachricht(zus, "fertig");
+      node = agentNachricht(zus, nichtsGeaendert ? "agent" : "fertig");
     }
     agentTextBlase = null;
-    var dateien = Array.isArray(d.dateien) ? d.dateien : [];
-    if (node && dateien.length) {
-      var liste = el("ul", { class: "__regoro-adateien" });
-      dateien.forEach(function (name) {
-        liste.appendChild(el("li", { text: String(name) }));
-      });
-      node.appendChild(liste);
+    if (!node) return;
+
+    if (nichtsGeaendert) {
+      node.appendChild(el("div", {
+        class: "__regoro-ahinweis __regoro-awarn",
+        text: "An der Website wurde nichts geändert."
+      }));
+      setAgentHinweis("Es wurde nichts geändert. Versuch es noch einmal, gern mit einem " +
+        "genaueren Auftrag.");
+      ladeAgentStatus(true);
+      return;
     }
+
+    var liste = el("ul", { class: "__regoro-adateien" });
+    dateien.forEach(function (name) {
+      liste.appendChild(el("li", { text: String(name) }));
+    });
+    node.appendChild(liste);
     // Die Seite im Browser ist jetzt veraltet: Der Agent hat die Datei auf
     // Platte geändert, dieses DOM kennt den alten Stand. Ein Reload ist kein
     // Vorschlag, sondern nötig — sonst überschriebe ein späteres Speichern
     // die Arbeit des Agenten (oder scheiterte am fileHash mit 409).
-    if (node) {
-      var neu = el("button", { class: "__regoro-abtn", type: "button", text: "Seite neu laden" });
-      neu.addEventListener("click", forceReload);
-      node.appendChild(el("div", { class: "__regoro-azeile" }, [neu]));
-    }
+    var neu = el("button", { class: "__regoro-abtn", type: "button", text: "Seite neu laden" });
+    neu.addEventListener("click", forceReload);
+    node.appendChild(el("div", { class: "__regoro-azeile" }, [neu]));
     setAgentHinweis("Die Änderung ist live. Über „Versionen“ lässt sie sich zurücknehmen.");
-    ladeAgentStatus();
+    ladeAgentStatus(true);
   }
 
   // ---------------------------------------------------------------------------
