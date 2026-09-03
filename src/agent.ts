@@ -40,7 +40,7 @@ import {
   raeumeAlteVerlaeufe,
   sitzungDirInKopie,
   uebernimmSitzung,
-  waehleFortsetzung,
+  waehleAus,
 } from "./verlauf.ts";
 import { ermittleContextWindow } from "./modell-info.ts";
 import { pruefeKontingent, verbucheTokens } from "./kontingent.ts";
@@ -309,10 +309,14 @@ async function fuehreAus(ctx: HostCtx, auftrag: string, opts: StartOptionen, lau
      * einen Auftrag nicht verhindern, er beginnt dann eben neu.
      */
     try {
-      raeumeAlteVerlaeufe(ctx.siteDir);
+      // EINMAL lesen, beides damit erledigen: `listeVerlaeufe` liest jede
+      // Sitzungsdatei ganz ein, und Aufräumen und Auswahl brauchen dieselbe
+      // Liste. Zweimal zu holen hieße, bei einem Kunden mit vielen Gesprächen
+      // alles doppelt zu lesen, bevor der Lauf überhaupt beginnt.
+      const { uebrig } = await raeumeAlteVerlaeufe(ctx.siteDir);
       sitzungDatei = bereiteSitzungVor(
         kopie,
-        await waehleFortsetzung(ctx.siteDir, Date.now(), opts.verlauf ?? "auto"),
+        waehleAus(uebrig, Date.now(), opts.verlauf ?? "auto"),
       );
     } catch (err) {
       process.stderr.write(`[agent] Verlauf nicht vorbereitet: ${String(err)}\n`);

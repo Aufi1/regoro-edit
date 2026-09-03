@@ -119,8 +119,25 @@ export async function waehleFortsetzung(
   jetzt: number = Date.now(),
   wunsch: string = "auto",
 ): Promise<VerlaufInfo | null> {
+  if (wunsch === "neu") return null;          // ohne die Liste zu lesen
+  return waehleAus(await listeVerlaeufe(siteDir), jetzt, wunsch);
+}
+
+/**
+ * Dieselbe Wahl auf einer BEREITS GELESENEN Liste.
+ *
+ * Existiert, weil `listeVerlaeufe` nicht billig ist: pi liest dafür jede
+ * Sitzungsdatei ganz ein (für Titel, Nachrichtenzahl und Volltext). Beim
+ * Laufstart brauchen Aufräumen und Auswahl dieselbe Liste — sie zweimal zu
+ * holen hieße, bei einem Kunden mit vielen Gesprächen zweimal alles zu lesen,
+ * bevor der erste Ton an das Modell geht.
+ */
+export function waehleAus(
+  alle: VerlaufInfo[],
+  jetzt: number = Date.now(),
+  wunsch: string = "auto",
+): VerlaufInfo | null {
   if (wunsch === "neu") return null;
-  const alle = await listeVerlaeufe(siteDir);
   if (wunsch !== "auto") {
     /**
      * Ein ausdrücklich gewähltes Gespräch wird fortgesetzt, EGAL WIE ALT es ist.
@@ -208,47 +225,63 @@ export function uebernimmSitzung(kopie: string, siteDir: string): { kopiert: num
 /**
  * Löscht Verläufe, deren letzte Änderung länger als `AUFBEWAHRUNG_MS` her ist.
  *
- * Über die Datei-mtime und nicht über `listAll`: Das Aufräumen soll auch dann
- * greifen, wenn eine Datei so beschädigt ist, dass pi sie nicht mehr einlesen
- * kann — sonst bliebe genau der Müll liegen, den man am ehesten loswerden will.
+ * EINE UHR, UND ZWAR DIE AUS DER DATEI. Gemeint ist überall dasselbe: „wann hat
+ * hier zuletzt jemand etwas gesagt". Diese Frage beantwortet `listeVerlaeufe`
+ * über pi's `SessionInfo.modified` — den Zeitstempel der letzten Nachricht IM
+ * GESPRÄCH (`getMessageActivityTime`, nachgesehen, nicht angenommen). Die Liste,
+ * die 24-Stunden-Regel und die Aufbewahrung rechnen damit alle mit demselben
+ * Wert.
  *
- * ES SIND DAMIT ZWEI VERSCHIEDENE UHREN, und das ist Absicht. Nachgesehen in
- * `session-manager.js`, nicht angenommen: `SessionInfo.modified` — woran die
- * Liste und die 24-Stunden-Regel hängen — ist der Zeitstempel der LETZTEN
- * NACHRICHT IN DER DATEI (`getMessageActivityTime`), mit Rückfall auf den
- * Header und erst ganz zuletzt auf die mtime. Hier zählt dagegen allein die
- * mtime.
+ * HIER STAND EINMAL DIE DATEI-MTIME, mit einem nachvollziehbaren Grund: So
+ * verschwand auch eine Datei, die pi gar nicht mehr einlesen kann. Der Grund
+ * trug nicht. Was er kaufte, war das Löschen von ein paar Kilobyte Müll — was
+ * er riskierte, war Kundentext: Sollte pi unsere Dateien eines Tages nicht mehr
+ * lesen (Formatwechsel, Bibliotheks-Bug), hätte die mtime-Regel nach 30 Tagen
+ * die Gespräche ALLER Kunden gelöscht, still und unwiederbringlich, während die
+ * Dateien selbst völlig in Ordnung waren. Ein Aufräumer, der bei einer Störung
+ * die Daten wegwirft, statt sie liegen zu lassen, ist am falschen Ende scharf.
  *
- * Im Betrieb laufen beide zusammen: Wer schreibt, hängt eine Nachricht an UND
- * fasst die Datei an. Auseinander laufen sie nur in eine ungefährliche
- * Richtung — `uebernimmSitzung` kopiert auch einen Lauf zurück, der nichts
- * angehängt hat, und frischt dabei die mtime auf. Ein Verlauf lebt dann länger
- * als 30 Tage; er verschwindet nie zu früh.
+ * Der Preis, bewusst bezahlt: Eine wirklich kaputte Datei bleibt jetzt liegen.
+ * Sie kostet nichts weiter — sie wird nie ausgeliefert (Dotfile-Sperre), nie
+ * gelistet (pi überspringt sie) und ist durch `MAX_VERLAUF_BYTES` gedeckelt.
  *
- * Wer das umbaut, muss beide Richtungen prüfen: Eine Aufbewahrung, die der
- * Liste voraus wäre, löschte Gespräche, die die Seitenleiste noch anzeigt.
+ * Ein Verlauf ohne brauchbares Alter wird NIE gelöscht. „Alter unbekannt" ist
+ * nicht dasselbe wie „alt": Bei 0 wäre die Differenz größer als jede Frist, bei
+ * `NaN` wäre der Vergleich `<=` immer falsch — beide Male verschwände ein
+ * Gespräch genau dann, wenn wir am wenigsten über es wissen.
+ *
+ * Der Riegel ist VORSORGE und über pi heute nicht auslösbar: `SessionInfo`
+ * trägt immer ein Datum (Nachricht → Header → mtime). Deshalb steht dafür auch
+ * kein Test — einer müsste einen Zustand herstellen, den es nicht gibt, und
+ * sähe wie Abdeckung aus, ohne welche zu sein.
  */
-export function raeumeAlteVerlaeufe(siteDir: string, jetzt: number = Date.now()): number {
-  const dir = verlaufDir(siteDir);
-  let eintraege;
-  try {
-    eintraege = readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return 0;
-  }
-  let weg = 0;
-  for (const e of eintraege) {
-    if (!e.isFile() || !e.name.endsWith(".jsonl")) continue;
-    const pfad = join(dir, e.name);
+export async function raeumeAlteVerlaeufe(
+  siteDir: string,
+  jetzt: number = Date.now(),
+): Promise<{ geloescht: number; uebrig: VerlaufInfo[] }> {
+  const uebrig: VerlaufInfo[] = [];
+  let geloescht = 0;
+  for (const v of await listeVerlaeufe(siteDir)) {
+    if (!Number.isFinite(v.geaendert) || v.geaendert <= 0) {
+      uebrig.push(v);
+      continue;
+    }
+    if (jetzt - v.geaendert <= AUFBEWAHRUNG_MS) {
+      uebrig.push(v);
+      continue;
+    }
     try {
-      if (jetzt - statSync(pfad).mtimeMs <= AUFBEWAHRUNG_MS) continue;
-      rmSync(pfad, { force: true });
-      weg++;
+      rmSync(v.datei, { force: true });
+      geloescht++;
     } catch {
-      // Nicht löschbar heißt nicht abbrechen — der nächste Lauf versucht es wieder.
+      // Nicht löschbar heißt nicht abbrechen — der nächste Lauf versucht es
+      // wieder. Bis dahin gehört der Verlauf weiter dazu.
+      uebrig.push(v);
     }
   }
-  return weg;
+  // Die Überlebenden kommen mit heraus, damit der Aufrufer die teure Liste
+  // nicht ein zweites Mal holen muss. Reihenfolge bleibt: jüngster zuerst.
+  return { geloescht, uebrig };
 }
 
 

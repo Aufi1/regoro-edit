@@ -132,49 +132,119 @@ describe("die 24-Stunden-Regel", () => {
 });
 
 describe("die Aufbewahrung von 30 Tagen", () => {
-  test("was jünger ist, bleibt", () => {
+  /**
+   * EINE UHR — dieselbe wie in der Liste und in der 24-Stunden-Regel.
+   *
+   * Diese Tests alterten früher die DATEI-MTIME. Das prüfte die alte Regel, und
+   * es prüfte sie schlecht: Ein Verlauf, den die Seitenleiste noch als frisch
+   * anzeigte, konnte trotzdem gelöscht werden, und kein Fall hätte das gemerkt.
+   * Gealtert wird jetzt über den Zeitstempel der Nachrichten IM Gespräch, denn
+   * genau daraus rechnet `listeVerlaeufe` das `geaendert`, an dem alles hängt.
+   */
+  function legeAltesGespraechAn(siteDir: string, text: string, altMs: number): void {
+    const sm = SessionManager.create(mkdtempSync(join(tmpdir(), "verlauf-cwd-")), verlaufDir(siteDir));
+    const zeit = Date.now() - altMs;
+    sm.appendMessage({ role: "user", content: text, timestamp: zeit } as never);
+    sm.appendMessage({ role: "assistant", content: "erledigt", timestamp: zeit + 1000 } as never);
+  }
+
+  test("was jünger ist, bleibt", async () => {
     const site = frischeSite();
     legeVerlaufAn(site, "neulich");
-    expect(raeumeAlteVerlaeufe(site)).toBe(0);
+    expect((await raeumeAlteVerlaeufe(site)).geloescht).toBe(0);
     expect(readdirSync(verlaufDir(site)).length).toBe(1);
   });
 
-  test("was älter ist, geht", () => {
+  test("was älter ist, geht", async () => {
     const site = frischeSite();
-    legeVerlaufAn(site, "uralt");
-    const datei = join(verlaufDir(site), readdirSync(verlaufDir(site))[0]!);
-    alter(datei, AUFBEWAHRUNG_MS + 60_000);
-    expect(raeumeAlteVerlaeufe(site)).toBe(1);
+    legeAltesGespraechAn(site, "uralt", AUFBEWAHRUNG_MS + 60_000);
+    expect((await raeumeAlteVerlaeufe(site)).geloescht).toBe(1);
     expect(readdirSync(verlaufDir(site)).length).toBe(0);
   });
 
-  test("gerechnet ab LETZTER Änderung, nicht ab Anlage", () => {
+  test("gerechnet ab LETZTER Änderung, nicht ab Anlage", async () => {
     // Ein Gespräch, das seit Wochen läuft, darf nicht verschwinden, nur weil es
-    // vor langer Zeit begonnen hat.
+    // vor langer Zeit begonnen hat. Erste Nachricht uralt, letzte von gerade.
     const site = frischeSite();
-    legeVerlaufAn(site, "lange gepflegt");
-    const datei = join(verlaufDir(site), readdirSync(verlaufDir(site))[0]!);
-    alter(datei, 1000); // gerade eben angefasst
-    expect(raeumeAlteVerlaeufe(site, Date.now() + AUFBEWAHRUNG_MS - 60_000)).toBe(0);
+    const sm = SessionManager.create(mkdtempSync(join(tmpdir(), "verlauf-cwd-")), verlaufDir(site));
+    sm.appendMessage({
+      role: "user", content: "vor Wochen begonnen",
+      timestamp: Date.now() - (AUFBEWAHRUNG_MS + 60_000),
+    } as never);
+    sm.appendMessage({ role: "assistant", content: "gerade eben geantwortet", timestamp: Date.now() } as never);
+    expect((await raeumeAlteVerlaeufe(site)).geloescht).toBe(0);
+    expect(readdirSync(verlaufDir(site)).length).toBe(1);
   });
 
-  test("eine kaputte Datei wird trotzdem aufgeräumt", () => {
-    // Über die mtime und nicht über `listAll`: Sonst bliebe genau der Müll
-    // liegen, den man am ehesten loswerden will.
+  test("DIESELBE Uhr wie die Liste: was noch angezeigt wird, wird nicht gelöscht", async () => {
+    /**
+     * DER FALL, DEN DIE ZWEITE UHR MÖGLICH MACHTE und den keiner der alten
+     * Tests fand: Solange ein Gespräch in `listeVerlaeufe` mit einem Datum
+     * innerhalb der Frist steht, darf das Aufräumen es nicht anfassen. Mit zwei
+     * Uhren war das eine Hoffnung; mit einer ist es dieselbe Zahl.
+     */
+    const site = frischeSite();
+    legeAltesGespraechAn(site, "knapp innerhalb", AUFBEWAHRUNG_MS - 60 * 60 * 1000);
+    const vorher = await listeVerlaeufe(site);
+    expect(vorher.length).toBe(1);
+    expect(Date.now() - vorher[0]!.geaendert).toBeLessThan(AUFBEWAHRUNG_MS);
+
+    expect((await raeumeAlteVerlaeufe(site)).geloescht).toBe(0);
+    expect((await listeVerlaeufe(site)).length).toBe(1);
+  });
+
+  test("eine kaputte Datei bleibt LIEGEN — bewusst", async () => {
+    /**
+     * Vorher wurde sie über die mtime gelöscht. Der Grund trug nicht: Was er
+     * kaufte, waren ein paar Kilobyte; was er riskierte, war Kundentext. Könnte
+     * pi unsere Dateien eines Tages nicht mehr lesen (Formatwechsel,
+     * Bibliotheks-Bug), hätte dieselbe Regel nach 30 Tagen die Gespräche ALLER
+     * Kunden gelöscht, während die Dateien in Ordnung waren.
+     *
+     * Sie kostet nichts: nie ausgeliefert (Dotfile-Sperre), nie gelistet, durch
+     * MAX_VERLAUF_BYTES gedeckelt.
+     */
     const site = frischeSite();
     const kaputt = join(verlaufDir(site), "2020-01-01T00-00-00-000Z_kaputt.jsonl");
     writeFileSync(kaputt, "{kein json\n");
     alter(kaputt, AUFBEWAHRUNG_MS + 60_000);
-    expect(raeumeAlteVerlaeufe(site)).toBe(1);
+    expect((await raeumeAlteVerlaeufe(site)).geloescht).toBe(0);
+    expect(existsSync(kaputt)).toBe(true);
   });
 
-  test("fremde Dateien im Verzeichnis bleibt es fern", () => {
+  test("fremde Dateien im Verzeichnis bleibt es fern", async () => {
     const site = frischeSite();
     const fremd = join(verlaufDir(site), "notizen.txt");
     writeFileSync(fremd, "x");
     alter(fremd, AUFBEWAHRUNG_MS + 60_000);
-    expect(raeumeAlteVerlaeufe(site)).toBe(0);
+    expect((await raeumeAlteVerlaeufe(site)).geloescht).toBe(0);
     expect(existsSync(fremd)).toBe(true);
+  });
+
+  test("`uebrig` ist genau das, was die Liste danach zeigt", async () => {
+    /**
+     * `raeumeAlteVerlaeufe` gibt die Überlebenden mit heraus, damit der
+     * Laufstart die teure Liste nicht zweimal holt (pi liest dafür jede
+     * Sitzungsdatei ganz ein). Das ist nur brauchbar, wenn es WIRKLICH
+     * dieselbe Liste ist — sonst arbeitete der Lauf auf einem Stand, den
+     * niemand sonst sieht, und ein gelöschtes Gespräch würde fortgesetzt.
+     */
+    const site = frischeSite();
+    legeAltesGespraechAn(site, "zu alt", AUFBEWAHRUNG_MS + 60_000);
+    await Bun.sleep(5);
+    legeVerlaufAn(site, "bleibt");
+
+    const { geloescht, uebrig } = await raeumeAlteVerlaeufe(site);
+    expect(geloescht).toBe(1);
+    expect(uebrig.map((v) => v.titel)).toEqual(["bleibt"]);
+    // Und die frisch gelesene Liste sagt dasselbe.
+    expect((await listeVerlaeufe(site)).map((v) => v.titel)).toEqual(["bleibt"]);
+  });
+
+  test("ohne Verzeichnis ist es ein no-op", async () => {
+    const d = mkdtempSync(join(tmpdir(), "verlauf-leer-"));
+    dirs.push(d);
+    expect((await raeumeAlteVerlaeufe(d)).geloescht).toBe(0);
   });
 });
 
