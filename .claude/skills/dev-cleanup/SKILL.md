@@ -67,7 +67,7 @@ PATH=/usr/bin:/bin /tmp/regoro-bin init "$SITE" --email test@example.de
 PATH=/usr/bin:/bin /tmp/regoro-bin licenses | wc -c        # ~620.000, nicht 0
 PORT=18899 PATH=/usr/bin:/bin /tmp/regoro-bin run "$SITE" &  # run kennt KEIN --port
 curl -so /dev/null -w '%{http_code} %{size_download}\n' localhost:18899/edit-assets/overlay.js
-                                                            # 200 + ~116 KB, nicht 404
+                                                            # 200 und > 50 KB, nicht 404
 regoro service "$SITE" --systemd > /tmp/x.service && systemd-analyze verify /tmp/x.service
 ```
 
