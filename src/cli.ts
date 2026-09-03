@@ -95,12 +95,15 @@ Verwendung:
                                   dasselbe für den Sammelbetrieb
   regoro service --apparmor       AppArmor-Profil für bwrap ausgeben (nötig für
                                   die KI-Seitenleiste, siehe README)
-  regoro ki --key-stdin | --key-from-proxy [--model m] [--base-url u]
-            [--brave-key-stdin] | --list | --off
+  regoro ki --stdin | --key-from-proxy [--model m] [--base-url u]
+  regoro ki --list | --off
                                   Modellzugang der KI-Seitenleiste. Gilt
                                   BETREIBERWEIT für alle Kundenwebsites —
-                                  deshalb ohne Site-Argument. Der Schlüssel
-                                  kommt über die Standardeingabe, nie über argv.
+                                  deshalb ohne Site-Argument. Schlüssel kommen
+                                  über die Standardeingabe, nie über argv:
+                                  eine Zeile je Schlüssel, mit Präfix aus
+                                  modell, brave, firecrawl. Beispiel:
+                                    printf '%s\\n' "modell=$K" | regoro ki --stdin
   regoro integration <siteDir> <name> --base-url u --key-stdin
                      [--pfade "POST /v1/x"] [--browser-herkunft https://…]
   regoro integration <siteDir> --list | <name> --off
@@ -506,6 +509,79 @@ function lesGeheimnisse(bezeichnungen: string[]): string[] {
   return werte;
 }
 
+/**
+ * Zustand eines Neben-Schlüssels für `--list`. Zeigt NIE den Wert.
+ *
+ * Drei Zustände, nicht zwei: `null` heißt „nicht eingerichtet", der leere
+ * String heißt „eingerichtet, Schlüssel kommt von außen" (ein ausgehender Proxy
+ * setzt ihn ein). Die beiden zusammenzuwerfen hieße, dem Betreiber „nicht
+ * eingerichtet" zu zeigen für etwas, das funktioniert.
+ */
+function schluesselZustand(wert: string | null): string {
+  if (wert === null) return "nicht eingerichtet";
+  return wert === "" ? "eingerichtet (Schlüssel kommt von außen)" : "eingerichtet";
+}
+
+/** Die Schlüssel, die `regoro ki` über die Standardeingabe entgegennimmt. */
+const KI_SCHLUESSEL = ["modell", "brave", "firecrawl"] as const;
+type KiSchluessel = (typeof KI_SCHLUESSEL)[number];
+
+/**
+ * Liest die Schlüssel für `regoro ki` — **eine Zeile je Schlüssel, mit Präfix**:
+ *
+ *     printf '%s\n' "modell=$OPENROUTER" "brave=$BRAVE" | regoro ki --stdin
+ *
+ * Warum Präfixe und nicht die Reihenfolge: Bei zwei Schlüsseln in fester
+ * Reihenfolge trägt derjenige, der sie vertauscht, den Suchschlüssel als
+ * Modellschlüssel ein — und merkt es erst, wenn beides nicht funktioniert. Bei
+ * drei ist es unhaltbar. Mit Präfix ist die Eingabe selbstbeschreibend,
+ * reihenfolgeunabhängig, und ein fehlender Schlüssel fällt am fehlenden Präfix
+ * auf statt an einer zu kurzen Eingabe.
+ *
+ * Über die Standardeingabe und **nie über argv**: `/proc/<pid>/cmdline` ist auf
+ * diesem Host für jeden Prozess lesbar, und die Shell schreibt das Kommando
+ * zusätzlich in ihre History. Ein Schlüssel, der einmal in argv stand, ist
+ * verbrannt.
+ *
+ * Ein unbekanntes Präfix ist ein **Fehler**, kein stilles Überlesen: Sonst wäre
+ * ein Tippfehler wieder ein Schlüssel, der lautlos nicht ankommt.
+ */
+function lesKiSchluessel(): Map<KiSchluessel, string> {
+  const gefunden = new Map<KiSchluessel, string>();
+  const roh = readFileSync(0, "utf8");
+
+  for (const [nr, zeile] of roh.split("\n").entries()) {
+    const t = zeile.trim();
+    // Leerzeilen und Kommentare: erlaubt, damit sich die Eingabe auch aus einer
+    // Datei speisen lässt, in der steht, welcher Schlüssel wozu gehört.
+    if (t === "" || t.startsWith("#")) continue;
+
+    const gleich = t.indexOf("=");
+    if (gleich <= 0) {
+      fail(
+        `Zeile ${nr + 1} der Standardeingabe hat kein Präfix: ${t.slice(0, 12)}…\n` +
+          `  Erwartet wird je Zeile <name>=<schlüssel>, mit <name> aus: ${KI_SCHLUESSEL.join(", ")}.\n` +
+          `  Beispiel: printf '%s\\n' "modell=$SCHLUESSEL" | regoro ki --stdin`,
+      );
+    }
+    const name = t.slice(0, gleich).trim().toLowerCase();
+    if (!(KI_SCHLUESSEL as readonly string[]).includes(name)) {
+      fail(
+        `unbekannter Schlüsselname auf der Standardeingabe: ${name}\n` +
+          `  Erlaubt sind: ${KI_SCHLUESSEL.join(", ")}\n` +
+          "  (Ein Tippfehler soll auffallen, statt als stiller fehlender Schlüssel zu enden.)",
+      );
+    }
+    if (gefunden.has(name as KiSchluessel)) {
+      // Stillschweigend den letzten gewinnen zu lassen wäre genau die Sorte
+      // Falle, gegen die die Präfixe da sind.
+      fail(`der Schlüssel "${name}" steht mehrfach auf der Standardeingabe.`);
+    }
+    gefunden.set(name as KiSchluessel, t.slice(gleich + 1).trim());
+  }
+  return gefunden;
+}
+
 /** Wert eines Flags, oder undefined. */
 function flagWert(args: string[], name: string): string | undefined {
   const i = args.indexOf(name);
@@ -536,9 +612,8 @@ function flagWerte(args: string[], name: string): string[] {
  */
 function cmdKi(args: string[]): void {
   checkFlags("ki", args, [
-    "--key-stdin",
+    "--stdin",
     "--key-from-proxy",
-    "--brave-key-stdin",
     "--model",
     "--base-url",
     "--list",
@@ -584,7 +659,7 @@ function cmdKi(args: string[]): void {
       // Datei da, aber unbrauchbar. Für den Betrieb dasselbe wie „aus"
       // (fail-closed), für den Betreiber ein wichtiger Unterschied.
       console.log("  vorhanden, aber unbrauchbar — die KI ist aus.");
-      console.log("  Neu einrichten: printf '%s\\n' \"$SCHLUESSEL\" | regoro ki --key-stdin");
+      console.log("  Neu einrichten: printf '%s\\n' \"modell=$SCHLUESSEL\" | regoro ki --stdin");
       return;
     }
     console.log(`  Angelegt:   ${statSync(pfad).mtime.toISOString().slice(0, 10)}`);
@@ -593,51 +668,71 @@ function cmdKi(args: string[]): void {
     console.log(
       `  Schlüssel:  ${cfg.keyFromProxy ? "kommt vom ausgehenden Proxy" : "gesetzt"}`,
     );
-    console.log(`  Websuche:   ${cfg.braveKey ? "eingerichtet" : "nicht eingerichtet"}`);
+    console.log(`  Websuche:    ${schluesselZustand(cfg.braveKey)}`);
+    console.log(`  Seitenabruf: ${schluesselZustand(cfg.firecrawlKey)}`);
     return;
   }
 
-  const ausStdin = args.includes("--key-stdin");
+  const ausStdin = args.includes("--stdin");
   const vomProxy = args.includes("--key-from-proxy");
-  if (ausStdin && vomProxy) {
-    fail(
-      "--key-stdin und --key-from-proxy schließen sich aus.\n" +
-        "  Entweder liegt der Schlüssel hier, oder ein ausgehender Proxy hängt ihn an.",
-    );
-  }
   if (!ausStdin && !vomProxy) {
     fail(
       "kein Schlüssel angegeben.\n" +
-        "  Über die Standardeingabe:  printf '%s\\n' \"$SCHLUESSEL\" | regoro ki --key-stdin\n" +
+        "  Über die Standardeingabe, eine Zeile je Schlüssel:\n" +
+        `    printf '%s\\n' "modell=$SCHLUESSEL" "brave=$BRAVE" | regoro ki --stdin\n` +
+        `    (mögliche Namen: ${KI_SCHLUESSEL.join(", ")})\n` +
         "  Hängt ein ausgehender Proxy die Anmeldung an: regoro ki --key-from-proxy\n" +
         "  Ein Schlüssel als Kommandozeilen-Argument wird bewusst nicht angeboten —\n" +
         "  argv liest jeder Prozess dieses Hosts, und die Shell-History speichert ihn.",
     );
   }
 
-  const braveAusStdin = args.includes("--brave-key-stdin");
-  const bezeichnungen: string[] = [];
-  if (ausStdin) bezeichnungen.push("Modellschlüssel");
-  if (braveAusStdin) bezeichnungen.push("Brave-Suchschlüssel");
-  const gelesen = bezeichnungen.length > 0 ? lesGeheimnisse(bezeichnungen) : [];
+  const gelesen = ausStdin ? lesKiSchluessel() : new Map<KiSchluessel, string>();
+  const modell = gelesen.get("modell");
 
-  const apiKey = ausStdin ? gelesen.shift()! : "";
-  const braveKey = braveAusStdin ? gelesen.shift()! : null;
+  if (vomProxy && modell !== undefined) {
+    fail(
+      "--key-from-proxy und ein `modell=`-Schlüssel schließen sich aus.\n" +
+        "  Entweder liegt der Modellschlüssel hier, oder ein ausgehender Proxy hängt ihn an.",
+    );
+  }
+  if (!vomProxy && modell === undefined) {
+    fail(
+      "der Modellschlüssel fehlt auf der Standardeingabe.\n" +
+        `    printf '%s\\n' "modell=$SCHLUESSEL" | regoro ki --stdin\n` +
+        "  Ohne eigenen Schlüssel: regoro ki --key-from-proxy",
+    );
+  }
+  if (modell === "") {
+    // Leer heißt bei brave/firecrawl „Schlüssel kommt von außen"; beim Modell
+    // gibt es dafür einen eigenen Schalter. Ohne diese Prüfung entstünde eine
+    // Datei, die loadKiConfig wegen zu kurzem apiKey verwirft — die KI wäre
+    // nach dem Einrichten wortlos aus.
+    fail(
+      "`modell=` ohne Wert.\n" +
+        "  Soll ein ausgehender Proxy die Anmeldung anhängen: regoro ki --key-from-proxy",
+    );
+  }
 
   const cfg = {
-    apiKey,
+    apiKey: modell ?? "",
     keyFromProxy: vomProxy,
-    braveKey,
+    // Fehlt das Präfix, ist die Funktion nicht eingerichtet (null). Ein LEERER
+    // Wert ist etwas anderes und bleibt erhalten: „Funktion an, Schlüssel kommt
+    // von außen" — dieselbe Bedeutung, die loadKiConfig ihm gibt.
+    braveKey: gelesen.get("brave") ?? null,
+    firecrawlKey: gelesen.get("firecrawl") ?? null,
     baseUrl: flagWert(args, "--base-url") ?? STANDARD_BASE_URL,
     model: flagWert(args, "--model") ?? STANDARD_MODELL,
   };
   schreibeKiConfig(cfg, pfad);
 
   console.log(`Modellzugang geschrieben: ${pfad} (Mode 0600)`);
-  console.log(`  Modell:    ${cfg.model}`);
-  console.log(`  baseUrl:   ${cfg.baseUrl}`);
-  console.log(`  Schlüssel: ${vomProxy ? "kommt vom ausgehenden Proxy" : "gesetzt"}`);
-  console.log(`  Websuche:  ${braveKey ? "eingerichtet" : "nicht eingerichtet (--brave-key-stdin)"}`);
+  console.log(`  Modell:      ${cfg.model}`);
+  console.log(`  baseUrl:     ${cfg.baseUrl}`);
+  console.log(`  Schlüssel:   ${vomProxy ? "kommt vom ausgehenden Proxy" : "gesetzt"}`);
+  console.log(`  Websuche:    ${schluesselZustand(cfg.braveKey)}`);
+  console.log(`  Seitenabruf: ${schluesselZustand(cfg.firecrawlKey)}`);
   console.log("");
   console.log("Gilt betreiberweit — die Seitenleiste erscheint bei jeder Website mit Editor.");
   // Ohne diesen Satz sucht jemand den Fehler in der Konfiguration, während in
