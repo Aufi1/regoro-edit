@@ -19,7 +19,7 @@
  * die Attrappe, `braveKey` ist `null`, `baseUrl` zeigt ins Leere.
  */
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
-import { cpSync, existsSync, mkdtempSync, rmSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as host from "./host.ts";
@@ -542,6 +542,92 @@ describe("GET /edit/agent/events (echter Server)", () => {
     expect(rahmen.at(-1)!.event).toBe("fehler");
     expect(JSON.parse(rahmen.at(-1)!.data)).toHaveProperty("grund");
     expect(existsSync(join(site, "leistungen.html"))).toBe(false);
+  }, 40_000);
+
+  // =========================================================================
+  // Kein Schlüsselwort darf roh im Chatfenster landen
+  // =========================================================================
+  /**
+   * `agent.ts` liefert maschinenlesbare Gründe, `agentFehlerText` in `host.ts`
+   * übersetzt sie an der HTTP-Grenze (Contract §10). Der `default`-Zweig dort
+   * gibt den Grund aber UNVERÄNDERT zurück — ein Grund, den niemand in die
+   * Tabelle eingetragen hat, steht damit wörtlich im Chatfenster des Kunden.
+   *
+   * Das ist kein Gedankenspiel: Genau so stand schon einmal „worker-abgestuerzt"
+   * beim Kunden, bis Dev-Web den Fall nachgetragen hat. Die Kopplung liegt
+   * zwischen zwei Dateien und wird von nichts sonst erzwungen.
+   */
+  function schluesselwoerterAus(datei: string): string[] {
+    const quelle = readFileSync(join(REPO_ROOT, "src", datei), "utf8");
+    return [...quelle.matchAll(/grund\s*(?:\?\?=|=|:)\s*"([a-z][a-z-]*)"/g)].map((m) => m[1]!);
+  }
+
+  /** Ein roher Schlüssel: klein, mit Bindestrich, ohne Leerzeichen und Satzzeichen. */
+  const istSchluessel = (text: string): boolean => /^[a-z]+(-[a-z]+)*$/.test(text.trim());
+
+  test("jeder Grund aus agent.ts hat eine Übersetzung in host.ts", () => {
+    // Die Gründe des STARTS (laeuft-bereits, kontingent, keine-sandbox) laufen
+    // über die Statuscodes und haben dort eigene Sätze; die des Ereignisstroms
+    // müssen durch agentFehlerText.
+    const nurStart = new Set(["laeuft-bereits", "kontingent", "keine-sandbox"]);
+    const ausAgent = schluesselwoerterAus("agent.ts").filter((g) => !nurStart.has(g));
+    expect(ausAgent.length).toBeGreaterThan(3); // Voraussetzung: die Ernte hat geklappt
+
+    // NUR der Rumpf von agentFehlerText. host.ts hat weitere switch-Blöcke
+    // (etwa den für die Statuscodes des Starts); gegen die ganze Datei zu
+    // prüfen wäre zu großzügig — der Test wäre grün, weil das Schlüsselwort
+    // irgendwo anders vorkommt.
+    const host = readFileSync(join(REPO_ROOT, "src", "host.ts"), "utf8");
+    const beginn = host.indexOf("function agentFehlerText");
+    expect(beginn).toBeGreaterThan(0);
+    const rumpf = host.slice(beginn, host.indexOf("\n}", beginn));
+    const uebersetzt = new Set([...rumpf.matchAll(/case "([a-z][a-z-]*)":/g)].map((m) => m[1]!));
+    const fehlend = [...new Set(ausAgent)].filter((g) => !uebersetzt.has(g)).sort();
+    expect(fehlend).toEqual([]);
+  });
+
+  test.skipIf(!haveBwrap())("ein abgebrochener Lauf zeigt einen Satz, kein Schlüsselwort", async () => {
+    // Der häufigste Abbruch überhaupt: Der Kunde drückt auf „Abbrechen".
+    const { site, base, cookie: c } = await bootMitKi(KI);
+    starteLauf(ctxFuer(site), "warten", { workerBefehl: [process.execPath, "run", ATTRAPPE] });
+    await Bun.sleep(300);
+    brichAb(site);
+
+    const rahmen = await liesSse(`${base}/edit/agent/events`, { cookie: c });
+    const grund = JSON.parse(rahmen.at(-1)!.data).grund as string;
+    expect(`${grund}`).not.toBe("abgebrochen");
+    expect(istSchluessel(grund)).toBe(false);
+  }, 40_000);
+
+  test.skipIf(!haveBwrap())("`regoro disable` mitten im Lauf zeigt ebenfalls einen Satz", async () => {
+    // Der Zuhörer hängt VORHER dran — anders geht es gar nicht: `regoro disable`
+    // schließt die Route sofort (Kill-Switch), eine neue Verbindung bekäme 404.
+    // Genau so sieht es der Kunde: Seine Seitenleiste ist offen und läuft,
+    // während der Betreiber den Zugang entzieht.
+    const { site, base, cookie: c } = await bootMitKi(KI);
+    starteLauf(ctxFuer(site), "warten", { workerBefehl: [process.execPath, "run", ATTRAPPE] });
+
+    const antwort = await fetch(`${base}/edit/agent/events`, { headers: { cookie: c } });
+    expect(antwort.headers.get("content-type")).toContain("text/event-stream");
+    const leser = (antwort.body as ReadableStream<Uint8Array>).getReader();
+    await leser.read(); // ": verbunden"
+
+    rmSync(join(site, ".regoro"), { recursive: true, force: true });
+
+    let puffer = "";
+    const dec = new TextDecoder();
+    for (let i = 0; i < 40 && !puffer.includes("event: fehler"); i++) {
+      const { value, done } = await leser.read();
+      if (done) break;
+      puffer += dec.decode(value, { stream: true });
+    }
+    const { rahmen } = zerlegeSse(puffer);
+    const letzter = rahmen.at(-1);
+    expect(letzter?.event).toBe("fehler");
+    const grund = JSON.parse(letzter!.data).grund as string;
+    expect(`${grund}`).not.toBe("abgeschaltet");
+    expect(istSchluessel(grund)).toBe(false);
+    await leser.cancel();
   }, 40_000);
 
   test("unangemeldet liefert die Ereignisroute 404 und keinen Strom", async () => {
