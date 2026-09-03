@@ -22,7 +22,7 @@ import {
 import { maskiereKennung, normalisiereKennung, type Kanal } from "./kennung.ts";
 import { erzeugeCode, merkeCode, pruefeCode } from "./codes.ts";
 import { entsperreKennung, pruefeBremse, wartezeitText } from "./bremse.ts";
-import { listeVerlaeufe } from "./verlauf.ts";
+import { leseVerlauf, listeVerlaeufe } from "./verlauf.ts";
 import type { Versand } from "./versand.ts";
 import type { KiConfig } from "./betreiber-config.ts";
 import { renderEditView, renderVersionPreview } from "./serve.ts";
@@ -677,6 +677,7 @@ async function route(
       if (path === "/edit/agent" && method === "POST") return handleAgentStart(req, ctx);
       if (path === "/edit/agent/status" && method === "GET") return handleAgentStatus(ctx);
       if (path === "/edit/agent/verlaeufe" && method === "GET") return handleAgentVerlaeufe(ctx);
+      if (path === "/edit/agent/verlauf" && method === "GET") return handleAgentVerlauf(req, ctx);
       if (path === "/edit/agent/abort" && method === "POST") return handleAgentAbort(ctx);
       if (path === "/edit/agent/events" && method === "GET") return handleAgentEvents(req, ctx, srv);
       return notFound();
@@ -1060,6 +1061,26 @@ async function handleAgentVerlaeufe(ctx: HostCtx): Promise<Response> {
       nachrichten: v.nachrichten,
     })),
   });
+}
+
+/**
+ * Ein einzelner Verlauf mit seinen Nachrichten.
+ *
+ * Damit überlebt das Gespräch den SEITENWECHSEL: Der Editor läuft auf jeder
+ * Seite der Website neu an, das Panel-DOM ist dann leer — der Lauf und der
+ * Verlauf hängen aber am Site-Ordner, nicht an der Seite. Ohne diese Route sah
+ * der Kunde beim Wechsel ein leeres Fenster und die Meldung „Es läuft bereits
+ * ein Auftrag", als wäre er bei etwas Fremdem gelandet.
+ *
+ * Ohne `id` kommt der aktuelle (jüngster innerhalb der 24-Stunden-Frist). Ein
+ * fremder Bezeichner liefert eine leere Antwort, nie den Verlauf einer anderen
+ * Website — gesucht wird ausschließlich im Ordner dieser Site.
+ */
+async function handleAgentVerlauf(req: Request, ctx: HostCtx): Promise<Response> {
+  const id = new URL(req.url).searchParams.get("id");
+  const v = await leseVerlauf(ctx.siteDir, id);
+  if (!v) return Response.json({ ok: true, id: null, nachrichten: [] });
+  return Response.json({ ok: true, id: v.id, nachrichten: v.nachrichten });
 }
 
 async function handleAgentStart(req: Request, ctx: HostCtx): Promise<Response> {

@@ -215,3 +215,53 @@ export function raeumeAlteVerlaeufe(siteDir: string, jetzt: number = Date.now())
   }
   return weg;
 }
+
+export type VerlaufNachricht = { rolle: "kunde" | "agent"; text: string };
+
+/**
+ * Die Nachrichten eines Verlaufs, für die Anzeige in der Seitenleiste.
+ *
+ * NUR Text von Kunde und Assistent. Werkzeugaufrufe, Systemhinweise und
+ * Compaction-Zusammenfassungen bleiben draußen: Sie sind Maschinerie, und die
+ * Zusammenfassung enthält obendrein Dateipfade des Servers. Was der Kunde beim
+ * ersten Mal gesehen hat, soll er wiedersehen — nicht mehr.
+ *
+ * `id === null` heißt „der aktuelle", also der jüngste innerhalb der
+ * 24-Stunden-Frist. Ein unbekannter oder fremder Bezeichner liefert eine leere
+ * Liste, nie den Verlauf einer anderen Website: Gesucht wird ausschließlich in
+ * `verlaufDir(siteDir)`.
+ */
+export async function leseVerlauf(
+  siteDir: string,
+  id: string | null,
+  jetzt: number = Date.now(),
+): Promise<{ id: string; nachrichten: VerlaufNachricht[] } | null> {
+  const ziel = id === null ? await waehleFortsetzung(siteDir, jetzt) : (await listeVerlaeufe(siteDir)).find((v) => v.id === id) ?? null;
+  if (!ziel) return null;
+  let eintraege;
+  try {
+    eintraege = SessionManager.open(ziel.datei, verlaufDir(siteDir)).getEntries();
+  } catch {
+    return null;
+  }
+  const nachrichten: VerlaufNachricht[] = [];
+  for (const e of eintraege as { type?: string; message?: { role?: string; content?: unknown } }[]) {
+    if (e.type !== "message") continue;
+    const rolle = e.message?.role;
+    if (rolle !== "user" && rolle !== "assistant") continue;
+    const text = alsText(e.message?.content);
+    if (text === "") continue;
+    nachrichten.push({ rolle: rolle === "user" ? "kunde" : "agent", text });
+  }
+  return { id: ziel.id, nachrichten };
+}
+
+/** Inhalt einer Nachricht als reiner Text — pi erlaubt String oder Teile-Liste. */
+function alsText(inhalt: unknown): string {
+  if (typeof inhalt === "string") return inhalt.trim();
+  if (!Array.isArray(inhalt)) return "";
+  return inhalt
+    .map((t) => (t && typeof t === "object" && typeof (t as { text?: unknown }).text === "string" ? (t as { text: string }).text : ""))
+    .join("")
+    .trim();
+}

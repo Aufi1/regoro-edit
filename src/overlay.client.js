@@ -2304,6 +2304,34 @@
    * `nurKontingent` = nur die Anzeige auffrischen, nicht erneut anhängen
    * (sonst öffnete jeder Abschluss einen zweiten Strom auf sich selbst).
    */
+  /**
+   * Holt das bisherige Gespräch und stellt es in den Verlauf.
+   *
+   * DER GRUND IST DER SEITENWECHSEL. Der Editor läuft auf jeder Seite der
+   * Website neu an; das Panel-DOM ist dann leer. Lauf und Verlauf hängen aber
+   * am Site-Ordner, nicht an der Seite — es IST dasselbe Gespräch. Ohne diesen
+   * Aufruf sah der Kunde nach dem Wechsel ein leeres Fenster und hielt sein
+   * Gespräch für verloren.
+   *
+   * Fehler bleiben stumm: Ein nicht ladbarer Verlauf ist ärgerlich, aber kein
+   * Grund, die Seitenleiste unbrauchbar zu machen — neue Aufträge gehen weiter.
+   */
+  function ladeVerlauf() {
+    fetch("/edit/agent/verlauf", {
+      credentials: "same-origin",
+      headers: { "Accept": "application/json" }
+    }).then(function (r) { return r.ok ? r.json() : null; }).then(function (v) {
+      if (!agentPanel || !v || !v.nachrichten || !v.nachrichten.length) return;
+      for (var i = 0; i < v.nachrichten.length; i++) {
+        var n = v.nachrichten[i];
+        // `agentNachricht` setzt `textContent` — Kundentext wird nie als HTML
+        // eingesetzt. Wer das je auf innerHTML umstellt, muss maskieren.
+        agentNachricht(n.text, n.rolle === "kunde" ? "kunde" : "agent");
+      }
+      agentAnsEnde(true);
+    }).catch(function () {});
+  }
+
   function ladeAgentStatus(nurKontingent) {
     fetch("/edit/agent/status", {
       credentials: "same-origin",
@@ -2315,10 +2343,19 @@
       if (!agentPanel) return;                       // zwischenzeitlich geschlossen
       zeigeKontingent(st && st.kontingent);
       if (nurKontingent) return;
+      // Erst den bisherigen Verlauf zeigen, dann anhängen: Sonst stünden neue
+      // Ereignisse über alten Nachrichten.
+      ladeVerlauf();
       if (st && st.laeuft) {
-        // Ein Lauf ist schon unterwegs (Reload, zweiter Tab, anderes Gerät).
-        // Anhängen statt einen zweiten zu starten — der zweite bekäme 409.
-        agentNachricht("Es läuft bereits ein Auftrag für diese Website. Ich hänge mich an.", "agent");
+        // Ein Lauf ist schon unterwegs (Reload, Seitenwechsel, zweiter Tab,
+        // anderes Gerät). Anhängen statt einen zweiten zu starten — der zweite
+        // bekäme 409.
+        //
+        // KEINE MELDUNG MEHR DARÜBER. Sie stammte aus der Zeit, als der
+        // Seitenwechsel wie ein fremder Zustand aussah („Es läuft bereits ein
+        // Auftrag für diese Website. Ich hänge mich an."). Das Gespräch gilt
+        // für die ganze Website, nicht für eine Seite — beim Wechsel ist
+        // Weiterlaufen der Normalfall und braucht keinen Kommentar.
         verbindeStrom();
       } else {
         // Auch OHNE laufenden Auftrag anhängen: Der Server reicht den zuletzt

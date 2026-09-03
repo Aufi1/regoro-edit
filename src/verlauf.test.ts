@@ -25,6 +25,7 @@ import {
   uebernimmSitzung,
   verlaufDir,
   waehleFortsetzung,
+  leseVerlauf,
 } from "./verlauf.ts";
 
 const dirs: string[] = [];
@@ -256,5 +257,57 @@ describe("der Weg in die Arbeitskopie und zurück", () => {
     const liste = await listeVerlaeufe(site);
     expect(liste.length).toBe(1);
     expect(liste[0]!.titel).toBe("Wärmepumpen-Seite");
+  });
+});
+
+describe("den Verlauf wieder anzeigen — der Seitenwechsel", () => {
+  /**
+   * WOZU DAS DA IST. Der Editor läuft auf JEDER Seite der Website neu an; das
+   * Panel-DOM ist dann leer. Lauf und Verlauf hängen aber am Site-Ordner, nicht
+   * an der Seite — es ist dasselbe Gespräch. Ohne diese Funktion sah der Kunde
+   * nach einem Seitenwechsel ein leeres Fenster und hielt sein Gespräch für
+   * verloren.
+   */
+  function mitGespraech(site: string): void {
+    const sm = SessionManager.create(mkdtempSync(join(tmpdir(), "verlauf-cwd-")), verlaufDir(site));
+    sm.appendMessage({ role: "user", content: "Leg eine Seite über Wärmepumpen an." } as never);
+    sm.appendMessage({ role: "assistant", content: "Habe die Seite angelegt." } as never);
+    sm.appendMessage({ role: "user", content: "Mehr Inhalt bitte." } as never);
+    sm.appendMessage({ role: "assistant", content: "Erweitert." } as never);
+  }
+
+  test("beide Seiten des Gesprächs kommen in der richtigen Reihenfolge zurück", async () => {
+    const site = frischeSite();
+    mitGespraech(site);
+    const v = await leseVerlauf(site, null);
+    expect(v).not.toBeNull();
+    expect(v!.nachrichten.map((n) => n.rolle)).toEqual(["kunde", "agent", "kunde", "agent"]);
+    expect(v!.nachrichten[0]!.text).toBe("Leg eine Seite über Wärmepumpen an.");
+    expect(v!.nachrichten[3]!.text).toBe("Erweitert.");
+  });
+
+  test("ohne Gespräch: leer, nicht kaputt", async () => {
+    expect(await leseVerlauf(frischeSite(), null)).toBeNull();
+  });
+
+  test("ein fremder Bezeichner liefert nichts — nie den Verlauf einer anderen Website", async () => {
+    // Gesucht wird ausschließlich im Ordner DIESER Site. Die Trennung zwischen
+    // Kunden ruht im Sammelbetrieb auf genau solchen Stellen (Invariante 10).
+    const a = frischeSite();
+    const b = frischeSite();
+    mitGespraech(a);
+    const vonA = (await listeVerlaeufe(a))[0]!;
+    expect(await leseVerlauf(b, vonA.id)).toBeNull();
+  });
+
+  test("ein alter Verlauf wird nicht automatisch angezeigt, ist aber gezielt lesbar", async () => {
+    // Dieselbe Trennlinie wie bei `waehleFortsetzung`: „neuer Chat" heißt nicht
+    // „Verlauf weg".
+    const site = frischeSite();
+    mitGespraech(site);
+    const spaeter = Date.now() + NEUER_VERLAUF_NACH_MS + 1000;
+    expect(await leseVerlauf(site, null, spaeter)).toBeNull();
+    const id = (await listeVerlaeufe(site))[0]!.id;
+    expect((await leseVerlauf(site, id, spaeter))!.nachrichten.length).toBe(4);
   });
 });
