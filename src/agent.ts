@@ -733,6 +733,12 @@ function uebernehmen(ctx: HostCtx, kopie: string, integrationen: ReturnType<type
       siteDir: ctx.siteDir,
       browserHerkuenfte,
       anzahlBisher: i,
+      // Nur für die weichen Hinweise. Hier werden sie zwar verworfen — der Lauf
+      // ist vorbei, es hört niemand mehr zu —, aber der Wert gehört trotzdem
+      // dazu: Sonst urteilt diese Stelle über eine andere Wissensbasis als die
+      // Werkzeugprüfung während des Laufs, und ein solcher Unterschied fällt
+      // erst auf, wenn jemand die Hinweise hier eines Tages doch benutzt.
+      arbeitskopie: kopie,
     });
     if (!erg.ok) return { ok: false, grund: erg.grund };
 

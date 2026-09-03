@@ -748,6 +748,61 @@ describe("validate.ts — weiche Hinweise", () => {
   });
 });
 
+describe("validate.ts — eigenes CSS zu schreiben ist erlaubt und wird nicht bemängelt", () => {
+  // Eigener Helfer: Der gleichnamige weiter unten liegt in einem anderen
+  // `describe` und ist hier nicht in Reichweite. `bun test` hat das als drei
+  // inhaltliche Fehlschläge gemeldet — den wahren Grund nannte erst `tsc`.
+  function meldetKlasse(hinweise: string[], klasse: string): boolean {
+    return hinweise.some((h) => h.includes(`"${klasse}"`));
+  }
+
+  test("wer die Klasse im selben <style> definiert, bekommt KEINEN Hinweis", () => {
+    /**
+     * DER FEHLER, DEN DER AUFTRAGGEBER GEMELDET HAT. Der Hinweis lautete
+     * „gibt es in dieser Website nicht — sie bleibt ohne Wirkung", auch wenn
+     * der Agent die Regel im Kopf derselben Seite gerade selbst geschrieben
+     * hatte. Der Satz war schlicht falsch, und ein folgsames Modell nimmt
+     * daraufhin richtige Arbeit wieder heraus. Eigenes CSS ist erlaubt.
+     */
+    const inhalt = seite(
+      '<style>.produkt-tabelle{border-collapse:collapse}</style><table class="produkt-tabelle"><tr><td>x</td></tr></table>',
+    );
+    const e = pruefe("leistungen.html", inhalt);
+    expect(e.ok).toBe(true);
+    if (e.ok) expect(meldetKlasse(e.hinweise, "produkt-tabelle")).toBe(false);
+  });
+
+  test("Gegenprobe: OHNE Definition schlägt der Hinweis weiterhin an", () => {
+    // Ohne diesen Fall wäre der Test darüber auch dann grün, wenn die Prüfung
+    // gar nichts mehr meldete — dann hätten wir den Tippfehler-Fang verloren,
+    // statt ihn zu reparieren.
+    const e = pruefe("leistungen.html", seite('<table class="produkt-tabelle"><tr><td>x</td></tr></table>'));
+    expect(e.ok).toBe(true);
+    if (e.ok) expect(meldetKlasse(e.hinweise, "produkt-tabelle")).toBe(true);
+  });
+
+  test("Gegenprobe: eine BENUTZTE Klasse definiert sich nicht selbst", () => {
+    // Aus der geprüften Datei dürfen nur DEFINITIONEN zählen. Zählte auch das
+    // `class="…"`-Attribut, legitimierte sich jede erfundene Klasse selbst und
+    // der Hinweis könnte nie mehr anschlagen — genau das ist beim Bauen dieser
+    // Behebung einmal passiert und von vier Tests gefangen worden.
+    const e = pruefe("leistungen.html", seite('<div class="frei-erfunden"><p class="frei-erfunden">x</p></div>'));
+    expect(e.ok).toBe(true);
+    if (e.ok) expect(meldetKlasse(e.hinweise, "frei-erfunden")).toBe(true);
+  });
+
+  test("der Hinweis behauptet nicht mehr, die Klasse bleibe ohne Wirkung", () => {
+    // Die Formulierung ist der halbe Hinweis: Sie war im häufigsten Fall falsch.
+    const e = pruefe("leistungen.html", seite('<div class="frei-erfunden">x</div>'));
+    expect(e.ok).toBe(true);
+    if (e.ok) {
+      const text = e.hinweise.join(" ");
+      expect(text).not.toContain("ohne Wirkung");
+      expect(text).toContain("bisher nirgends definiert");
+    }
+  });
+});
+
 describe("validate.ts — das Wissen über eine Website gehört genau dieser Website", () => {
   // Die weichen Hinweise stammen aus dem CSS der Site. Wird dieses Wissen
   // zwischen Sites verwechselt, schweigt der Validator bei Kunde B über eine

@@ -45,6 +45,17 @@ export type ValidateKontext = {
   browserHerkuenfte: string[];
   /** Wie viele Dateien dieser Lauf schon geschrieben hat. */
   anzahlBisher: number;
+  /**
+   * Die Arbeitskopie dieses Laufs, falls vorhanden — NUR für weiche Hinweise.
+   *
+   * Ohne sie stammt das Wissen über vorhandene CSS-Klassen allein aus der
+   * LIVE-Site. Schreibt der Agent eine neue Klasse in `styles.css` und benutzt
+   * sie dann im HTML, kennt die Live-Site sie noch nicht — er bekam dann
+   * zurück, die Klasse „gibt es nicht, sie bleibt ohne Wirkung". Das war
+   * schlicht falsch, und ein folgsames Modell nimmt daraufhin richtige Arbeit
+   * wieder heraus.
+   */
+  arbeitskopie?: string;
 };
 
 export type ValidateErgebnis =
@@ -494,11 +505,32 @@ function jsVerstoesse(js: string, erlaubt: Set<string>): Verstoss[] {
 
 type SiteWissen = { klassen: Set<string>; farben: Set<string> };
 
-const wissenCache = new Map<string, SiteWissen>();
+/**
+ * Kurzlebiger Zwischenspeicher — bewusst mit Verfallszeit.
+ *
+ * Vorher lag das Wissen unbegrenzt im Speicher, und `leereSiteWissenCache()`
+ * wurde **ausschließlich von Tests** gerufen. Im Sammelbetrieb läuft der Prozess
+ * wochenlang: Die Klassenliste war damit ein Schnappschuss vom ersten Lauf nach
+ * dem Start, und jede seit dem übernommene CSS-Regel fehlte darin. Der Hinweis
+ * wurde also mit der Zeit immer falscher — genau in die Richtung, die den
+ * Agenten unnötig einschränkt.
+ *
+ * Eine Minute ist lang genug, damit ein Lauf nicht bei jeder Datei neu über die
+ * Website läuft, und kurz genug, dass eine Übernahme im nächsten Lauf zählt.
+ */
+const WISSEN_TTL_MS = 60_000;
+
+const wissenCache = new Map<string, { wissen: SiteWissen; zeit: number }>();
 
 /** Für Tests: verwirft das gemerkte Wissen über alle Sites. */
 export function leereSiteWissenCache(): void {
   wissenCache.clear();
+}
+
+/** Vereinigt zwei Wissensstände; `b` wird in `a` hineingeschrieben. */
+function ergaenze(a: SiteWissen, b: SiteWissen): void {
+  for (const k of b.klassen) a.klassen.add(k);
+  for (const f of b.farben) a.farben.add(f);
 }
 
 const KLASSEN_SELEKTOR_RE = /\.(-?[_a-zA-Z][\w-]*)/g;
@@ -555,9 +587,9 @@ function* dateienIn(wurzel: string, tiefe: number): Generator<string> {
  * Ergebnis wird gemerkt: Ein Lauf prüft bis zu 20 Dateien, und die Original-Site
  * ändert sich währenddessen nicht.
  */
-function siteWissen(siteDir: string): SiteWissen {
+function siteWissen(siteDir: string, jetzt: number = Date.now()): SiteWissen {
   const gemerkt = wissenCache.get(siteDir);
-  if (gemerkt) return gemerkt;
+  if (gemerkt && jetzt - gemerkt.zeit < WISSEN_TTL_MS) return gemerkt.wissen;
   const wissen: SiteWissen = { klassen: new Set(), farben: new Set() };
   for (const datei of dateienIn(siteDir, MAX_TIEFE)) {
     const ext = extname(datei).toLowerCase();
@@ -571,8 +603,40 @@ function siteWissen(siteDir: string): SiteWissen {
     if (ext === ".css") ernteCss(inhalt, wissen);
     else ernteHtml(inhalt, wissen);
   }
-  wissenCache.set(siteDir, wissen);
+  wissenCache.set(siteDir, { wissen, zeit: jetzt });
   return wissen;
+}
+
+/**
+ * Alles, was zum Zeitpunkt der Prüfung als „vorhanden" gelten darf.
+ *
+ * Drei Quellen, und alle drei waren nötig: die **Live-Site** (der Bestand), die
+ * **Arbeitskopie** (was dieser Lauf schon geschrieben hat) und die **Datei
+ * selbst** (ein `<style>` im Kopf derselben Seite, oder bei einer `.css` ihr
+ * eigener Inhalt). Fehlte eine davon, meldete der Hinweis eine Klasse als
+ * unbekannt, die der Agent gerade korrekt und vollständig eingeführt hatte.
+ */
+function wissenFuerHinweise(ktx: ValidateKontext, pfad: string, inhalt: string): SiteWissen {
+  const alles: SiteWissen = { klassen: new Set(), farben: new Set() };
+  ergaenze(alles, siteWissen(ktx.siteDir));
+  if (ktx.arbeitskopie) ergaenze(alles, siteWissen(ktx.arbeitskopie));
+  /**
+   * AUS DER GEPRÜFTEN DATEI ZÄHLEN NUR DEFINITIONEN, KEINE VERWENDUNGEN.
+   *
+   * `ernteHtml` sammelt auch `class="…"`-Attribute. Für den Bestand ist das
+   * richtig — eine Klasse, die quer über die Website benutzt wird, ist real.
+   * Für die Datei, über die gerade geurteilt wird, wäre es ein Zirkelschluss:
+   * Jede erfundene Klasse legitimierte sich selbst, und der Hinweis könnte nie
+   * mehr anschlagen. Gemessen an vier Tests, die genau das aufgedeckt haben.
+   *
+   * Definiert heißt: Es gibt eine CSS-Regel dafür — im `<style>`-Block dieser
+   * Seite oder, bei einer `.css`, in ihr selbst.
+   */
+  const eigen: SiteWissen = { klassen: new Set(), farben: new Set() };
+  if (extname(pfad).toLowerCase() === ".css") ernteCss(inhalt, eigen);
+  else for (const m of inhalt.matchAll(STYLE_BLOCK_RE)) ernteCss(m[1] ?? "", eigen);
+  ergaenze(alles, eigen);
+  return alles;
 }
 
 // ===========================================================================
@@ -753,7 +817,7 @@ function pruefeCss(
     alt === null ? [] : cssVerstoesse(alt, erlaubt),
   );
   if (neuerVerstoss) return nein(neuerVerstoss.grund);
-  return { ok: true, hinweise: farbHinweise(css, siteWissen(ktx.siteDir)) };
+  return { ok: true, hinweise: farbHinweise(css, wissenFuerHinweise(ktx, ".css", css)) };
 }
 
 // ===========================================================================
@@ -953,15 +1017,27 @@ function pruefeHtml(
   if (neuerSkriptVerstoss) return nein(neuerSkriptVerstoss.grund);
 
   // --- 7. Weiche Hinweise -------------------------------------------------
-  const wissen = siteWissen(ktx.siteDir);
+  const wissen = wissenFuerHinweise(ktx, ".html", neu);
   const hinweise: string[] = [];
   const gemeldet = new Set<string>();
   for (const el of docNeu.querySelectorAll("[class]")) {
     for (const name of String(el.getAttribute("class") ?? "").split(/\s+/)) {
       if (name === "" || wissen.klassen.has(name) || gemeldet.has(name)) continue;
       gemeldet.add(name);
+      /**
+       * DIE FORMULIERUNG IST DER HALBE HINWEIS. Hier stand „gibt es in dieser
+       * Website nicht — sie bleibt ohne Wirkung". Beides war im häufigsten Fall
+       * falsch: Wer eine Klasse neu einführt UND die Regel dazu schreibt, hat
+       * sehr wohl Wirkung. Ein Modell, das dem Satz glaubt, nimmt daraufhin
+       * richtige Arbeit wieder heraus.
+       *
+       * Eigenes CSS zu schreiben ist ausdrücklich erlaubt. Der Hinweis fängt
+       * jetzt nur noch, was er wirklich belegen kann — meist ein Tippfehler.
+       */
       hinweise.push(
-        `Die CSS-Klasse "${name}" gibt es in dieser Website nicht — sie bleibt ohne Wirkung. Vorhanden sind unter anderem: ${[...wissen.klassen].slice(0, 12).join(", ")}.`,
+        `Die CSS-Klasse "${name}" ist in dieser Website bisher nirgends definiert. ` +
+          `Wenn du sie neu einführst, schreib die Regel dazu; wenn du eine bestehende meintest: ` +
+          `vorhanden sind unter anderem ${[...wissen.klassen].slice(0, 12).join(", ")}.`,
       );
     }
   }
