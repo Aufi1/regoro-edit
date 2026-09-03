@@ -76,14 +76,15 @@ Ein einzelner Bun-Prozess, der eine **bestehende statische Website** ausliefert 
 ## Testen / Checks
 ```bash
 export PATH="$HOME/.bun/bin:$PATH"
+bun x tsc --noEmit       # ZUERST. Typecheck (tsconfig include: src/**/*.ts)
 bun test                 # ~1280 Tests (Fixtures kopieren examples/site in tmp-Dirs)
-bun x tsc --noEmit       # Typecheck (tsconfig include: src/**/*.ts)
 bun build src/overlay.client.js --target=browser >/dev/null   # Syntax-Check des Client-JS (tsc erfasst es NICHT)
 caddy validate --config Caddyfile.example --adapter caddyfile        # Proxy-Vorlage Einzelbetrieb
 caddy validate --config Caddyfile.multi.example --adapter caddyfile  # Proxy-Vorlage Sammelbetrieb
 bun scripts/gen-notices.ts --check   # Lizenzhinweise aktuell? (roter Release-Build sonst)
 bun build --compile src/cli.ts --outfile /tmp/regoro           # Binary — bricht bei Asset-Fehlern NICHT, erst zur Laufzeit
 ```
+- **`tsc` vor `bun test`, immer.** `bun test` **führt TypeScript aus, ohne es zu prüfen** — ein Typfehler ist für die Suite unsichtbar. Genau deshalb konnte `src/cli.ts` über mehrere Commits unübersetzbar sein, während alle Tests grün meldeten (das fehlende `firecrawlKey` im Objektliteral). Umgekehrt sind Testfehler nach einem gescheiterten Typecheck fast immer Folgefehler und kosten nur Lesezeit.
 - **Ein Nachweis, der nicht anschlagen kann, beweist durch sein Ausbleiben nichts.** An einem Tag dreimal dieselbe Fehlerklasse, jedes Mal an anderer Stelle und von jemand anderem gefunden:
   - `test.skipIf` wertet beim **Einsammeln** aus, vor jedem `beforeAll` — vier Binary-Tests waren dauerhaft übersprungen und meldeten **grün**.
   - Zwei `service.test.ts`-Zusicherungen nagelten die **kaputte** Form von `WorkingDirectory=` fest; deshalb erzeugte der dokumentierte Deploy-Weg nie eine startfähige Unit, und niemand sah es.

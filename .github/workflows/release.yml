@@ -68,10 +68,18 @@ jobs:
 
       # Die Checks aus CLAUDE.md. Ein Release, das die Suite nicht besteht,
       # soll gar nicht erst entstehen.
+      #
+      # `tsc` läuft ZUERST, und der Schritt bricht dort ab (GitHub Actions fährt
+      # `run:` als `bash -e`). Grund: **`bun test` führt TypeScript aus, ohne es
+      # zu prüfen.** Genau deshalb konnte `src/cli.ts` über mehrere Commits
+      # unübersetzbar sein, ohne dass ein einziger Test rot wurde — der
+      # Typfehler war für die Suite unsichtbar. Läuft die Suite danach trotzdem,
+      # kostet sie nur Lesezeit: Ihre Fehlschläge sind dann Folgefehler eines
+      # Problems, das eine Zeile weiter oben schon benannt war.
       - name: Checks
         run: |
-          bun test
           bun x tsc --noEmit
+          bun test
           bun build src/overlay.client.js --target=browser > /dev/null
           caddy validate --config Caddyfile.example --adapter caddyfile
           caddy validate --config Caddyfile.multi.example --adapter caddyfile
