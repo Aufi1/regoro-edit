@@ -1,5 +1,5 @@
 /**
- * `modell-info.ts` — das Kontextfenster beim Anbieter erfragen.
+ * `modell-info.ts` — Kontextfenster und Ausgabedeckel beim Anbieter erfragen.
  *
  * KEIN TEST DIESER DATEI GEHT INS NETZ. Der „Anbieter" ist ein lokaler Server,
  * der genau die Formen ausliefert, die draußen vorkommen — die Antwortform von
@@ -16,8 +16,9 @@ import { afterAll, describe, expect, test } from "bun:test";
 import type { KiConfig } from "./betreiber-config.ts";
 import {
   CACHE_TTL_MS,
+  GEWUENSCHTE_MAX_TOKENS,
   STANDARD_CONTEXT_WINDOW,
-  ermittleContextWindow,
+  ermittleModellGrenzen,
   leereModellCache,
 } from "./modell-info.ts";
 
@@ -76,24 +77,24 @@ describe("das Kontextfenster kommt vom Anbieter", () => {
     // 1.048.576 (top_provider), NICHT 1.310.720 (theoretisches Maximum). Die
     // größere Zahl anzunehmen hieße, Anfragen zu bauen, die abgelehnt werden.
     leereModellCache();
-    expect(await ermittleContextWindow(ki(anbieter(OPENROUTER)))).toBe(1_048_576);
+    expect((await ermittleModellGrenzen(ki(anbieter(OPENROUTER)))).contextWindow).toBe(1_048_576);
   });
 
   test("ohne top_provider zählt context_length", async () => {
     leereModellCache();
     const url = anbieter({ data: [{ id: "irgendein/modell", context_length: 262_144 }] });
-    expect(await ermittleContextWindow(ki(url, "irgendein/modell"))).toBe(262_144);
+    expect((await ermittleModellGrenzen(ki(url, "irgendein/modell"))).contextWindow).toBe(262_144);
   });
 
   test("vLLM meldet es als max_model_len", async () => {
     leereModellCache();
     const url = anbieter({ data: [{ id: "lokal/llama", max_model_len: 32_768 }] });
-    expect(await ermittleContextWindow(ki(url, "lokal/llama"))).toBe(32_768);
+    expect((await ermittleModellGrenzen(ki(url, "lokal/llama"))).contextWindow).toBe(32_768);
   });
 
   test("das RICHTIGE Modell aus der Liste, nicht das erste", async () => {
     leereModellCache();
-    expect(await ermittleContextWindow(ki(anbieter(OPENROUTER), "anthropic/claude-sonnet-5"))).toBe(200_000);
+    expect((await ermittleModellGrenzen(ki(anbieter(OPENROUTER), "anthropic/claude-sonnet-5"))).contextWindow).toBe(200_000);
   });
 });
 
@@ -115,7 +116,7 @@ describe("im Zweifel der Vorgabewert — ein Lauf scheitert hieran nie", () => {
     test(name, async () => {
       leereModellCache();
       const modell = name.includes("nicht in der Liste") ? "gibt-es/nicht" : "m";
-      expect(await ermittleContextWindow(ki(mach(), modell))).toBe(STANDARD_CONTEXT_WINDOW);
+      expect((await ermittleModellGrenzen(ki(mach(), modell))).contextWindow).toBe(STANDARD_CONTEXT_WINDOW);
     });
   }
 
@@ -124,9 +125,61 @@ describe("im Zweifel der Vorgabewert — ein Lauf scheitert hieran nie", () => {
     leereModellCache();
     const url = anbieter(OPENROUTER, { verzoegerungMs: 15_000 });
     const begonnen = Date.now();
-    expect(await ermittleContextWindow(ki(url))).toBe(STANDARD_CONTEXT_WINDOW);
+    expect((await ermittleModellGrenzen(ki(url))).contextWindow).toBe(STANDARD_CONTEXT_WINDOW);
     expect(Date.now() - begonnen).toBeLessThan(9_000);
   }, 20_000);
+});
+
+describe("der Ausgabedeckel", () => {
+  test("unser Wunsch, gedeckelt durch den Anbieter", async () => {
+    // OpenRouter meldet für dieses Modell 131.072 — weniger als unsere 150.000,
+    // also gewinnt der Anbieter. Ein strenger Server lehnt einen zu großen Wert
+    // ab; OpenRouter klemmt ihn still, gemessen. Wir verlassen uns auf keines
+    // von beiden.
+    leereModellCache();
+    const g = await ermittleModellGrenzen(ki(anbieter(OPENROUTER)));
+    expect(g.maxTokens).toBe(131_072);
+    expect(g.maxTokens).toBeLessThan(GEWUENSCHTE_MAX_TOKENS);
+  });
+
+  test("erlaubt der Anbieter mehr, gewinnt unser Wunsch", async () => {
+    // Der Deckel soll das Modell nicht formen, aber einen Ausreißer begrenzen:
+    // Eine einzelne Antwort darf nicht das halbe Monatskontingent verbrauchen.
+    leereModellCache();
+    const url = anbieter({
+      data: [{ id: "gross/modell", context_length: 2_000_000, top_provider: { max_completion_tokens: 900_000 } }],
+    });
+    const g = await ermittleModellGrenzen(ki(url, "gross/modell"));
+    expect(g.maxTokens).toBe(GEWUENSCHTE_MAX_TOKENS);
+  });
+
+  test("ohne Angabe des Anbieters deckelt das Kontextfenster", async () => {
+    // Die einzige Schranke, die sich aus dem Modell selbst ergibt: Eine Antwort
+    // kann nie größer sein als das, was hineinpasst.
+    leereModellCache();
+    const url = anbieter({ data: [{ id: "knapp/modell", max_model_len: 32_768 }] });
+    const g = await ermittleModellGrenzen(ki(url, "knapp/modell"));
+    expect(g.contextWindow).toBe(32_768);
+    expect(g.maxTokens).toBe(32_768);
+  });
+
+  test("ein kleiner Ausgabedeckel ist kein kaputter Wert", async () => {
+    // Für das Kontextfenster gilt eine Untergrenze (darunter ist die Angabe
+    // kaputt) — für die Ausgabe nicht: 4.096 sind ein kleines Modell, kein
+    // Fehler. Beides durch dieselbe Prüfung zu schicken, verwürfe den Wert.
+    leereModellCache();
+    const url = anbieter({
+      data: [{ id: "klein/modell", context_length: 128_000, max_completion_tokens: 4_096 }],
+    });
+    expect((await ermittleModellGrenzen(ki(url, "klein/modell"))).maxTokens).toBe(4_096);
+  });
+
+  test("ohne jede Auskunft gilt der Vorgabewert für beides", async () => {
+    leereModellCache();
+    const g = await ermittleModellGrenzen(ki("http://127.0.0.1:1/v1"));
+    expect(g.contextWindow).toBe(STANDARD_CONTEXT_WINDOW);
+    expect(g.maxTokens).toBe(STANDARD_CONTEXT_WINDOW);
+  });
 });
 
 describe("gefragt wird selten", () => {
@@ -134,8 +187,8 @@ describe("gefragt wird selten", () => {
     leereModellCache();
     const zaehler = { n: 0 };
     const k = ki(anbieter(OPENROUTER, { zaehler }));
-    expect(await ermittleContextWindow(k)).toBe(1_048_576);
-    expect(await ermittleContextWindow(k)).toBe(1_048_576);
+    expect((await ermittleModellGrenzen(k)).contextWindow).toBe(1_048_576);
+    expect((await ermittleModellGrenzen(k)).contextWindow).toBe(1_048_576);
     expect(zaehler.n).toBe(1);
   });
 
@@ -145,8 +198,8 @@ describe("gefragt wird selten", () => {
     leereModellCache();
     const zaehler = { n: 0 };
     const k = ki(anbieter(OPENROUTER, { zaehler }));
-    await ermittleContextWindow(k);
-    await ermittleContextWindow(k, Date.now() + CACHE_TTL_MS + 1);
+    await ermittleModellGrenzen(k);
+    await ermittleModellGrenzen(k, Date.now() + CACHE_TTL_MS + 1);
     expect(zaehler.n).toBe(2);
   });
 
@@ -154,15 +207,15 @@ describe("gefragt wird selten", () => {
     leereModellCache();
     const zaehler = { n: 0 };
     const k = ki(anbieter({}, { status: 404, zaehler }));
-    expect(await ermittleContextWindow(k)).toBe(STANDARD_CONTEXT_WINDOW);
-    expect(await ermittleContextWindow(k)).toBe(STANDARD_CONTEXT_WINDOW);
+    expect((await ermittleModellGrenzen(k)).contextWindow).toBe(STANDARD_CONTEXT_WINDOW);
+    expect((await ermittleModellGrenzen(k)).contextWindow).toBe(STANDARD_CONTEXT_WINDOW);
     expect(zaehler.n).toBe(1);
   });
 
   test("verschiedene Modelle am selben Anbieter werden getrennt gemerkt", async () => {
     leereModellCache();
     const url = anbieter(OPENROUTER);
-    expect(await ermittleContextWindow(ki(url, "z-ai/glm-5.3-flash"))).toBe(1_048_576);
-    expect(await ermittleContextWindow(ki(url, "anthropic/claude-sonnet-5"))).toBe(200_000);
+    expect((await ermittleModellGrenzen(ki(url, "z-ai/glm-5.3-flash"))).contextWindow).toBe(1_048_576);
+    expect((await ermittleModellGrenzen(ki(url, "anthropic/claude-sonnet-5"))).contextWindow).toBe(200_000);
   });
 });

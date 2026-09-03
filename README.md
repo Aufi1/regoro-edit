@@ -354,6 +354,13 @@ Kontextfenster des Modells. Regoro **fragt es beim Anbieter ab** (`GET
 gemerkt. Antwortet der Anbieter nicht oder kennt er die Route nicht, gelten
 128.000 Token und der Lauf startet trotzdem.
 
+Dieselbe Abfrage liefert, wie lang **eine einzelne Antwort** sein darf. Regoro
+verlangt bis zu 150.000 Token, gedeckelt durch das, was der Anbieter zulässt
+(bei `glm-5.3-flash` sind das 131.072). Das ist bewusst reichlich: Der Deckel
+soll das Modell nicht formen, sondern nur einen Ausreißer begrenzen — die
+Argumente eines Werkzeugaufrufs zählen mit, eine neu geschriebene Seite geht also
+vollständig durch diese Grenze.
+
 Ist das Fenster voll, verdichtet der Agent das Gespräch selbst: Er fasst den
 älteren Teil zusammen und arbeitet damit weiter. Das kostet einen zusätzlichen
 Modellaufruf, wird aber **nicht** ins Monatskontingent gebucht — der Deckel ist

@@ -236,7 +236,17 @@ export async function runWorker(): Promise<void> {
          * immer".
          */
         contextWindow: Number(process.env.REGORO_CONTEXT_WINDOW) || 128_000,
-        maxTokens: 16_384,
+        /**
+         * Wie lang EINE Antwort sein darf — ebenfalls vom Elternprozess.
+         *
+         * Auf der Leitung nachgemessen: Dieser Wert geht als
+         * `max_completion_tokens` wirklich an den Anbieter. 16.384 standen hier
+         * fest und waren an zwei Stellen zugleich zu knapp — Werkzeug-Argumente
+         * sind Ausgabe (`write_file` übergibt die ganze Datei, 16.384 Token
+         * sind grob 55–60 KB HTML), und pi stutzt das Denk-Budget auf denselben
+         * Deckel zurecht. Begründung und Messung: `modell-info.ts`.
+         */
+        maxTokens: Number(process.env.REGORO_MAX_TOKENS) || 16_384,
       },
     ],
   });

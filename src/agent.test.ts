@@ -599,7 +599,9 @@ describe("das Kontextfenster erreicht den Arbeiter", () => {
       port: 0,
       fetch(req) {
         if (!new URL(req.url).pathname.endsWith("/models")) return new Response("nein", { status: 404 });
-        return Response.json({ data: [{ id: modell, top_provider: { context_length: fenster } }] });
+        return Response.json({
+          data: [{ id: modell, top_provider: { context_length: fenster, max_completion_tokens: 131_072 } }],
+        });
       },
     });
     anbieterServer.push(s);
@@ -625,10 +627,13 @@ describe("das Kontextfenster erreicht den Arbeiter", () => {
     return (JSON.parse(text) as { env: Record<string, string> }).env;
   }
 
-  test.skipIf(!haveBwrap())("die gemeldete Zahl landet in REGORO_CONTEXT_WINDOW", async () => {
+  test.skipIf(!haveBwrap())("die gemeldeten Zahlen landen in der Umgebung", async () => {
     const modell = "test/grosses-modell";
     const env = await umgebungMit({ ...KI, baseUrl: anbieter(modell, 1_048_576), model: modell });
     expect(env.REGORO_CONTEXT_WINDOW).toBe("1048576");
+    // Der Anbieter meldet 131.072 als Ausgabemaximum — weniger als unser
+    // Wunsch, also gewinnt er.
+    expect(env.REGORO_MAX_TOKENS).toBe("131072");
   }, 30_000);
 
   test.skipIf(!haveBwrap())("ein toter Anbieter gibt den Vorgabewert — der Lauf startet trotzdem", async () => {

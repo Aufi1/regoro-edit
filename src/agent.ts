@@ -42,7 +42,7 @@ import {
   uebernimmSitzung,
   waehleAus,
 } from "./verlauf.ts";
-import { ermittleContextWindow } from "./modell-info.ts";
+import { ermittleModellGrenzen, type ModellGrenzen } from "./modell-info.ts";
 import { pruefeKontingent, verbucheTokens } from "./kontingent.ts";
 import { validateAgentOutput } from "./validate.ts";
 import { alleBrowserHerkuenfte, loadIntegrationen } from "./integrationen.ts";
@@ -323,19 +323,19 @@ async function fuehreAus(ctx: HostCtx, auftrag: string, opts: StartOptionen, lau
     }
 
     /**
-     * Das Kontextfenster des Modells beim Anbieter erfragen.
+     * Erfragen, was das Modell darf — Kontextfenster und Ausgabedeckel.
      *
      * Vor dem Relay und vor dem Arbeiter: Der Elternprozess darf ins Netz, der
-     * Arbeiter nicht (Invariante 11). Scheitert die Abfrage, gilt der
-     * Vorgabewert — sie ist eine Stellschraube, keine Voraussetzung, und darf
+     * Arbeiter nicht (Invariante 11). Scheitert die Abfrage, gelten die
+     * Vorgabewerte — sie ist eine Stellschraube, keine Voraussetzung, und darf
      * einen Auftrag nie verhindern. Das Ergebnis wird je Modell für Stunden
      * gemerkt, ein Lauf wartet also im Regelfall auf gar nichts.
      */
-    const contextWindow = await ermittleContextWindow(ki);
+    const grenzen = await ermittleModellGrenzen(ki);
 
     relay = starteRelay(ki, integrationen);
 
-    const ergebnis = await begleiteWorker(ctx, auftrag, opts, lauf, kopie, relay.port, ki, integrationen, kontingent.frei, sitzungDatei, contextWindow);
+    const ergebnis = await begleiteWorker(ctx, auftrag, opts, lauf, kopie, relay.port, ki, integrationen, kontingent.frei, sitzungDatei, grenzen);
     geseheneTokens = ergebnis.tokens;
 
     if (!ergebnis.sauberFertig) {
@@ -424,7 +424,7 @@ async function begleiteWorker(
   integrationen: ReturnType<typeof loadIntegrationen>,
   freiesKontingent: number,
   sitzungDatei: string | null,
-  contextWindow: number,
+  grenzen: ModellGrenzen,
 ): Promise<WorkerErgebnis> {
   const skills = process.env.REGORO_SKILLS || null;
   const befehl = opts.workerBefehl ?? standardWorkerBefehl();
@@ -448,7 +448,7 @@ async function begleiteWorker(
     // OpenRouter-Schlüssel ein: Erbte der Worker HTTP_PROXY, gelänge ein
     // Modellaufruf AM RELAY VORBEI — und ein kaputtes Relay fiele niemandem auf,
     // weil weiterhin alles funktionierte.
-    env: workerUmgebung(auftrag, kopie, skills, relayPort, ki, integrationen, freiesKontingent, sitzungDatei, contextWindow),
+    env: workerUmgebung(auftrag, kopie, skills, relayPort, ki, integrationen, freiesKontingent, sitzungDatei, grenzen),
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
@@ -711,7 +711,7 @@ function workerUmgebung(
   integrationen: ReturnType<typeof loadIntegrationen>,
   freiesKontingent: number,
   sitzungDatei: string | null,
-  contextWindow: number,
+  grenzen: ModellGrenzen,
 ): Record<string, string> {
   // pi schriebe sonst nach ~/.pi/agent/: Sitzungen samt vollem Kundenauftrag
   // und einen Auth-Speicher. Beides zeigt in die Arbeitskopie, die mit dem Lauf
@@ -745,7 +745,8 @@ function workerUmgebung(
     REGORO_SITZUNG_DIR: sitzungDirInKopie(kopie),
     REGORO_SITZUNG_DATEI: sitzungDatei ?? "",
     // Beim Anbieter erfragt, nicht geraten — siehe `modell-info.ts`.
-    REGORO_CONTEXT_WINDOW: String(contextWindow),
+    REGORO_CONTEXT_WINDOW: String(grenzen.contextWindow),
+    REGORO_MAX_TOKENS: String(grenzen.maxTokens),
   };
 }
 
