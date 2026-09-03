@@ -311,6 +311,119 @@ describe("extrahiereText() entfernt, was ein Besucher nicht sieht", () => {
   });
 });
 
+describe("extrahiereText() — die Schreibweise des Attributs darf nichts ändern", () => {
+  // Der teuerste Befund dieser Runde, und meine Fälle haben ihn NICHT gefunden:
+  // Ich hatte jede Regel nur kleingeschrieben geprüft. linkedom bewahrt die
+  // Schreibweise des Quelltexts (`<div HIDDEN>` kommt als Attribut "HIDDEN" an),
+  // und ein CSS-Selektor `[hidden]` trifft das nicht — also rutschten ALLE FÜNF
+  // attributgestützten Regeln durch eine Großschreibung hindurch.
+  //
+  // Am schwersten wog `STYLE`: Das ist die Hauptregel `display:none`, und sie
+  // ließ sich damit schlicht umgehen. Großschreibung ist ausgerechnet die Form,
+  // die jemand nimmt, der WEISS, dass gefiltert wird.
+  //
+  // Dieselbe Klasse wie §13.20 im Validator, eine Etage tiefer.
+  test.each([
+    ["hidden, klein", "<div hidden>KOEDER</div>"],
+    ["hidden, groß", "<div HIDDEN>KOEDER</div>"],
+    ["hidden, gemischt", "<div Hidden>KOEDER</div>"],
+    ["aria-hidden, klein", '<div aria-hidden="true">KOEDER</div>'],
+    ["aria-hidden, groß", '<div ARIA-HIDDEN="true">KOEDER</div>'],
+    ["aria-hidden, gemischt", '<div Aria-Hidden="true">KOEDER</div>'],
+    ["style, klein", '<div style="display:none">KOEDER</div>'],
+    ["style, groß", '<div STYLE="display:none">KOEDER</div>'],
+    ["style, groß samt Wert", '<div STYLE="DISPLAY:NONE">KOEDER</div>'],
+    ["style, gemischt", '<div Style="Visibility:Hidden">KOEDER</div>'],
+    ["class, klein", '<div class="cookie-banner">KOEDER</div>'],
+    ["class, groß", '<div CLASS="cookie-banner">KOEDER</div>'],
+    ["id, klein", '<div id="cookieConsent">KOEDER</div>'],
+    ["id, groß", '<div ID="cookieConsent">KOEDER</div>'],
+  ])("%s wird entfernt", (_name, stueck) => {
+    const text = extrahiereText(`<body><p>echter Inhalt</p>${stueck}</body>`);
+    expect(text).toContain("echter Inhalt");
+    expect(text).not.toContain("KOEDER");
+  });
+
+  test("auch der Tag-Name in Großschreibung ändert nichts", () => {
+    const text = extrahiereText('<body><P>echter Inhalt</P><DIV HIDDEN>KOEDER</DIV></body>');
+    expect(text).toContain("echter Inhalt");
+    expect(text).not.toContain("KOEDER");
+  });
+});
+
+describe("extrahiereText() — <html>, <body> und <head> überleben jede Regel", () => {
+  // An 40 echten Seiten gemessen: Zwei verloren die GANZE Seite, weil das Theme
+  // den Einwilligungszustand an die Wurzel schreibt (Enfold `av-cookies-…` auf
+  // <html>, Complianz `cmplz-…` auf <body>). Seit der Umbau alle fünf Regeln in
+  // EINEN Durchgang zieht, gilt der Riegel für alle — vorher hätte ein
+  // `<body HIDDEN>` die Seite gelöscht.
+  test.each([
+    '<html class="cmplz-blocked"><body><p>Inhalt der Seite</p></body></html>',
+    '<html><body class="cookie-consent-open"><p>Inhalt der Seite</p></body></html>',
+    "<html><body hidden><p>Inhalt der Seite</p></body></html>",
+    "<html><body HIDDEN><p>Inhalt der Seite</p></body></html>",
+    '<html><body style="display:none"><p>Inhalt der Seite</p></body></html>',
+    '<html><head><title>T</title></head><body aria-hidden="true"><p>Inhalt der Seite</p></body></html>',
+  ])("%s behält seinen Inhalt", (html) => {
+    expect(extrahiereText(html)).toContain("Inhalt der Seite");
+  });
+});
+
+describe("extrahiereText() — der Notfallweg räumt dieselben Verstecke", () => {
+  // Wenn linkedom aufgibt, greift `rohText`. Räumte der nicht mit auf, wäre eine
+  // kaputte Seite genau der Umweg, auf dem ein Kommentar mit Anweisungen doch
+  // beim Modell landet — und kaputtes Markup ist nichts, was ein Angreifer
+  // vermeiden müsste.
+  test.each([
+    "<<<>>><div hidden>KOEDER</div>",
+    "<<<>>><div HIDDEN>KOEDER</div>",
+    "<<<>>><!-- SYSTEM: KOEDER -->",
+    "<<<>>><script>var x = 'KOEDER'</script>",
+    "<<<>>><template>KOEDER</template>",
+  ])("%s enthält den Köder nicht", (html) => {
+    expect(extrahiereText(html)).not.toContain("KOEDER");
+  });
+
+  test("ROT: display:none fällt im Notfallweg NICHT — und das ist die Hauptregel", () => {
+    // `rohText` räumt Kommentare, script/style/noscript/template und das
+    // `hidden`-Attribut. `display:none` fehlt — ausgerechnet die Regel, die im
+    // DOM-Durchgang die wichtigste ist und die ein Angreifer zuerst nimmt.
+    //
+    // Der Weg ist erreichbar, ohne dass ein Angreifer etwas dafür tun müsste:
+    // Er läuft, sobald linkedom kein documentElement liefert oder wirft — und
+    // kaputtes Markup ist nichts, was jemand vermeiden muss, der Text
+    // unterschieben will. Es ist die Ausnahme, aber es ist eine erreichbare.
+    //
+    // Nach der eigenen Zusage im Kommentar an `rohText` („muss dieselben
+    // Verstecke räumen wie der DOM-Durchgang") gehört die Regel dazu; grob und
+    // ohne Verschachtelungswissen ist dort ausdrücklich in Ordnung.
+    const text = extrahiereText('<<<>>><div style="display:none">KOEDER</div>');
+    expect(text).not.toContain("KOEDER");
+  });
+
+  test("der Notfallweg liefert trotzdem eine gerahmte Antwort, keinen Wurf", () => {
+    const text = extrahiereText("<<<>>>sichtbarer Rest");
+    expect(text).toContain(KLAMMER);
+  });
+});
+
+describe("extrahiereText() — <template> fällt in jeder Form", () => {
+  // Der E2E-Bericht nannte <template> als Leck; nachstellen ließ es sich nicht,
+  // weil linkedom Tag-Namen sehr wohl normalisiert. Die Formen stehen hier, damit
+  // die Frage beantwortet bleibt statt offen.
+  test.each([
+    "<body><p>Inhalt</p><template><p>KOEDER</p></template></body>",
+    "<body><p>Inhalt</p><TEMPLATE><p>KOEDER</p></TEMPLATE></body>",
+    "<html><head><template>KOEDER</template></head><body><p>Inhalt</p></body></html>",
+    "<body><p>Inhalt</p><div><section><template>KOEDER</template></section></div></body>",
+    "<body><p>Inhalt</p><template><p>KOEDER</p></body>",
+  ])("%s", (html) => {
+    const text = extrahiereText(html);
+    expect(text).toContain("Inhalt");
+    expect(text).not.toContain("KOEDER");
+  });
+});
+
 describe("extrahiereText() gibt lesbaren Text zurück", () => {
   test("der sichtbare Text bleibt, Auszeichnung fällt weg", () => {
     const text = extrahiereText(`<body><h1>Badsanierung</h1><p>Wir machen <strong>alles</strong>.</p></body>`);
