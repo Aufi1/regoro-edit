@@ -143,6 +143,29 @@ const FAELLE: Record<string, Fall> = {
     ],
   },
 
+  "kontingent-sprengen": {
+    tun: "Leiste öffnen, irgendeinen Auftrag abschicken.",
+    erwartung:
+      "Der Lauf arbeitet erst (Werkzeugzeile), dann reißt das Kontingent. Danach MUSS " +
+      "dreierlei zugleich stimmen: eine Fehlerblase mit dem Grund, die Kontingentzeile " +
+      "auf „aufgebraucht“ EINGEFÄRBT, und „Auftrag geben“ GESPERRT. Ein Kunde, der hier " +
+      "noch einmal klicken kann, läuft in eine 429.",
+    ki: true,
+    auftrag: true,
+    pruefung: `JSON.stringify({werkzeuge:${Q.werkzeuge},fehler:document.querySelectorAll('.__regoro-afehler').length,eingefaerbt:document.querySelector('.__regoro-aquota').className.indexOf('aleer')>-1,gesperrt:${Q.gesperrt}})`,
+    sollwert: '{"werkzeuge":1,"fehler":1,"eingefaerbt":true,"gesperrt":true}',
+    // Entspricht dem Attrappen-Szenario `kontingent-sprengen`. Die Reihenfolge
+    // ist der Punkt: ohne vorangegangene Arbeit gäbe es keinen Übergang zu sehen.
+    // `frei: 0` und nicht negativ — der Server klammert mit Math.max(0, …).
+    ereignisse: [
+      rahmen("werkzeug", { name: "write_file", kurz: "schreibt leistungen.html" }),
+      rahmen("tokens", { gesamt: 999_999_999, frei: 0 }),
+      rahmen("fehler", {
+        grund: "Das Monatskontingent ist mitten im Auftrag aufgebraucht. Es wurde nichts geändert; am Monatsersten geht es weiter.",
+      }),
+    ],
+  },
+
   "ohne-ki": {
     tun: "Seite laden, die obere Leiste ansehen.",
     erwartung:
@@ -233,6 +256,8 @@ function fallAusCookie(req: Request): string {
  * Fall „nie ein Lauf" wäre nicht prüfbar.
  */
 let auftragLaeuft = false;
+/** Hat der Lauf sein Kontingent gesprengt? Dann meldet der Status danach „leer". */
+let kontingentWeg = false;
 
 Bun.serve({
   port: PORT,
@@ -256,11 +281,14 @@ Bun.serve({
       });
     }
     if (pfad.endsWith("/edit/agent/status")) {
+      // Nach einem gesprengten Kontingent meldet der echte Server „erschöpft" —
+      // der Prüfstand muss das nachbilden, sonst prüft der Fall eine Lüge.
+      const leer = erschoepft || (fallName === "kontingent-sprengen" && kontingentWeg);
       return Response.json({
         ok: true,
         laeuft: false,
         laufId: null,
-        kontingent: erschoepft
+        kontingent: leer
           ? { frei: 0, gesamt: 200_000, erschoepft: true, monat: "2026-09" }
           : { frei: 198_766, gesamt: 200_000, erschoepft: false, monat: "2026-09" },
       });
@@ -281,10 +309,12 @@ Bun.serve({
         return strom([rahmen("fehler", { grund: "Kein Lauf aktiv." })]);
       }
       auftragLaeuft = false;
+      if (fallName === "kontingent-sprengen") kontingentWeg = true;
       return strom(fall.ereignisse);
     }
     if (seitenAufruf) {
       auftragLaeuft = false; // frische Seite, frischer Zustand
+      kontingentWeg = false;
       return new Response(seite(erschoepft ? true : fall.ki), {
         headers: {
           "Content-Type": "text/html; charset=utf-8",
