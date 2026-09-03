@@ -962,7 +962,7 @@ export function agentFehlerText(grund: string): string {
   if (trenner > 0 && UEBERNAHME_ABLEHNUNGEN.has(grund.slice(0, trenner))) {
     console.error(`[regoro] Übernahme abgelehnt: ${grund}`);
     return (
-      "Die Sicherheitsprüfung hat die Änderung nicht übernommen — nichts geändert."
+      "Die Sicherheitsprüfung hat die Änderung nicht übernommen."
     );
   }
 
@@ -972,12 +972,12 @@ export function agentFehlerText(grund: string): string {
     case "kein-modellzugang":
       return "Der KI-Assistent ist nicht eingerichtet.";
     case "lauf-gescheitert":
-      return "Auftrag fehlgeschlagen — nichts geändert.";
+      return "Auftrag fehlgeschlagen.";
     case "worker-abgestuerzt":
       // Nachgemessen: Ohne diesen Fall stand wörtlich „worker-abgestuerzt" im
       // Chatfenster des Kunden. Was schiefging, gehört ins Log des Betreibers;
       // der Kunde braucht zu wissen, dass seine Website unberührt ist.
-      return "Der Assistent hat sich unerwartet beendet — nichts geändert.";
+      return "Der Assistent hat sich unerwartet beendet.";
     case "kontingent-erschoepft":
       /**
        * ZWEI WÖRTER, UND DAS IST ABSICHT. Die Kontingentleiste steht direkt
@@ -986,14 +986,17 @@ export function agentFehlerText(grund: string): string {
        * wiederholen hieße, dieselbe Aussage zweimal zu führen — und zwei
        * Quellen für eine Aussage laufen früher oder später auseinander.
        *
-       * Auch die Entwarnung („nichts geändert") fehlt bewusst, anders als bei
-       * den übrigen Meldungen: Dort ist der Chat die einzige Quelle, hier nicht.
+       * Die Entwarnung („nichts geändert") fehlt hier wie überall sonst — so
+       * vom Betreiber entschieden, nachdem der Einwand vorlag. Sie stand in
+       * fast jeder Meldung und machte alle lang; ein abgebrochener Lauf ändert
+       * ohnehin nichts, weil die Übernahme erst nach sauberem Abschluss läuft.
+       * Wer sie zurückholt, holt sie an EINER Stelle zurück, nicht in sieben.
        */
       return "Kontingent aufgebraucht.";
     case "abgebrochen":
       // Der meistbenutzte Weg überhaupt — der Abbrechen-Knopf. Ohne diesen Fall
       // stand dort ein rotes Feld mit dem Wort „abgebrochen".
-      return "Abgebrochen — nichts geändert.";
+      return "Auftrag abgebrochen.";
     case "abgeschaltet":
       return "Der Zugang wurde vom Betreiber beendet.";
     default:
@@ -1016,7 +1019,7 @@ export function agentFehlerText(grund: string): string {
        */
       if (istEigenerKlartext(grund)) return grund;
       console.error(`[regoro] Agentenlauf gescheitert: ${grund}`);
-      return "Der Assistent ist gerade nicht verfügbar — an der Website wurde nichts geändert.";
+      return "Der Assistent ist gerade nicht verfügbar.";
   }
 }
 

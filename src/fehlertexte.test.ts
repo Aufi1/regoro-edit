@@ -146,8 +146,8 @@ describe("jeder Grund aus agent.ts wird übersetzt", () => {
     expect(text).not.toContain("http");
     expect(text).not.toContain("{");
     expect(text).not.toContain("402");
-    // Und was der Kunde wirklich wissen muss.
-    expect(text).toContain("Website");
+    // Und ein lesbarer deutscher Satz bleibt es.
+    expect(text).toMatch(/^[A-ZÄÖÜ][^{}"<>]*[.!?]$/);
   });
 
   test("Gegenprobe: der Filter schluckt nicht einfach alles", () => {
