@@ -28,6 +28,7 @@ import {
   BRAVE_BASIS,
   FIRECRAWL_BASIS,
   RECHERCHE_UA,
+  INTERN,
   pruefeZieladresse,
   extrahiereText,
   holeSeite,
@@ -108,17 +109,120 @@ describe("pruefeZieladresse() weist ab, was kein http-Ziel ist", () => {
   });
 });
 
-describe("pruefeZieladresse() — was sie ausdrücklich NICHT mehr tut", () => {
-  // Mit dem Wechsel auf Firecrawl holt nicht mehr unser Host, sondern deren
-  // Infrastruktur. Damit ist die IP-Sperre gegenstandslos: `127.0.0.1` zeigt von
-  // dort nicht auf unser Relay, und `169.254.169.254` nicht auf unsere Metadaten.
+describe("pruefeZieladresse() weist interne Adressen ab — als Kostenschutz, NICHT als SSRF-Abwehr", () => {
+  // Der Grund ist ausdrücklich ein anderer als früher, damit es beim nächsten
+  // Lesen niemand für einen Rückfall hält: Seit Firecrawl holt, steht unser Host
+  // nicht mehr im Pfad, und die SSRF-Frage ist gegenstandslos. Geblieben sind
+  // zwei kleinere Anliegen: Eine intern aussehende Adresse soll nicht zu einem
+  // DRITTEN wandern (192.168.178.10 ist hier ein echter Heim-Server), und jeder
+  // Müllabruf kostet eine Credit.
+  test.each([
+    "http://127.0.0.1/x",
+    "http://127.0.0.1:8788/edit",
+    "http://127.0.0.53/x",
+    "http://127.1/x",
+    "http://2130706433/x",
+    "http://0x7f000001/x",
+    "http://0177.0.0.1/x",
+    "http://localhost/x",
+    "https://LOCALHOST/x",
+    "http://localhost./x",
+    "http://0.0.0.0/x",
+    "http://[::1]/x",
+    "http://[::]/x",
+    "http://[::ffff:127.0.0.1]/x",
+    "http://10.0.0.1/x",
+    "http://192.168.178.10/x",
+    "http://172.16.0.1/x",
+    "http://172.31.255.255/x",
+    "http://169.254.169.254/latest/meta-data/",
+    "http://[fe80::1]/x",
+    "http://[fe80::1%25eth0]/x",
+    "http://[fc00::1]/x",
+    "http://[fd12:3456::1]/x",
+    "http://100.64.0.1/x",
+    "http://kunde.localhost/x",
+    "http://drucker.local/x",
+    "http://api.internal/x",
+    "http://ding.home.arpa/x",
+    "http://host.localdomain/x",
+  ])("%s wird abgewiesen", (url) => {
+    expect(pruefeZieladresse(url)).toBe(INTERN);
+  });
+
+  test("die Grenzen der privaten Blöcke stimmen in beide Richtungen", () => {
+    expect(pruefeZieladresse("http://172.32.0.1/x")).toBeNull();
+    expect(pruefeZieladresse("http://172.15.255.255/x")).toBeNull();
+    expect(pruefeZieladresse("http://100.128.0.1/x")).toBeNull();
+    expect(pruefeZieladresse("https://8.8.8.8/x")).toBeNull();
+    expect(pruefeZieladresse("https://[2606:4700:4700::1111]/x")).toBeNull();
+  });
+
+  test("für eine interne Adresse geht KEINE Anfrage raus — sie kostet also nichts", async () => {
+    // Das ist die Zusicherung, die den Kostengrund trägt. Der Wurf allein sagt
+    // nicht, ob vorher schon etwas rausging.
+    const s = attrappe();
+    try {
+      for (const url of ["http://127.0.0.1:45678/modell/models", "http://192.168.178.10/", "http://169.254.169.254/"]) {
+        await expect(holeSeite(url, "fc-x", s.basis)).rejects.toThrow(INTERN);
+      }
+      expect(s.empfangen.length).toBe(0);
+    } finally {
+      s.stop();
+    }
+  });
+});
+
+describe("pruefeZieladresse() — die Ablehnungsgründe bleiben unterscheidbar", () => {
+  // Dev-Netz' Hinweis, und er trifft: Liefe eines Tages wieder alles über
+  // denselben Wortlaut, wäre das das Zeichen, dass jemand die beiden Anliegen
+  // — Kostenschutz und Schemaprüfung — wieder vermischt hat. Ein einziger
+  // Wortlaut wäre außerdem für den Agenten unbrauchbar: Er soll wissen, ob er
+  // die Adresse korrigieren kann oder ob sie grundsätzlich nicht geht.
+  test("intern, Schema, Zugangsdaten, leer und unbrauchbar sind fünf verschiedene Sätze", () => {
+    const gruende = [
+      pruefeZieladresse("http://127.0.0.1/x"),
+      pruefeZieladresse("file:///etc/passwd"),
+      pruefeZieladresse("https://nutzer:geheim@example.de/x"),
+      pruefeZieladresse(""),
+      pruefeZieladresse("keine-url"),
+    ];
+    expect(gruende.every((g) => g !== null)).toBe(true);
+    expect(new Set(gruende).size).toBe(5);
+  });
+
+  test("aber ALLE internen Adressen teilen sich einen Wortlaut", () => {
+    // Andersherum als bei den Gründen: Verschiedene Meldungen für Loopback,
+    // privat und link-local wären eine Landkarte, die der Agent durch
+    // Ausprobieren zeichnet.
+    const meldungen = new Set(
+      ["http://127.0.0.1/x", "http://10.0.0.1/x", "http://169.254.169.254/x", "http://[::1]/x", "http://x.local/y"].map(
+        (u) => pruefeZieladresse(u),
+      ),
+    );
+    expect(meldungen.size).toBe(1);
+    expect([...meldungen][0]).toBe(INTERN);
+  });
+
+  test("die interne Meldung nennt weder Adresse noch Port", () => {
+    const m = pruefeZieladresse("http://127.0.0.1:45678/modell/models")!;
+    expect(m).not.toContain("45678");
+    expect(m).not.toContain("127.0.0.1");
+    expect(m.length).toBeLessThan(200);
+  });
+});
+
+describe("pruefeZieladresse() — was ausdrücklich NICHT zurückgekommen ist", () => {
+  // Zurück ist nur, was man dem URL-TEXT ansieht. NICHT zurück sind
+  // DNS-Auflösung, die Anheftung an die aufgelöste Adresse und die Prüfung je
+  // Weiterleitungssprung. Das ist Absicht und kein Loch: Von außen erreicht
+  // Firecrawl einen intern auflösenden Namen ohnehin nicht.
   //
-  // Diese Tests stehen hier, damit die Entscheidung SICHTBAR ist. Kehrt der
-  // Abruf je in den eigenen Prozess zurück, werden sie rot — und genau dann
-  // müssen IP-Sperre, Auflösungs-Anheftung und Prüfung je Weiterleitungssprung
-  // zurückkommen, sonst liest der Agent über `fetch_page` das eigene Relay aus.
-  test("private und lokale Adressen werden hier nicht mehr gesperrt", () => {
-    for (const url of ["http://127.0.0.1:45678/modell/models", "http://169.254.169.254/", "http://192.168.178.10/"]) {
+  // Der Test hält den IST-Zustand fest. Wird er rot, hat jemand die Auflösung
+  // wieder eingebaut — dann gehören Anheftung und Sprungprüfung mit dazu, sonst
+  // ist es die halbe Maßnahme, die nur so aussieht wie die ganze.
+  test("ein Name, der erst per DNS auf etwas Internes zeigt, kommt durch", () => {
+    for (const url of ["http://nas.beispiel-firma.de/", "https://intranet.beispiel-firma.de/x"]) {
       expect(pruefeZieladresse(url)).toBeNull();
     }
   });
