@@ -143,6 +143,25 @@ function cspZeile(browserHerkuenfte: string[] = []): string {
 }
 
 /**
+ * Spiegelt `X-Content-Type-Options` aus SECURITY_HEADERS (host.ts) in den
+ * statischen Zweig. In Produktion liefert Caddy die Website direkt aus, der
+ * Bun-Host ist dafür gar nicht im Pfad — ohne diese Zeile gilt die Zusicherung
+ * nur für Editor-Antworten und nicht für das, was der Besucher sieht.
+ *
+ * Wogegen: ein Polyglot-Asset mit gültiger Bild-Signatur und eingebettetem
+ * HTML/JS. Für `.txt`, `.xml`, Bilder und Schriften fällt der Validator
+ * ausdrücklich kein Inhaltsurteil, der Agent darf sie also frei befüllen.
+ *
+ * DIE BEIDEN ANDEREN HEADER AUS SECURITY_HEADERS GEHÖREN HIER NICHT HER — sie
+ * gelten dem Editor, nicht der Website, und wären hier ein echter Schaden:
+ *   - `X-Robots-Tag: noindex, nofollow` nähme jede Kundenwebsite aus dem Index.
+ *   - `Cache-Control: no-store` verböte jedes Zwischenspeichern der Seite.
+ * „Header-Parität" ist deshalb das falsche Ziel; gespiegelt wird, was den
+ * ausgelieferten INHALT absichert, nicht was den Editor privat hält.
+ */
+const NOSNIFF_ZEILE = 'header X-Content-Type-Options "nosniff"';
+
+/**
  * Begründung für `flush_interval -1`, wörtlich gleich in beiden Blöcken und in
  * beiden Vorlagen.
  *
@@ -452,6 +471,7 @@ ${SSE_KOMMENTAR}
     handle @allowed {
         root * ${caddyQuote(o.siteDir)}
         ${cspZeile(o.browserHerkuenfte)}
+        ${NOSNIFF_ZEILE}
         file_server
     }
 
@@ -579,7 +599,7 @@ function cspZweigeMulti(o: ServiceOpts): string {
     .sort(([a], [b]) => a.localeCompare(b));
 
   if (jeHost.length === 0) {
-    return `        ${cspZeile(o.browserHerkuenfte)}\n        file_server`;
+    return `        ${cspZeile(o.browserHerkuenfte)}\n        ${NOSNIFF_ZEILE}\n        file_server`;
   }
 
   const zweige = jeHost.map(([host, herkuenfte]) => {
@@ -594,7 +614,8 @@ function cspZweigeMulti(o: ServiceOpts): string {
         }`;
   });
 
-  return `        # Domains mit eigenen Browser-Herkünften (regoro integration).
+  return `        ${NOSNIFF_ZEILE}
+        # Domains mit eigenen Browser-Herkünften (regoro integration).
         # Nach jeder Änderung an den Integrationen neu erzeugen und Caddy
         # nachladen — sonst lädt der eingebaute Knopf beim Kunden nicht.
 ${zweige.join("\n")}

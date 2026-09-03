@@ -100,6 +100,17 @@ https:// {
         # Inline-Skripte aus; ohne das wären bestehende Kundenseiten kaputt.
         header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'none'; form-action 'self'; frame-src 'none'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'"
 
+        # Spiegelt X-Content-Type-Options aus SECURITY_HEADERS (src/host.ts) in
+        # den statischen Zweig: In Produktion liefert Caddy die Website direkt
+        # aus, der Bun-Host ist dafür gar nicht im Pfad. Wogegen: ein
+        # Polyglot-Asset mit gültiger Bild-Signatur und eingebettetem HTML/JS.
+        #
+        # Die beiden ANDEREN Header aus SECURITY_HEADERS gehören hier NICHT her
+        # — sie gelten dem Editor und wären hier ein Schaden:
+        # `X-Robots-Tag: noindex` nähme die Website aus dem Index,
+        # `Cache-Control: no-store` verböte jedes Zwischenspeichern.
+        header X-Content-Type-Options "nosniff"
+
         file_server
     }
 
