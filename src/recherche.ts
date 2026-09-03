@@ -329,6 +329,9 @@ function zeichensatz(res: Response): string {
 const BANNER_KENNUNG =
   /cookie|consent|cmplz|borlabs|usercentrics|cookiebot|klaro|onetrust|didomi|trustarc|gdpr/i;
 
+/** Trägt die Seite, kann also nie das Banner sein. Siehe die Schleife unten. */
+const STRUKTUR_TAGS = new Set(["HTML", "BODY", "HEAD"]);
+
 /** Inline-Stile, die etwas unsichtbar machen. Nur das Attribut, kein Kaskaden-Wissen. */
 const UNSICHTBAR_STIL = /(?:^|;)\s*(?:display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0(?:\.0*)?)\s*(?:;|$)/i;
 
@@ -379,6 +382,13 @@ export function extrahiereText(html: string): string {
     // deshalb draußen. Zu viel zu entfernen kostet hier nichts an Sicherheit —
     // die Richtung ist dieselbe wie beim Entfernen unsichtbarer Elemente.
     for (const el of dokument.querySelectorAll("[id], [class]")) {
+      // <html>, <body> und <head> NIE entfernen, egal was in der Klasse steht.
+      // An 40 echten Seiten gemessen: zwei verloren so die GANZE Seite, weil das
+      // Theme den Einwilligungszustand an die Wurzel schreibt — Enfold setzt
+      // `av-cookies-…` auf <html>, Complianz `cmplz-…` auf <body>. Ein Banner ist
+      // nie das Wurzelelement; ohne diesen Riegel schlägt die Regel vom Aufräumen
+      // in Totalverlust um, und zwar lautlos.
+      if (STRUKTUR_TAGS.has(el.tagName ?? "")) continue;
       const kennung = `${el.getAttribute("id") ?? ""} ${el.getAttribute("class") ?? ""}`;
       if (BANNER_KENNUNG.test(kennung)) el.remove();
     }
