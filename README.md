@@ -264,9 +264,11 @@ Alternativ per Docker – siehe `Dockerfile` (Site als Volume mounten; `init` ei
 | `PORT` | `8788` | Port des Editor-Servers |
 | `EDITOR_INSECURE_COOKIE` | *(nicht gesetzt)* | `=1` lässt das `Secure`-Cookie-Flag weg. Nur nötig, wenn du den Editor über **HTTP unter einem anderen Namen als `localhost`** erreichst (LAN-IP, Hostname). **Nie in Produktion.** |
 
-> **`http://localhost` braucht das nicht.** Browser behandeln `localhost` als vertrauenswürdigen Kontext und akzeptieren `Secure`-Cookies auch über HTTP. `regoro run` genügt.
+> **`http://localhost` braucht das nicht.** Browser behandeln `localhost` als vertrauenswürdigen Kontext und akzeptieren `Secure`-Cookies auch über HTTP. `regoro run` genügt. **Auch `curl` nicht** (8.5 nachgemessen): Es speichert und sendet das `Secure`-Cookie auf Loopback. Wer die Cookie-Datei ansieht und sie für leer hält, ist auf `#HttpOnly_`-Zeilen hereingefallen — die stehen dort mit Rautenzeichen und sehen aus wie Kommentare.
 >
 > Über einen anderen Hostnamen ohne TLS verwirft der Browser das Cookie dagegen **stumm** — man meldet sich an und landet wieder auf dem Login. Die Login-Seite warnt in diesem Fall vor und nennt beide Auswege.
+>
+> **Der Schalter ist gefährlicher, als er aussieht — nicht nur wegen des fehlenden `Secure`:** Ohne `Secure` fällt auch das **`__Host-`-Präfix** weg (der Browser verwürfe das Cookie sonst). Ein Durchlauf mit dem Schalter prüft also **nicht mehr den Cookie, der in Produktion ausgeliefert wird**. Wer damit eine Anmeldung testet, hat die Schutzwirkung des Präfixes nicht mitgetestet. Deshalb: beim Ausprobieren weglassen, wo er nicht wirklich nötig ist.
 
 ## KI-Seitenleiste
 
