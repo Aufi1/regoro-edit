@@ -23,6 +23,14 @@
  * Danach die ausgegebenen Adressen im Browser öffnen und gegen die genannte
  * Erwartung prüfen. Die Leiste öffnet sich über den Knopf „KI-Assistent“; wo
  * ein Auftrag nötig ist, steht es beim jeweiligen Fall.
+ *
+ * MASCHINELL statt von Hand: Das Skript druckt je Fall einen fertigen Aufruf
+ * für den headless-Browser aus gstack (`~/.claude/skills/gstack/browse`, in
+ * CLAUDE.md im Testabschnitt genannt) samt Sollwert. Der Treiber liegt
+ * AUSSERHALB des Repos und ist bewusst KEINE Abhängigkeit — er ist auf den
+ * Entwicklungsmaschinen da, nicht in der CI. Genau deshalb ist das hier ein
+ * Werkzeug und keine `*.test.ts`: Ein Test, der überall außer auf einer
+ * Maschine übersprungen wird, sieht wie Abdeckung aus und ist keine.
  */
 import { join } from "node:path";
 
@@ -43,7 +51,24 @@ interface Fall {
   ki: boolean;
   /** Die Ereignisfolge, die `/edit/agent/events` ausliefert. */
   ereignisse: string[];
+  /** Muss vor der Prüfung ein Auftrag abgeschickt werden? */
+  auftrag?: boolean;
+  /** JS-Ausdruck, im Browser ausgewertet — liefert das Prüfergebnis als JSON. */
+  pruefung: string;
+  /** Was dieser Ausdruck liefern MUSS. */
+  sollwert: string;
 }
+
+/** Kurzform für die immer gleichen Abfragen im Prüfausdruck. */
+const Q = {
+  gruen: "document.querySelectorAll('.__regoro-afertig').length",
+  blasen: "document.querySelectorAll('#__regoro-agent .__regoro-anachricht').length",
+  werkzeuge: "document.querySelectorAll('.__regoro-awerkzeug').length",
+  reload:
+    "!!Array.from(document.querySelectorAll('#__regoro-agent button'))" +
+    ".find(b=>b.textContent==='Seite neu laden')",
+  gesperrt: "document.querySelector('.__regoro-asenden').disabled",
+};
 
 const FAELLE: Record<string, Fall> = {
   "mit-dateien": {
@@ -52,6 +77,9 @@ const FAELLE: Record<string, Fall> = {
       "Grüne Abschlussblase mit der Liste „index.html“ und einem Knopf „Seite neu laden“. " +
       "Der gestreamte Text und die Zusammenfassung stehen NUR EINMAL da, nicht zweimal.",
     ki: true,
+    auftrag: true,
+    pruefung: `JSON.stringify({gruen:${Q.gruen},dateien:Array.from(document.querySelectorAll('.__regoro-adateien li')).map(l=>l.textContent),reload:${Q.reload},blasen:${Q.blasen}})`,
+    sollwert: '{"gruen":1,"dateien":["index.html"],"reload":true,"blasen":2}',
     ereignisse: [
       rahmen("werkzeug", { name: "write_file", kurz: "schreibt index.html" }),
       // Absichtlich in Stücke zerlegt: Das Modell streamt Token für Token —
@@ -77,6 +105,12 @@ const FAELLE: Record<string, Fall> = {
       "zu versuchen. (Ein Abschluss ohne geänderte Dateien ist kein Erfolg — genau hier " +
       "meldete die Leiste einmal „Der Auftrag wurde bearbeitet.“, während nichts passiert war.)",
     ki: true,
+    auftrag: true,
+    pruefung: `JSON.stringify({gruen:${Q.gruen},reload:${Q.reload},warnung:(document.querySelector('#__regoro-agent .__regoro-anachricht .__regoro-awarn')||{}).textContent})`,
+    sollwert: '{"gruen":0,"reload":false,"warnung":"An der Website wurde nichts geändert."}',
+    // Entspricht dem Attrappen-Szenario `nichts-tun`: Der Agent hält den Wunsch
+    // für erfüllt und meldet fertig, ohne etwas zu schreiben. Der häufige Fall,
+    // nicht der konstruierte.
     ereignisse: [
       rahmen("fertig", { zusammenfassung: "Der Auftrag wurde bearbeitet.", dateien: [], commit: null }),
     ],
@@ -89,6 +123,8 @@ const FAELLE: Record<string, Fall> = {
       "„Kein Lauf aktiv.“ ist die Abwesenheit einer Nachricht, kein Fehler — wer die " +
       "Leiste zum ersten Mal öffnet, hat nichts falsch gemacht.",
     ki: true,
+    pruefung: `JSON.stringify({blasen:${Q.blasen},fehler:document.querySelectorAll('.__regoro-afehler').length,gesperrt:${Q.gesperrt}})`,
+    sollwert: '{"blasen":0,"fehler":0,"gesperrt":false}',
     ereignisse: [rahmen("fehler", { grund: "Kein Lauf aktiv." })],
   },
 
@@ -99,6 +135,8 @@ const FAELLE: Record<string, Fall> = {
       "Grund. (Ohne das versucht es der Kunde nach einem Reload noch einmal und bezahlt " +
       "denselben Fehlschlag zweimal.)",
     ki: true,
+    pruefung: `JSON.stringify({werkzeuge:${Q.werkzeuge},fehler:(document.querySelector('.__regoro-afehler')||{}).textContent})`,
+    sollwert: '{"werkzeuge":1,"fehler":"Die Datei enthält ein neues Inline-Skript."}',
     ereignisse: [
       rahmen("werkzeug", { name: "write_file", kurz: "schreibt leistungen.html" }),
       rahmen("fehler", { grund: "Die Datei enthält ein neues Inline-Skript." }),
@@ -111,6 +149,11 @@ const FAELLE: Record<string, Fall> = {
       "KEIN Knopf „KI-Assistent“ und kein `#__regoro-agent` im DOM — die Seitenleiste " +
       "existiert ohne Modellzugang gar nicht. Der übrige Editor funktioniert unverändert.",
     ki: false,
+    pruefung:
+      "JSON.stringify({knopf:!!Array.from(document.querySelectorAll('#__regoro-bar button'))" +
+      ".find(b=>b.textContent==='KI-Assistent'),panel:!!document.querySelector('#__regoro-agent')," +
+      "leiste:!!document.querySelector('#__regoro-bar')})",
+    sollwert: '{"knopf":false,"panel":false,"leiste":true}',
     ereignisse: [],
   },
 };
@@ -256,17 +299,39 @@ Bun.serve({
 
 const basis = `http://localhost:${PORT}`;
 console.log(`Prüfstand für die KI-Seitenleiste läuft auf ${basis}\n`);
-for (const [name, fall] of Object.entries(FAELLE)) {
+const BROWSE = "~/.claude/skills/gstack/browse/dist/browse";
+const OEFFNEN =
+  "js \"var b=Array.from(document.querySelectorAll('#__regoro-bar button'))" +
+  ".find(x=>x.textContent==='KI-Assistent'); if(b)b.click()\"";
+const ABSCHICKEN =
+  "js \"document.querySelector('.__regoro-aeingabe').value='mach was';" +
+  " document.querySelector('.__regoro-asenden').click()\"";
+
+function anleitung(name: string, fall: Fall): void {
   console.log(`── ${name} ──`);
   console.log(`   ${basis}/${name}/edit`);
   console.log(`   Tun:       ${fall.tun}`);
-  console.log(`   Erwartung: ${fall.erwartung}\n`);
+  console.log(`   Erwartung: ${fall.erwartung}`);
+  console.log("   Maschinell:");
+  console.log(`     B=${BROWSE}`);
+  console.log(`     $B goto ${basis}/${name}/edit`);
+  if (fall.ki) console.log(`     $B ${OEFFNEN}`);
+  if (fall.auftrag) console.log(`     $B ${ABSCHICKEN}`);
+  console.log("     sleep 3");
+  console.log(`     $B js "${fall.pruefung.replace(/"/g, '\\"')}"`);
+  console.log(`   Sollwert:  ${fall.sollwert}\n`);
 }
-console.log(`── ${ERSCHOEPFT} ──`);
-console.log(`   ${basis}/${ERSCHOEPFT}/edit`);
-console.log("   Tun:       Nur die Leiste öffnen.");
-console.log(
-  "   Erwartung: Die Kontingentzeile ist eingefärbt und nennt den Monatsersten, und\n" +
-    "              „Auftrag geben“ ist GESPERRT — der Kunde läuft gar nicht erst hinein.\n",
-);
+
+for (const [name, fall] of Object.entries(FAELLE)) anleitung(name, fall);
+anleitung(ERSCHOEPFT, {
+  tun: "Nur die Leiste öffnen.",
+  erwartung:
+    "Die Kontingentzeile ist eingefärbt und nennt den Monatsersten, und „Auftrag geben“ " +
+    "ist GESPERRT — der Kunde läuft gar nicht erst hinein. Die Sperre muss das Ende des " +
+    "Ereignisstroms ÜBERLEBEN: Genau dort gab sie einmal wieder frei.",
+  ki: true,
+  pruefung: `JSON.stringify({eingefaerbt:document.querySelector('.__regoro-aquota').className.indexOf('aleer')>-1,gesperrt:${Q.gesperrt}})`,
+  sollwert: '{"eingefaerbt":true,"gesperrt":true}',
+  ereignisse: [],
+});
 console.log("Beenden mit Strg+C.");
