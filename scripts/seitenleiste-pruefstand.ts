@@ -20,6 +20,21 @@
  *   bun scripts/seitenleiste-pruefstand.ts            # Port 8794
  *   PORT=9000 bun scripts/seitenleiste-pruefstand.ts
  *
+ * VORHER NACHSEHEN, WAS SCHON LÄUFT:
+ *   ss -lptnH "sport = :8794"      # wer hält den Port?
+ *   pgrep -af "cli.ts run"         # laufende Editor-Server
+ * Ein zweiter Prozess auf demselben Port startet NICHT, und ein Browser, der
+ * trotzdem antwortet, wird von der alten Fassung bedient. Zweimal passiert:
+ * Beide Male hielt ich einen behobenen Fehler für ungelöst, weil ich gegen
+ * einen Zombie von vorhin gemessen habe. Dieses Skript bricht deshalb mit
+ * einer Erklärung ab statt mit einem Stapelabzug (siehe unten).
+ *
+ * NICHT blind `pkill` fahren, aus zwei Gründen: Auf dieser Maschine laufen
+ * parallel E2E-Läufe anderer Beteiligter, und ein `pkill -f <muster>` trifft
+ * die eigene Kommandozeile mit, wenn das Muster darin vorkommt — dann beendet
+ * der Aufruf die Shell, die ihn abgesetzt hat. `ss` nennt die PID direkt und
+ * kann sich nicht selbst treffen; danach gezielt `kill <PID>`.
+ *
  * Danach die ausgegebenen Adressen im Browser öffnen und gegen die genannte
  * Erwartung prüfen. Die Leiste öffnet sich über den Knopf „KI-Assistent“; wo
  * ein Auftrag nötig ist, steht es beim jeweiligen Fall.
@@ -259,7 +274,8 @@ let auftragLaeuft = false;
 /** Hat der Lauf sein Kontingent gesprengt? Dann meldet der Status danach „leer". */
 let kontingentWeg = false;
 
-Bun.serve({
+function starte(): void {
+  Bun.serve({
   port: PORT,
   fetch(req) {
     const url = new URL(req.url);
@@ -325,7 +341,30 @@ Bun.serve({
     }
     return new Response("Nicht gefunden", { status: 404 });
   },
-});
+  });
+}
+
+try {
+  starte();
+} catch (err) {
+  // Der Abbruch, der zweimal Zeit gekostet hat: Ein alter Prozess hält den
+  // Port, der neue stirbt — und wer danach im Browser prüft, bekommt die ALTE
+  // Fassung des Overlays und hält einen behobenen Fehler für ungelöst. Bun
+  // wirft dabei nur `EADDRINUSE` samt Stapelabzug; das liest sich wie ein
+  // Fehler im Skript und nicht wie das, was es ist.
+  const code = (err as { code?: string } | null)?.code;
+  if (code !== "EADDRINUSE") throw err;
+  console.error(
+    `Port ${PORT} ist belegt — dieser Prüfstand startet NICHT.\n\n` +
+      "  Achtung: Ein Browser, der jetzt trotzdem antwortet, wird von der\n" +
+      "  ALTEN Fassung bedient. Was du dann misst, ist nicht dein Stand.\n\n" +
+      `  Wer hält ihn:  ss -lptnH "sport = :${PORT}"\n` +
+      "  Gezielt beenden:  kill <PID>   (NICHT pkill — auf dieser Maschine\n" +
+      "  laufen parallel E2E-Läufe anderer Beteiligter.)\n" +
+      `  Oder ausweichen:  PORT=8795 bun ${"scripts/seitenleiste-pruefstand.ts"}`,
+  );
+  process.exit(1);
+}
 
 const basis = `http://localhost:${PORT}`;
 console.log(`Prüfstand für die KI-Seitenleiste läuft auf ${basis}\n`);
