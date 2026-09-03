@@ -766,7 +766,11 @@ function htmlVerstoesse(html: string, dok: DomDokument, erlaubt: Set<string>): V
         // "bild.webp 1x, bild2.webp 2x" — je Eintrag zählt der erste Teil.
         for (const teil of wert.split(",")) {
           const adresse = teil.trim().split(/\s+/)[0] ?? "";
-          merke("srcset", adresse, pruefeRessource(adresse, erlaubt, tag === "img" || tag === "source"));
+          // data: gilt NUR für <img src> (§13.4). In einem srcset und an einem
+          // <source> greift `default-src 'self'`: Der Validator ließe etwas
+          // durch, das der Browser danach stumm nicht lädt — für den Kunden
+          // sieht das aus wie ein kaputter Editor, nicht wie eine Regel.
+          merke("srcset", adresse, pruefeRessource(adresse, erlaubt, false));
         }
         continue;
       }
@@ -784,7 +788,7 @@ function htmlVerstoesse(html: string, dok: DomDokument, erlaubt: Set<string>): V
         merke(
           name,
           wert,
-          pruefeRessource(wert, erlaubt, name === "src" && (tag === "img" || tag === "source")),
+          pruefeRessource(wert, erlaubt, name === "src" && tag === "img"),
         );
         continue;
       }
