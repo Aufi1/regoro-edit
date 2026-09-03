@@ -392,6 +392,38 @@ const JS_CREATE_SCRIPT_RE = /\bcreateElement\s*\(\s*(['"])\s*script\s*\1/gi;
 const JS_HREF_ZUWEISUNG_RE = /\.\s*href\s*=(?![=>])\s*([^;\n]*)/gi;
 const JS_CLICK_RE = /\.\s*click\s*\(\s*\)/;
 
+/**
+ * Service Worker — die einzige Änderung, die die Versionsliste nicht zurücknimmt.
+ *
+ * Der Plan trägt an einer Stelle sein ganzes Gewicht: „Änderungen gehen sofort
+ * live, **die Versionsliste ist das Sicherheitsnetz**." Darauf ruht die
+ * Entscheidung gegen einen Freigabeknopf. Für einen Service Worker hat das Netz
+ * ein Loch, und ausgerechnet für die Klasse mit der längsten Wirkung.
+ *
+ * Nachgewiesen gegen einen Server mit der echten erzeugten CSP: Der Agent legt
+ * `sw.js` an und ein `app.js`, das ihn registriert. Der Kunde stellt
+ * `index.html` über die Versionsliste wieder her — `curl` liefert danach die
+ * saubere Seite, der Browser des Besuchers zeigt weiter die Entstellung.
+ *
+ * Zwei Eigenschaften spielen zusammen, und keine ist allein der Fehler:
+ * `restoreVersion` stellt genau EINEN Pfad wieder her und löscht nie etwas, also
+ * bleibt `sw.js` mit 200 erreichbar — und ein registrierter Worker überlebt
+ * dadurch jede Wiederherstellung. Die CSP kann hier nicht helfen: Die
+ * Registrierung geht auf die EIGENE Herkunft, und die erlaubt sie zu Recht.
+ *
+ * Anders als bei der Navigation gibt es hier keinen legitimen Gegenfall — die
+ * Broschüren-Website eines Handwerksbetriebs braucht keinen Service Worker.
+ * Deshalb am Klartext angesetzt und nicht am Effekt: jede Berührung von
+ * `navigator.serviceWorker` fällt, nicht erst das `register`.
+ */
+const JS_SERVICEWORKER_RE =
+  /\bnavigator\s*(?:\.\s*serviceWorker\b|\[\s*(['"])serviceWorker\1\s*\])/gi;
+
+const SERVICEWORKER_GRUND =
+  "Service Worker werden nicht übernommen. Ein registrierter Service Worker bleibt im Browser der Besucher aktiv, " +
+  "auch nachdem die Seite über die Versionsliste zurückgenommen wurde — er ist die einzige Änderung, die sich " +
+  "nicht mehr rückgängig machen lässt. Für eine Website wie diese wird keiner gebraucht.";
+
 /** Der Wert eines alleinstehenden String-Literals, oder null bei allem anderen. */
 function stringLiteral(ausdruck: string): string | null {
   const t = ausdruck.trim();
@@ -435,6 +467,9 @@ function jsVerstoesse(js: string, erlaubt: Set<string>): Verstoss[] {
   }
   for (const m of js.matchAll(JS_CREATE_SCRIPT_RE)) {
     raus.push({ schluessel: `js-createscript:${m[0].replace(/\s+/g, "")}`, grund: LADE_GRUND });
+  }
+  for (const m of js.matchAll(JS_SERVICEWORKER_RE)) {
+    raus.push({ schluessel: `js-serviceworker:${m[0].replace(/\s+/g, "")}`, grund: SERVICEWORKER_GRUND });
   }
 
   // Der zweite Navigationsweg — nur wenn beide Hälften beisammen sind.
