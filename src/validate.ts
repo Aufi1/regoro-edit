@@ -918,20 +918,39 @@ function pruefeHtml(
   );
   if (neuerVerstoss) return nein(neuerVerstoss.grund);
 
-  // --- 6. Inline-Skripte: ein Vergleich, kein Urteil ----------------------
-  // Die Fabrik-Blöcke dürfen bleiben und dürfen verschwinden; neu hinzukommen
-  // darf keiner. Über eine Multimenge, damit zwei gleiche Blöcke nicht als
-  // einer durchgehen.
-  const uebrig = [...standAlt.inline];
-  for (const block of standNeu.inline) {
-    const i = uebrig.indexOf(block);
-    if (i === -1) {
-      return nein(
-        "Neue oder geänderte <script>-Blöcke im HTML werden nicht übernommen. JavaScript gehört in eine eigene .js-Datei, die per <script src=\"…\"> eingebunden wird.",
-      );
-    }
-    uebrig.splice(i, 1);
-  }
+  // --- 6. Inline-Skripte: derselbe Maßstab wie für eine eigene .js-Datei ---
+  /**
+   * FRÜHER STAND HIER EIN PAUSCHALES VERBOT — und es war wirkungslos.
+   *
+   * Es lehnte jeden neu hinzugekommenen Block ab („JavaScript gehört in eine
+   * eigene .js-Datei"). Nachgemessen kaufte das nichts: Eine eigene `.js`-Datei
+   * ist ausdrücklich erlaubt, `<script src="…">` ebenso, und die erzeugte CSP
+   * führt `script-src 'self' 'unsafe-inline'` mit Absicht — die Fabrik baut
+   * ihren Seitenkopf genau damit. Beide Formen laufen also mit denselben
+   * Rechten auf derselben Herkunft. Das Verbot erzwang eine Datei mehr, sonst
+   * nichts.
+   *
+   * Schlimmer: Die Asymmetrie lief in die falsche Richtung. Eine neue
+   * `.js`-Datei wurde inhaltlich geprüft (Navigationsregel, Service-Worker);
+   * ein Inline-Block wurde gar nicht erst angesehen, sondern abgelehnt. Wir
+   * haben den Agenten damit in die Form gedrängt, die WENIGER geprüft war.
+   *
+   * Und es kostete real: Der Agent kann den Fabrik-Seitenkopf nicht vollständig
+   * kopieren, weil dessen Skripte für eine NEUE Datei zwangsläufig neu sind.
+   * Gemessen an einer angelegten Produktseite — Menüknopf tot, Kopfhöhe beim
+   * CSS-Rückfall, auf dem Handy zerdrückter Kopf. Jede neu angelegte Seite war
+   * davon betroffen.
+   *
+   * Jetzt gilt derselbe Maßstab wie für `.js`: geprüft wird der INHALT, und
+   * zwar gegen den Vorzustand — was schon vorher im Kopf stand, bleibt gültig,
+   * neu hinzukommende Verstöße fallen. Ein Angreifer gewinnt dadurch nichts,
+   * was ihm die erlaubte `.js`-Datei nicht ohnehin gäbe.
+   */
+  const neuerSkriptVerstoss = ersterNeuerVerstoss(
+    jsVerstoesse(standNeu.inline.join("\n;\n"), erlaubt),
+    jsVerstoesse(standAlt.inline.join("\n;\n"), erlaubt),
+  );
+  if (neuerSkriptVerstoss) return nein(neuerSkriptVerstoss.grund);
 
   // --- 7. Weiche Hinweise -------------------------------------------------
   const wissen = siteWissen(ktx.siteDir);

