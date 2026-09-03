@@ -60,9 +60,26 @@ https:// {
     # Muss isEditorPath() in host.ts spiegeln. `/edit*` allein reicht NICHT: es
     # verfehlt die Suffix-Routen `/impressum.html/edit` und fängt zugleich
     # öffentliche Seiten wie `/edit-preise.html` ein.
+    #
+    # HIER KEINE CSP: `connect-src 'none'` blockierte jedes fetch des Overlays.
+    # Der Editor wäre stumm kaputt — Knöpfe reagieren, nichts wird gespeichert.
     @editor path /edit /edit/* /edit-assets/* */edit
     handle @editor {
-        reverse_proxy 127.0.0.1:8788
+        reverse_proxy 127.0.0.1:8788 {
+            # Der Agentenlauf meldet sich über Server-Sent Events; diese Zeile
+            # schaltet jede Pufferung des Antwortkörpers ab.
+            #
+            # Sie ist NICHT der Grund, warum die Seitenleiste sofort aufgeht.
+            # Gemessen (caddy 2.11.4, Upstream schweigt 4 s): Caddy gibt die
+            # Antwort-HEADER erst mit dem ersten Körper-Byte heraus — 4,00 s,
+            # mit dieser Zeile wie ohne. Dagegen hilft kein Proxy-Schalter.
+            # Der Editor schickt deshalb beim Verbinden sofort einen
+            # SSE-Kommentar (": verbunden\n", ohne Leerzeile — ein
+            # vollständiger Rahmen erzeugte einen Phantom-Rahmen im Client);
+            # damit sind es 0,002 s.
+            # Wer hier eine Verzögerung sucht, sucht an der falschen Stelle.
+            flush_interval -1
+        }
     }
 
     # Statische Site: NUR bekannte Dateitypen, aus dem Ordner DIESER Domain.
@@ -73,8 +90,46 @@ https:// {
     @allowed path / */ *.html *.css *.js *.png *.jpg *.jpeg *.webp *.gif *.ico *.woff *.woff2 *.txt *.xml
     handle @allowed {
         root * "/srv/sites/{host}"
+
+        # --- Content-Security-Policy: die dritte Grenze des KI-Editors --------
+        # Steht HIER und nicht im HTML: Der Agent schreibt HTML, also wäre eine
+        # Grenze im HTML eine, die er umschreiben kann. Muss mit cspWert() in
+        # src/service.ts übereinstimmen (per Test festgenagelt).
+        #
+        # `'unsafe-inline'` bei script-src ist ABSICHT — die Fabrik liefert
+        # Inline-Skripte aus; ohne das wären bestehende Kundenseiten kaputt.
+        header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'none'; form-action 'self'; frame-src 'none'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'"
+
+        # Spiegelt X-Content-Type-Options aus SECURITY_HEADERS (src/host.ts) in
+        # den statischen Zweig: In Produktion liefert Caddy die Website direkt
+        # aus, der Bun-Host ist dafür gar nicht im Pfad. Wogegen: ein
+        # Polyglot-Asset mit gültiger Bild-Signatur und eingebettetem HTML/JS.
+        #
+        # Die beiden ANDEREN Header aus SECURITY_HEADERS gehören hier NICHT her
+        # — sie gelten dem Editor und wären hier ein Schaden:
+        # `X-Robots-Tag: noindex` nähme die Website aus dem Index,
+        # `Cache-Control: no-store` verböte jedes Zwischenspeichern.
+        header X-Content-Type-Options "nosniff"
+
         file_server
     }
+
+    # Hat EINE Kundenwebsite eigene Browser-Herkünfte freigeschaltet
+    # (`regoro integration <site> <name> --browser-herkunft https://…`), bekommt
+    # NUR sie eine erweiterte CSP — als eigener handle-Zweig VOR dem Zweig oben.
+    # `regoro service <sitesRoot> --multi --caddy` erzeugt das fertig; das Muster
+    # sieht so aus:
+    #
+    #     @csp_kunde_de header_regexp Host ^kunde\.de$
+    #     handle @csp_kunde_de {
+    #         header Content-Security-Policy "… script-src 'self' 'unsafe-inline' https://js.stripe.com … connect-src https://js.stripe.com …"
+    #         file_server
+    #     }
+    #
+    # Bewusst je Domain und NICHT als gemeinsame Liste: Eine für Kunde A
+    # freigeschaltete Herkunft wäre sonst auch auf Kundenseite B ladbar — genau
+    # die Quervermischung, gegen die die Kundentrennung steht.
+    # Nach jeder Änderung an den Integrationen neu erzeugen und Caddy nachladen.
 
     handle {
         respond 404

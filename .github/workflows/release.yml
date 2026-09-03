@@ -38,14 +38,51 @@ jobs:
           sudo install -m 0755 caddy /usr/local/bin/caddy
           caddy version
 
+      # Baut der Commit auch OHNE das Arbeitsverzeichnis, in dem er entstand?
+      #
+      # Gemessen an dieser Branch: `src/host.ts` war committet und importierte
+      # `./betreiber-config.ts`, `./agent.ts` und `./kontingent.ts` — die waren
+      # ungetrackt. Lokal fällt das niemandem auf, weil die Dateien im
+      # Arbeitsbaum liegen; ein Klon, ein `git bisect` oder dieser Job sehen sie
+      # nicht. Ohne diesen Schritt schlägt das erst beim Tag zu, also dann, wenn
+      # es am teuersten ist.
+      #
+      # `git archive HEAD` packt ausschließlich, was wirklich im Commit steht —
+      # keine ungetrackten und keine ignorierten Dateien.
+      - name: Der Commit baut auch ohne Arbeitsverzeichnis
+        run: |
+          rein="$(mktemp -d)"
+          git archive HEAD | tar -x -C "$rein"
+          cd "$rein"
+          bun install --frozen-lockfile
+          bun x tsc --noEmit
+
+      # Lizenzhinweise MÜSSEN zum Abhängigkeitsbaum passen, bevor gebaut wird.
+      # Ein --compile-Binary trägt keine einzige der Lizenzdateien aus
+      # node_modules; THIRD-PARTY-NOTICES.txt ist die Erfüllung der
+      # Weitergabepflicht, und `regoro licenses` gibt genau diese Datei aus.
+      # Eine veraltete Datei ist deshalb ein roter Build, kein Schönheitsfehler:
+      # Sonst liefe ein Release aus, das Pakete verschweigt, die es enthält.
+      - name: Lizenzhinweise sind aktuell
+        run: bun scripts/gen-notices.ts --check
+
       # Die Checks aus CLAUDE.md. Ein Release, das die Suite nicht besteht,
       # soll gar nicht erst entstehen.
+      #
+      # `tsc` läuft ZUERST, und der Schritt bricht dort ab (GitHub Actions fährt
+      # `run:` als `bash -e`). Grund: **`bun test` führt TypeScript aus, ohne es
+      # zu prüfen.** Genau deshalb konnte `src/cli.ts` über mehrere Commits
+      # unübersetzbar sein, ohne dass ein einziger Test rot wurde — der
+      # Typfehler war für die Suite unsichtbar. Läuft die Suite danach trotzdem,
+      # kostet sie nur Lesezeit: Ihre Fehlschläge sind dann Folgefehler eines
+      # Problems, das eine Zeile weiter oben schon benannt war.
       - name: Checks
         run: |
-          bun test
           bun x tsc --noEmit
+          bun test
           bun build src/overlay.client.js --target=browser > /dev/null
           caddy validate --config Caddyfile.example --adapter caddyfile
+          caddy validate --config Caddyfile.multi.example --adapter caddyfile
 
       # Cross-Compile aus einem Runner: bun bringt die Ziel-Runtimes selbst mit.
       # Die Asset-Namen müssen exakt zu install.sh passen (regoro-<os>-<arch>).
@@ -69,10 +106,19 @@ jobs:
           echo "binary=$actual package.json=$expected"
           test "$actual" = "$expected"
 
+      # Die Lizenzhinweise gehören ans Release: Wer nur das Binary herunterlädt,
+      # bekommt sie über `regoro licenses`; wer vor dem Download wissen will, was
+      # drinsteckt, soll sie ohne Ausführen lesen können.
+      - name: Lizenzhinweise ans Release legen
+        run: cp THIRD-PARTY-NOTICES.txt dist/
+
       - name: SHA256SUMS
         working-directory: dist
         run: |
-          sha256sum regoro-* > SHA256SUMS
+          # THIRD-PARTY-NOTICES.txt kommt mit in die Prüfsummen. install.sh
+          # sucht darin nur seinen eigenen Asset-Namen (exakter Vergleich in
+          # awk), zusätzliche Zeilen stören es also nicht.
+          sha256sum regoro-* THIRD-PARTY-NOTICES.txt > SHA256SUMS
           cat SHA256SUMS
 
       # Tag stammt entweder vom push-Trigger oder aus der manuellen Eingabe.
@@ -86,8 +132,10 @@ jobs:
         run: |
           tag="${{ steps.tag.outputs.value }}"
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/regoro-* dist/SHA256SUMS --clobber
+            gh release upload "$tag" dist/regoro-* dist/SHA256SUMS \
+              dist/THIRD-PARTY-NOTICES.txt --clobber
           else
             gh release create "$tag" dist/regoro-* dist/SHA256SUMS \
+              dist/THIRD-PARTY-NOTICES.txt \
               --title "$tag" --generate-notes
           fi

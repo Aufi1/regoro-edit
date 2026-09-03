@@ -583,6 +583,73 @@ describe("host.ts — statisches Asset-Serving (Task 7)", () => {
   });
 });
 
+// ===========================================================================
+// Die Routen der KI-Seitenleiste stehen hinter derselben Wand
+// ===========================================================================
+describe("host.ts — /edit/agent* ist eine API-Route, keine View-Route", () => {
+  let host: typeof import("./host.ts");
+  let git: typeof import("./git.ts");
+  let ctx: import("./host.ts").HostCtx;
+
+  const PAGE_WHITELIST = ["index.html", "impressum.html", "datenschutz.html", "agb.html"];
+  const AGENT_ROUTEN = ["/edit/agent", "/edit/agent/status", "/edit/agent/events", "/edit/agent/abort"];
+
+  beforeAll(async () => {
+    git = await import("./git.ts");
+    host = await import("./host.ts");
+  });
+
+  beforeEach(() => {
+    const repoRoot = makeTmpDir("regoro-agentsec-");
+    const siteDir = join(repoRoot, "site");
+    mkdirSync(siteDir, { recursive: true });
+    cpSync(REAL_SITE, siteDir, { recursive: true });
+    git.ensureRepo(repoRoot);
+    ctx = { repoRoot, siteDir, pageWhitelist: PAGE_WHITELIST, auth: TEST_AUTH };
+  });
+
+  function call(method: string, path: string): Promise<Response> {
+    const url = new URL("http://localhost:8788" + path);
+    return Promise.resolve(host.handleEditorRequest(new Request(url, { method }), url, ctx));
+  }
+
+  test("unangemeldet → 404, NICHT 302 auf den Login", async () => {
+    // Eine View-Route leitet unangemeldet zum Login um. Für die Agenten-Routen
+    // wäre das falsch: Sie werden per fetch aus dem Overlay gerufen, ein 302
+    // käme dort als 200 mit HTML an und die Seitenleiste zeigte Unsinn. Und ein
+    // Fremder erführe, dass es diesen Editor gibt.
+    for (const pfad of AGENT_ROUTEN) {
+      const res = await call("POST", pfad);
+      expect(`${pfad} → ${res.status}`).toBe(`${pfad} → 404`);
+      expect(res.headers.get("location")).toBeNull();
+    }
+  });
+
+  test("die 404 trägt dieselben Kopfzeilen wie jede andere Editor-Antwort", async () => {
+    // noindex/no-store gelten auf ALLEN Editor-Routen, auch auf den 404ern.
+    for (const pfad of AGENT_ROUTEN) {
+      const res = await call("GET", pfad);
+      expect(res.headers.get("x-robots-tag")).toContain("noindex");
+      expect(res.headers.get("cache-control")).toContain("no-store");
+    }
+  });
+
+  test("isEditorPath fasst sie mit — sonst greift der Kill-Switch nicht", () => {
+    // `regoro disable` wirkt im Einzelbetrieb über den Guard in server.ts, und
+    // der fragt isEditorPath(). Eine Agenten-Route, die dort durchfällt, liefe
+    // weiter, nachdem der Betreiber den Zugang entzogen hat — und kostete Geld.
+    for (const pfad of AGENT_ROUTEN) {
+      expect(`${pfad}: ${host.isEditorPath(pfad)}`).toBe(`${pfad}: true`);
+    }
+  });
+
+  test("eine öffentliche Seite namens edit-agent.html bleibt öffentlich", () => {
+    // Gegenprobe zur Präzedenz: startsWith("/edit") wäre zu grob.
+    expect(host.isEditorPath("/edit-agent.html")).toBe(false);
+    expect(host.isEditorPath("/agent.html")).toBe(false);
+  });
+});
+
 afterAll(() => {
   for (const dir of tmpRoots) {
     try {

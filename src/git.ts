@@ -106,14 +106,31 @@ export function countCommits(repoRoot: string): number | null {
   return null; // alles andere: git verweigert die Auskunft
 }
 
-/** Committet genau pagePath; no-op-tolerant (keine Änderung → kein Fehler). */
-export function commitEdit(repoRoot: string, pagePath: string, msg: string): void {
-  git(repoRoot, "add", "--", pagePath);
+/**
+ * Committet genau die angegebenen Pfade; no-op-tolerant (keine Änderung → kein
+ * Fehler).
+ *
+ * Nimmt einen Pfad oder mehrere: Ein Agentenlauf ändert eine neue Unterseite,
+ * die Navigation der Startseite und vielleicht eine CSS-Datei — das ist EINE
+ * Änderung des Kunden und gehört in EINEN Commit. Sonst zeigte die Versionsliste
+ * drei Einträge, von denen das Zurücknehmen eines einzelnen die Website in einem
+ * halben Zustand zurückließe.
+ */
+export function commitEdit(repoRoot: string, pagePath: string | string[], msg: string): void {
+  const pfade = typeof pagePath === "string" ? [pagePath] : pagePath;
+  // Ohne Pfadangabe committet `git commit -m … --` den GESAMTEN Index. Aus einem
+  // Randfall heraus — ein Lauf, der am Ende nichts Übernehmbares hatte — wäre
+  // das ein Commit über fremde, zufällig vorgemerkte Dateien.
+  if (pfade.length === 0) return;
+
+  git(repoRoot, "add", "--", ...pfade);
   const res = Bun.spawnSync([
     "git", "-C", repoRoot,
     "-c", "user.name=Regoro Editor",
     "-c", "user.email=editor@regoro.local",
-    "commit", "-m", msg, "--", pagePath,
+    // Das explizite `--` bleibt: ohne es würde ein Pfad wie `-f.html` als Flag
+    // gelesen.
+    "commit", "-m", msg, "--", ...pfade,
   ]);
   if (res.exitCode !== 0) {
     const stderr = new TextDecoder().decode(res.stderr);

@@ -4,9 +4,9 @@
  * Kennt Auth + Routing, delegiert die eigentliche Logik an contract/serve/apply/git.
  * Auth-Fehler → 404 (nicht 401), außer /edit/login. Alle Antworten noindex/no-store.
  */
-import { join, resolve, dirname, basename, extname, sep, posix } from "node:path";
+import { join, resolve, extname, sep, posix } from "node:path";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync, statSync, mkdirSync, realpathSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, statSync, mkdirSync } from "node:fs";
 import { parseHTML } from "linkedom";
 // Bun-"file"-Import: liefert einen Pfad, den bun build --compile mit einbettet.
 import overlayAsset from "./overlay.client.js" with { type: "file" };
@@ -21,13 +21,24 @@ import {
 } from "./auth.ts";
 import { maskiereKennung, normalisiereKennung, type Kanal } from "./kennung.ts";
 import { erzeugeCode, merkeCode, pruefeCode } from "./codes.ts";
-import { pruefeBremse, wartezeitText } from "./bremse.ts";
+import { entsperreKennung, pruefeBremse, wartezeitText } from "./bremse.ts";
+import { leseNachrichten, listeVerlaeufe, waehleFortsetzung, NACHRICHTEN_JE_SEITE } from "./verlauf.ts";
 import type { Versand } from "./versand.ts";
+import type { KiConfig } from "./betreiber-config.ts";
 import { renderEditView, renderVersionPreview } from "./serve.ts";
-// PAGE_RE wohnt in sites.ts, damit Whitelist-Erzeugung und Auflösung nicht driften.
-import { PAGE_RE } from "./sites.ts";
-import { applyEdits, setImageSrc, fileSha256, type Edit } from "./apply.ts";
+// PAGE_RE und ASSET_TYPES wohnen in sites.ts — sie beschreiben die WEBSITE
+// (welche Seiten es gibt, was ausgeliefert wird), nicht den Router. PAGE_RE
+// braucht dort ohnehin die Whitelist-Erzeugung; ASSET_TYPES ist mitgezogen,
+// damit validate.ts sie ohne Importzyklus lesen kann (Begründung dort).
+import { ASSET_TYPES, PAGE_RE } from "./sites.ts";
+// Re-Export für Bestandsleser. NEUE Leser importieren aus sites.ts: Ein
+// `from "./host.ts"` baut den Zyklus host → agent → validate → host wieder auf,
+// und in dem ist die Konstante beim Import des Partners noch nicht initialisiert.
+export { ASSET_TYPES, PAGE_RE };
+import { applyEdits, setImageSrc, fileSha256, pathInsideSite, type Edit } from "./apply.ts";
 import { enumerateImages } from "./contract.ts";
+import { brichAb, ereignisse, laufAktiv, starteLauf, type AgentEreignis } from "./agent.ts";
+import { pruefeKontingent, TOKEN_KONTINGENT } from "./kontingent.ts";
 import {
   ensureRepo,
   commitEdit,
@@ -48,6 +59,41 @@ export interface HostCtx {
    * eingerichtet (`/etc/regoro/versand.json`), nicht je Website.
    */
   versand?: Versand | null;
+  /**
+   * Der betreiberweite Modellzugang (`/etc/regoro/ki.json`). Fehlt er, gibt es
+   * die KI-Seitenleiste nicht: alle `/edit/agent*`-Routen antworten 404 und
+   * `serve.ts` blendet die Leiste gar nicht erst ins DOM — fail-closed wie bei
+   * `auth`.
+   *
+   * Wird VERZÖGERT gelesen (Getter in `buildCtx`/`singleSiteHandler`), nicht
+   * einmal beim Start: sonst wirkte `regoro ki --off` erst nach einem Neustart,
+   * und der Betreiber hätte keinen sofortigen Hebel gegen einen Lauf, der Geld
+   * kostet.
+   *
+   * Optional wie `versand`, damit die Ctx-Bauer ihn erst ergänzen müssen, wenn
+   * der Lader existiert. Deshalb überall `== null` prüfen, nie `=== null`:
+   * `undefined` ist derselbe Fall — „kein Modellzugang".
+   */
+  ki?: KiConfig | null;
+}
+
+/**
+ * Der Teil von `Bun.Server`, den der Router braucht — mehr nicht.
+ *
+ * Gebraucht wird er allein für `server.timeout(req, 0)` auf dem Ereignisstrom:
+ * Bun beendet jede Antwort, die `idleTimeout` lang (Vorgabe 10 s) kein Byte
+ * geliefert hat. Ein Agentenlauf schweigt minutenlang, während das Modell
+ * nachdenkt — ohne diese Abschaltung risse die Seitenleiste reproduzierbar
+ * nach zehn Sekunden ab, und zwar erst in Produktion, weil im Test niemand so
+ * lange wartet. Ein globales `idleTimeout: 0` wäre der falsche Handel: Es
+ * nähme JEDER Anfrage den Schutz vor Stillstand, um ein Problem zu lösen, das
+ * eine einzige Route hat.
+ *
+ * Als schmale Form statt `Bun.Server`, damit ein Test eine Attrappe übergeben
+ * und nachweisen kann, dass die Abschaltung wirklich passiert.
+ */
+export interface AnfrageZeitgrenze {
+  timeout(request: Request, seconds: number): void;
 }
 
 /**
@@ -63,6 +109,12 @@ function pagePathFor(ctx: HostCtx, page: string): string {
 /**
  * Ist der Pfad eine Editor-Route? Exakt matchen, nicht startsWith("/edit"):
  * eine öffentliche Seite darf "edit-preise.html" heißen.
+ *
+ * Die Routen der KI-Seitenleiste (`/edit/agent`, `/edit/agent/events|abort|status`)
+ * fallen unter `startsWith("/edit/")` und sind damit gedeckt — der Kill-Switch in
+ * server.ts (`regoro disable` wirkt sofort) greift für sie ohne Zusatzregel. Nicht
+ * auf eine engere Liste umbauen: Eine vergessene Agenten-Route liefe sonst weiter,
+ * nachdem der Betreiber den Zugang entzogen hat.
  */
 export function isEditorPath(path: string): boolean {
   return (
@@ -95,27 +147,6 @@ const COMMIT_RE = /^[0-9a-f]{7,40}$/;
 // Binary ins Leere → /edit-assets/overlay.js gab 404 und der Editor war stumm
 // funktionslos. readFileSync/existsSync können beide Pfade.
 const OVERLAY_PATH: string = overlayAsset;
-
-// Allowlist statischer Asset-Extensions → Content-Type. KEIN .html hier
-// (Seiten laufen über den /edit-Pfad; Asset-Serving darf keine beliebigen
-// .html ausliefern). Nur diese Extensions werden öffentlich ausgeliefert.
-const ASSET_TYPES: Record<string, string> = {
-  ".css": "text/css; charset=utf-8",
-  ".js": "application/javascript; charset=utf-8",
-  ".png": "image/png",
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".webp": "image/webp",
-  // KEIN .svg: image/svg+xml ist script-fähig (latenter Stored-XSS). regoro.de
-  // nutzt nur webp/jpg. Upload blockt SVG ohnehin per Sniff — das schließt auch
-  // den Static-Serving-Pfad.
-  ".gif": "image/gif",
-  ".ico": "image/x-icon",
-  ".woff": "font/woff",
-  ".woff2": "font/woff2",
-  ".txt": "text/plain; charset=utf-8",
-  ".xml": "application/xml; charset=utf-8",
-};
 
 // Bild-Upload: Größenlimit + Magic-Byte-Sniff. SVG bewusst NICHT zugelassen
 // (XSS-Risiko durch eingebettetes Script). Liefert die kanonische Extension
@@ -412,12 +443,29 @@ async function parseBody(req: Request): Promise<Record<string, unknown>> {
   return obj;
 }
 
-/** Haupt-Router. Synchron oder als Promise<Response>. */
-export function handleEditorRequest(req: Request, url: URL, ctx: HostCtx): Promise<Response> {
-  return route(req, url, ctx);
+/**
+ * Haupt-Router. Synchron oder als Promise<Response>.
+ *
+ * `srv` ist optional, damit die bestehenden Aufrufer und Tests unverändert
+ * bleiben; nur der Ereignisstrom braucht es (siehe AnfrageZeitgrenze). Fehlt
+ * es, funktioniert alles außer der Zeitgrenze — der Strom risse dann nach
+ * zehn Sekunden ab, statt gar nicht erst zu entstehen.
+ */
+export function handleEditorRequest(
+  req: Request,
+  url: URL,
+  ctx: HostCtx,
+  srv?: AnfrageZeitgrenze,
+): Promise<Response> {
+  return route(req, url, ctx, srv);
 }
 
-async function route(req: Request, url: URL, ctx: HostCtx): Promise<Response> {
+async function route(
+  req: Request,
+  url: URL,
+  ctx: HostCtx,
+  srv?: AnfrageZeitgrenze,
+): Promise<Response> {
   const path = url.pathname;
   const method = req.method.toUpperCase();
 
@@ -491,6 +539,12 @@ async function route(req: Request, url: URL, ctx: HostCtx): Promise<Response> {
         // nicht entstanden sein — die Prüfung ist trotzdem da, weil sie billig ist.
         if (!kennungHinterlegt(auth, kennung.wert)) return abweisen();
         if (pruefeCode(ctx.siteDir, kennung.wert, codeRoh) !== "ok") return abweisen();
+
+        // Ab hier ist die Anmeldung nachgewiesen. Die Bremse begrenzt Kosten
+        // durch Anfragen von jemandem, der sich NICHT anmelden kann — wer einen
+        // gültigen Code vorgelegt hat, gehört nicht dazu. Ohne diesen Schnitt
+        // wartet der Kunde, der sich soeben ausgewiesen hat, am zweiten Gerät.
+        entsperreKennung(ctx.siteDir, kennung.wert);
 
         return new Response(null, {
           status: 302,
@@ -601,9 +655,48 @@ async function route(req: Request, url: URL, ctx: HostCtx): Promise<Response> {
     path === "/edit/upload" ||
     path === "/edit/restore" ||
     path === "/edit/versions" ||
+    // KI-Seitenleiste: Auftrag, Ereignisstrom, Abbruch, Zustand. Gehören HIER
+    // hin und nicht zu den View-Routen: Ohne den Auth-Gate könnte ein Fremder
+    // einen Agentenlauf auslösen — der kostet Token und schreibt in die Website.
+    // Unangemeldet also 404 (nicht 401), wie bei jeder anderen API-Route.
+    // ACHTUNG beim Ergänzen: Diese Liste ist die Auth-Wand. Eine Route, die
+    // unten in `handleEditorRequest` steht, hier aber fehlt, wird NIE erreicht —
+    // sie fällt durch bis zum statischen Ausliefern und antwortet 404, auch
+    // angemeldet. Genau so lagen `/edit/agent/verlaeufe` und `/edit/agent/verlauf`
+    // tot da, der Gesprächsverlauf war wirkungslos, und nichts wurde rot.
+    //
+    // Kein Test schlug an, weil nur „unangemeldet → 404" geprüft wurde: Das
+    // stimmte, aber aus dem falschen Grund — eine Route, die es gar nicht gibt,
+    // antwortet genauso. Auch die Handprüfung bestätigte den Fehler aus
+    // demselben falschen Grund. Jede Route hier gehört deshalb AUCH in eine
+    // Prüfung, die sie ANGEMELDET mit ihrem echten Statuscode sieht
+    // (`ERREICHBAR` in `agent-routes.test.ts`).
+    //
+    // Zwei Zweige haben diesen Fehler unabhängig gefunden und gleich behoben;
+    // hier stehen beide Begründungen zusammengeführt.
+    /^\/edit\/agent(\/(events|abort|status|verlauf|verlaeufe))?$/.test(path) ||
     /^\/edit\/version\/[^/]+$/.test(path);
   if (isApiRoute) {
     if (!isAuthed(req, ctx)) return notFound();
+
+    // --- KI-Seitenleiste ---
+    // Ohne betreiberweiten Modellzugang gibt es diese Routen NICHT — auch mit
+    // gültigem Cookie. Fail-closed wie bei fehlender Auth-Datei: 404, kein 503,
+    // keine Fehlermeldung. Sonst wäre die Antwort ein Orakel darüber, welche
+    // Websites dieser Server bedient und wie er eingerichtet ist.
+    //
+    // `== null` und nicht `=== null`: `ki` ist optional am HostCtx, und ein Ctx,
+    // der das Feld gar nicht kennt, ist derselbe Fall — kein Modellzugang.
+    if (path.startsWith("/edit/agent")) {
+      if (ctx.ki == null) return notFound();
+      if (path === "/edit/agent" && method === "POST") return handleAgentStart(req, ctx);
+      if (path === "/edit/agent/status" && method === "GET") return handleAgentStatus(ctx);
+      if (path === "/edit/agent/verlaeufe" && method === "GET") return handleAgentVerlaeufe(ctx);
+      if (path === "/edit/agent/verlauf" && method === "GET") return handleAgentVerlauf(url, ctx);
+      if (path === "/edit/agent/abort" && method === "POST") return handleAgentAbort(ctx);
+      if (path === "/edit/agent/events" && method === "GET") return handleAgentEvents(req, ctx, srv);
+      return notFound();
+    }
 
     if (path === "/edit/save" && method === "POST") return handleSave(req, ctx);
     if (path === "/edit/upload" && method === "POST") return handleUpload(req, ctx);
@@ -662,6 +755,9 @@ async function route(req: Request, url: URL, ctx: HostCtx): Promise<Response> {
       scriptUrl: "/edit-assets/overlay.js",
       pages: ctx.pageWhitelist,
       page: target.page,
+      // Ohne Modellzugang erscheint die Seitenleiste gar nicht erst im DOM —
+      // ein Knopf, der nur 404 erntet, ist schlimmer als kein Knopf.
+      ki: ctx.ki != null,
     });
     return html(out);
   }
@@ -702,26 +798,6 @@ async function route(req: Request, url: URL, ctx: HostCtx): Promise<Response> {
   return notFound();
 }
 
-/**
- * Symlink-sichere Containment-Prüfung: true, wenn der REALE (aufgelöste) Pfad
- * innerhalb von siteDir liegt. Verhindert, dass Schreib-/Restore-Vorgänge einem
- * Symlink (z.B. eine als Symlink angelegte Seite/`assets` in einer mounted-/
- * restored-site) nach außerhalb des Site-Baums folgen. Der lexikalische
- * resolve()-Check erkennt Symlinks nicht — realpath schon. Fail-closed.
- */
-function pathInsideSite(ctx: HostCtx, absPath: string): boolean {
-  try {
-    const realSite = realpathSync(ctx.siteDir);
-    // Existierende Datei/Verzeichnis: real auflösen; sonst realen Parent + Basename.
-    const real = existsSync(absPath)
-      ? realpathSync(absPath)
-      : join(realpathSync(dirname(absPath)), basename(absPath));
-    return real === realSite || real.startsWith(realSite + sep);
-  } catch {
-    return false;
-  }
-}
-
 async function handleSave(req: Request, ctx: HostCtx): Promise<Response> {
   const body = await parseBody(req);
   const pagePath = typeof body.pagePath === "string" ? body.pagePath : "";
@@ -741,7 +817,7 @@ async function handleSave(req: Request, ctx: HostCtx): Promise<Response> {
 
   const { html: nextHtml } = applyEdits(current, edits);
   // Symlink-sicher: nie einer als Symlink angelegten Seite nach außerhalb folgen.
-  if (!pathInsideSite(ctx, target.abs)) return json({ error: "bad-path" }, 400);
+  if (!pathInsideSite(ctx.siteDir, target.abs)) return json({ error: "bad-path" }, 400);
   writeFileSync(target.abs, nextHtml, "utf8");
 
   ensureRepo(ctx.repoRoot);
@@ -800,14 +876,14 @@ async function handleUpload(req: Request, ctx: HostCtx): Promise<Response> {
   // Elternsegment) ein Symlink nach außerhalb (mounted-/restored-site), würde
   // writeFileSync dem Symlink folgen. Daher das ECHTE Ziel gegen siteDir prüfen.
   mkdirSync(assetsBase, { recursive: true });
-  if (!pathInsideSite(ctx, assetsAbs)) return json({ error: "bad-path" }, 400);
+  if (!pathInsideSite(ctx.siteDir, assetsAbs)) return json({ error: "bad-path" }, 400);
   writeFileSync(assetsAbs, bytes);
 
   // 8. src auf der Seite aktualisieren + schreiben.
   const newSrc = `/assets/${filename}`;
   const { html: nextHtml, applied } = setImageSrc(pageHtml, imgIdx, newSrc);
   if (applied !== 1) return json({ error: "img-not-applied" }, 400);
-  if (!pathInsideSite(ctx, target.abs)) return json({ error: "bad-path" }, 400);
+  if (!pathInsideSite(ctx.siteDir, target.abs)) return json({ error: "bad-path" }, 400);
   writeFileSync(target.abs, nextHtml, "utf8");
 
   // 9. Beide (Asset + Seite) committen.
@@ -832,7 +908,7 @@ async function handleRestore(req: Request, ctx: HostCtx): Promise<Response> {
   if (!target || pagePath !== pagePathFor(ctx, target.page)) return notFound();
   if (!COMMIT_RE.test(commit)) return notFound();
   // Symlink-sicher: Restore würde sonst einem als Symlink angelegten Seitenpfad folgen.
-  if (existsSync(target.abs) && !pathInsideSite(ctx, target.abs)) {
+  if (existsSync(target.abs) && !pathInsideSite(ctx.siteDir, target.abs)) {
     return json({ ok: false, error: "bad-path" }, 400);
   }
 
@@ -843,6 +919,398 @@ async function handleRestore(req: Request, ctx: HostCtx): Promise<Response> {
     return json({ ok: false, error: "restore-failed" }, 400);
   }
   return json({ ok: true });
+}
+
+// ===========================================================================
+// KI-Seitenleiste — vier Routen (Contract §7)
+//
+// Der Wortlaut jeder Fehlermeldung und jeder Statuscode gehören hierher
+// (Contract §10). `agent.ts` liefert maschinenlesbare Gründe; erst hier werden
+// daraus deutsche Sätze. Stünde der Wortlaut an beiden Stellen, driftete er.
+// ===========================================================================
+
+/**
+ * Obergrenze für einen Auftrag.
+ *
+ * Der Auftrag geht in den System-Prompt des Modells und als Umgebungsvariable
+ * an den Worker. Ohne Grenze ist beides ein bezahltes Fass ohne Boden, und der
+ * Kernel hat für Umgebungsvariablen eine eigene, deutlich unfreundlichere
+ * Grenze — die schlüge als unverständlicher Startfehler durch statt als klarer
+ * Satz im Browser. 4000 Zeichen sind rund 600 Wörter; ein Kundenauftrag in
+ * normalen Sätzen bleibt weit darunter.
+ */
+const MAX_AUFTRAG_ZEICHEN = 4000;
+
+/** Obergrenze für die Gesprächskennung im Auftrag. Eine UUID ist 36 Zeichen. */
+const MAX_VERLAUF_KENNUNG = 200;
+
+/**
+ * Die technischen Ablehnungen beim Übernehmen. `agent.ts` baut sie als
+ * `<grund>:<pfad>`; der Pfad ist für den Betreiber gedacht, nicht für den Kunden.
+ */
+const UEBERNAHME_ABLEHNUNGEN = new Set([
+  "symlink",
+  "geloescht",
+  "unlesbar",
+  "ausserhalb-kopie",
+  "ausserhalb-site",
+]);
+
+/**
+ * Maschinenlesbare Gründe aus `agent.ts` in Sätze übersetzen, die ein
+ * Handwerksbetrieb versteht.
+ *
+ * JEDER Grund, den `agent.ts` erzeugen kann, muss hier ankommen — sonst steht
+ * das Schlüsselwort wörtlich in der roten Sprechblase. Nachgemessen ist das
+ * zweimal passiert (`worker-abgestuerzt`, und beim Abbrechen-Knopf las der
+ * Kunde schlicht „abgebrochen"). `src/fehlertexte.test.ts` liest die Gründe
+ * aus `agent.ts` und bricht, sobald einer dazukommt, der hier fehlt.
+ *
+ * Nur frei formulierte Meldungen gehen unverändert durch: Validator und
+ * Recherche liefern bereits deutschen Klartext, und den hier noch einmal zu
+ * übersetzen hieße, ihn zu verlieren.
+ */
+export function agentFehlerText(grund: string): string {
+  // `<grund>:<pfad>` — der Pfad gehört ins Betreiber-Log, nicht in den Browser.
+  // Dem Kunden sagt er nichts, und im ungünstigen Fall verrät er die Struktur
+  // eines Ausbruchsversuchs an genau den, der ihn ausgelöst hat. `agent.ts`
+  // schreibt selbst nichts ins Log (kein einziges console.*), also passiert es
+  // hier — sonst ginge die einzige Spur verloren, die eine Störung erklärt.
+  /**
+   * Kein Sicherheitsbefund, sondern ein Zusammenstoß — deshalb ein eigener Satz.
+   *
+   * Der Kunde hat während des Laufs selbst gespeichert. Er MUSS erfahren, dass
+   * seine eigene Änderung erhalten ist: Sonst sieht er nur, dass der Auftrag
+   * nichts bewirkt hat, und startet ihn erneut — was dasselbe noch einmal
+   * kostet. Die Dateinamen bleiben im Log, sie sagen ihm nichts.
+   */
+  if (grund.startsWith("fremd-geaendert:")) {
+    console.error(`[regoro] Übernahme verworfen, fremde Änderung: ${grund}`);
+    return "Die Website wurde während des Auftrags von Hand geändert. Der Auftrag wurde verworfen, deine eigene Änderung ist erhalten.";
+  }
+
+  const trenner = grund.indexOf(":");
+  if (trenner > 0 && UEBERNAHME_ABLEHNUNGEN.has(grund.slice(0, trenner))) {
+    console.error(`[regoro] Übernahme abgelehnt: ${grund}`);
+    return (
+      "Die Sicherheitsprüfung hat die Änderung nicht übernommen."
+    );
+  }
+
+  switch (grund) {
+    case "kein-lauf":
+      return "Kein Lauf aktiv.";
+    case "kein-modellzugang":
+      return "Der KI-Assistent ist nicht eingerichtet.";
+    case "lauf-gescheitert":
+      return "Auftrag fehlgeschlagen.";
+    case "worker-abgestuerzt":
+      // Nachgemessen: Ohne diesen Fall stand wörtlich „worker-abgestuerzt" im
+      // Chatfenster des Kunden. Was schiefging, gehört ins Log des Betreibers;
+      // der Kunde braucht zu wissen, dass seine Website unberührt ist.
+      return "Der Assistent hat sich unerwartet beendet.";
+    case "kontingent-erschoepft":
+      /**
+       * ZWEI WÖRTER, UND DAS IST ABSICHT. Die Kontingentleiste steht direkt
+       * über dem Verlauf und sagt dauerhaft „Das Monatskontingent ist
+       * aufgebraucht. Es setzt sich am Monatsersten zurück." Das Datum hier zu
+       * wiederholen hieße, dieselbe Aussage zweimal zu führen — und zwei
+       * Quellen für eine Aussage laufen früher oder später auseinander.
+       *
+       * Die Entwarnung („nichts geändert") fehlt hier wie überall sonst — so
+       * vom Betreiber entschieden, nachdem der Einwand vorlag. Sie stand in
+       * fast jeder Meldung und machte alle lang; ein abgebrochener Lauf ändert
+       * ohnehin nichts, weil die Übernahme erst nach sauberem Abschluss läuft.
+       * Wer sie zurückholt, holt sie an EINER Stelle zurück, nicht in sieben.
+       */
+      return "Kontingent aufgebraucht.";
+    case "abgebrochen":
+      // Der meistbenutzte Weg überhaupt — der Abbrechen-Knopf. Ohne diesen Fall
+      // stand dort ein rotes Feld mit dem Wort „abgebrochen".
+      return "Auftrag abgebrochen.";
+    case "abgeschaltet":
+      return "Der Zugang wurde vom Betreiber beendet.";
+    default:
+      /**
+       * NICHTS UNBEKANNTES GEHT AN DEN BROWSER. Hier stand `return grund;`, und
+       * das ist dreimal schiefgegangen: erst „worker-abgestuerzt", dann
+       * „abgebrochen", zuletzt — bei leerem Guthaben — die komplette
+       * OpenRouter-Antwort als englischer JSON-Rohtext, mitsamt dem Namen
+       * unseres Modellanbieters und einem Link auf UNSERE Abrechnungsseite.
+       * Ein Handwerksbetrieb bekam das wörtlich in der Seitenleiste zu sehen.
+       *
+       * Zweimal wurde daraufhin der Einzelfall ergänzt. Das war die falsche
+       * Ebene: Die Menge der Gründe ist offen — jede Anbieter-Antwort, jeder
+       * neue Zustand landet hier. Deshalb ist der Vorgabezweig jetzt der
+       * SICHERE, und ein neuer Grund kostet eine Log-Zeile statt eines Lecks.
+       *
+       * Die Trennlinie dahinter: Ein leeres Guthaben ist ein BETREIBER-Problem.
+       * Der Kunde kann daran nichts ändern, also erfährt er nur, dass seine
+       * Website unberührt ist; der Betreiber findet den Grund im Log.
+       */
+      if (istEigenerKlartext(grund)) return grund;
+      console.error(`[regoro] Agentenlauf gescheitert: ${grund}`);
+      return "Der Assistent ist gerade nicht verfügbar.";
+  }
+}
+
+/**
+ * Trennt EIGENEN deutschen Klartext von FREMDEM Maschinentext.
+ *
+ * Beide erreichen den Vorgabezweig oben, und beide müssen unterschiedlich
+ * behandelt werden — das ist der Grund, warum dort kein einfacher Deckel steht:
+ *
+ *   durchlassen  „Die Datei enthält ein neues Inline-Skript."   (Validator)
+ *                „Interne Adressen werden nicht abgerufen."      (Recherche)
+ *   schlucken    `402: {"message":"This request requires more credits …`
+ *
+ * Beide Sorten sind frei formuliert, eine Liste hilft also nicht. Geprüft wird
+ * deshalb die FORM eines Satzes, den wir selbst geschrieben haben. Die Regel
+ * ist bewusst streng: Wer sich irrt, schluckt einen brauchbaren Hinweis und
+ * schreibt ihn ins Log — wer zu lax ist, stellt dem Kunden fremde Rohdaten in
+ * die Seitenleiste. Der erste Fehler kostet Bequemlichkeit, der zweite Vertrauen.
+ */
+function istEigenerKlartext(s: string): boolean {
+  // Anbieter-Antworten sind JSON, tragen Anführungszeichen und verlinken auf
+  // fremde Abrechnungsseiten. Nichts davon steht je in einem unserer Sätze.
+  if (/[{}"<>]|https?:\/\//.test(s)) return false;
+  // Ein Satz, kein Datenfeld: beginnt groß, endet mit Satzzeichen, hat Wörter.
+  if (!/^[A-ZÄÖÜ]/.test(s)) return false;
+  if (!/[.!?]$/.test(s.trimEnd())) return false;
+  if (!s.includes(" ")) return false;
+  // Deutlich länger als jeder unserer Sätze heißt: da hängt etwas dran.
+  return s.length <= 200;
+}
+
+/**
+ * Die Liste vergangener Gespräche dieser Website.
+ *
+ * Titel sind KUNDENTEXT — der erste Satz eines Auftrags. Sie gehen als JSON
+ * hinaus und werden im Overlay per `textContent` gesetzt, nie als HTML. Wer das
+ * hier je zu einer gerenderten Liste umbaut, muss maskieren.
+ *
+ * Kein Kontingent-Verbrauch, kein Lauf: reines Lesen. Trotzdem hinter der
+ * Auth-Wall wie alle `/edit/agent*`-Routen — der Verlauf enthält wörtlich, was
+ * der Kunde geschrieben hat.
+ */
+async function handleAgentVerlaeufe(ctx: HostCtx): Promise<Response> {
+  const alle = await listeVerlaeufe(ctx.siteDir);
+  // Welches Gespräch ein Auftrag OHNE Angabe fortsetzen würde. Der Browser
+  // rechnet die 24-Stunden-Regel nicht nach — täte er es, gäbe es sie zweimal,
+  // und die Leiste zeigte irgendwann ein anderes Gespräch an als das, in das
+  // der nächste Auftrag liefe.
+  const fortsetzung = await waehleFortsetzung(ctx.siteDir);
+  return Response.json({
+    ok: true,
+    fortsetzbar: fortsetzung ? fortsetzung.id : null,
+    verlaeufe: alle.map((v) => ({
+      id: v.id,
+      titel: v.titel,
+      geaendert: v.geaendert,
+      nachrichten: v.nachrichten,
+    })),
+  });
+}
+
+/**
+ * Ein Gespräch zum Nachlesen, seitenweise von hinten.
+ *
+ * `id` ist eine Kennung aus der Liste, KEIN Pfad — `leseNachrichten` sucht sie
+ * im Verzeichnis dieser Website und kommt nie auf eine Datei, die nicht ohnehin
+ * dazugehört. Eine unbekannte Kennung ist 404, nicht 400: Nach dem Aufräumen
+ * (30 Tage) ist genau das der Normalfall, und für den Browser ist beides
+ * dasselbe — er beginnt ein neues Gespräch.
+ *
+ * Der Text ist wörtlich, was der Kunde geschrieben und das Modell geantwortet
+ * hat. Er geht als JSON hinaus und wird im Overlay per `textContent` gesetzt,
+ * nie als HTML — wie die Titel in der Liste.
+ */
+async function handleAgentVerlauf(url: URL, ctx: HostCtx): Promise<Response> {
+  const id = url.searchParams.get("id") ?? "";
+  if (id === "") return json({ ok: false, grund: "Kennung fehlt." }, 400);
+  // Dieselbe Grenze wie beim Auftrag. Nicht ausnutzbar (es folgt nur ein
+  // Zeichenkettenvergleich), aber zwei Wege in dieselbe Funktion sollen nicht
+  // verschieden streng sein — sonst rät beim nächsten Mal jemand, welcher gilt.
+  if (id.length > MAX_VERLAUF_KENNUNG) {
+    return json({ ok: false, grund: "Ungültige Gesprächskennung." }, 400);
+  }
+
+  const vorRoh = url.searchParams.get("vor");
+  const anzahlRoh = url.searchParams.get("anzahl");
+  const seite = await leseNachrichten(ctx.siteDir, id, {
+    // `Number("")` ist 0 und wäre eine leere Seite — deshalb erst prüfen, dann
+    // umwandeln. Unsinnige Werte klammert `leseNachrichten` selbst.
+    vor: vorRoh === null || vorRoh === "" ? null : Number(vorRoh),
+    anzahl: anzahlRoh === null || anzahlRoh === "" ? NACHRICHTEN_JE_SEITE : Number(anzahlRoh),
+  });
+  if (!seite) return json({ ok: false, grund: "Dieses Gespräch gibt es nicht mehr." }, 404);
+  return Response.json({ ok: true, ...seite });
+}
+
+async function handleAgentStart(req: Request, ctx: HostCtx): Promise<Response> {
+  const body = await parseBody(req);
+  const auftrag = typeof body.auftrag === "string" ? body.auftrag.trim() : "";
+  // Leer und „nur Leerzeichen" sind derselbe Fall: Ein Lauf ohne Auftrag würde
+  // Kontingent verbrauchen, um nichts zu tun.
+  if (auftrag === "") {
+    return json({ ok: false, grund: "Auftrag fehlt." }, 400);
+  }
+  if (auftrag.length > MAX_AUFTRAG_ZEICHEN) {
+    return json(
+      {
+        ok: false,
+        grund: `Der Auftrag ist zu lang (${auftrag.length} Zeichen, erlaubt sind ${MAX_AUFTRAG_ZEICHEN}). Beschreibe in ein paar Sätzen, was sich ändern soll.`,
+      },
+      400,
+    );
+  }
+
+  /**
+   * Welches Gespräch fortgesetzt wird. Drei Werte: `"auto"` (Vorgabe, der
+   * Server wendet die 24-Stunden-Regel an), `"neu"`, oder eine Kennung aus
+   * `GET /edit/agent/verlaeufe`.
+   *
+   * Eine unbekannte Kennung ist KEIN Fehler — sie beginnt ein neues Gespräch
+   * (Begründung in `verlauf.ts`). Geprüft wird nur die Länge: Kennungen sind
+   * UUIDs, alles darüber ist niemals eine und hat im Vergleich nichts zu
+   * suchen.
+   */
+  const verlaufRoh = typeof body.verlauf === "string" ? body.verlauf.trim() : "auto";
+  if (verlaufRoh.length > MAX_VERLAUF_KENNUNG) {
+    return json({ ok: false, grund: "Ungültige Gesprächskennung." }, 400);
+  }
+  const verlauf = verlaufRoh === "" ? "auto" : verlaufRoh;
+
+  const start = starteLauf(ctx, auftrag, { verlauf });
+  if (start.ok) return json({ ok: true, laufId: start.laufId });
+
+  switch (start.grund) {
+    case "laeuft-bereits":
+      return json({ ok: false, grund: "Es läuft bereits ein Auftrag für diese Website." }, 409);
+    case "kontingent":
+      return json(
+        {
+          ok: false,
+          grund: "Das Monatskontingent ist aufgebraucht. Es setzt sich am Monatsersten zurück.",
+        },
+        429,
+      );
+    case "keine-sandbox":
+      // 503 und nicht 500: Es ist eine fehlende Voraussetzung des Servers, kein
+      // Fehler des Kunden und nichts, was ein zweiter Versuch behebt.
+      return json(
+        { ok: false, grund: "Die Sandbox (bwrap) ist auf diesem Server nicht verfügbar." },
+        503,
+      );
+  }
+}
+
+function handleAgentStatus(ctx: HostCtx): Response {
+  const k = pruefeKontingent(ctx.siteDir);
+  return json({
+    ok: true,
+    laeuft: laufAktiv(ctx.siteDir) !== null,
+    laufId: laufAktiv(ctx.siteDir),
+    // Bewusst nur diese vier Felder: `tokens` und `laeufe` aus dem Kontingent
+    // sind Betreiber-Buchhaltung und gehen den Browser nichts an. `gesamt`
+    // kommt dazu, damit die Seitenleiste „noch X von Y" anzeigen kann, ohne
+    // die Obergrenze selbst zu kennen — sonst rechnete sie beim Monatswechsel
+    // falsch.
+    kontingent: {
+      frei: k.frei,
+      gesamt: TOKEN_KONTINGENT,
+      erschoepft: k.erschoepft,
+      monat: k.monat,
+    },
+  });
+}
+
+function handleAgentAbort(ctx: HostCtx): Response {
+  // Idempotent: Auch ohne laufenden Auftrag 200. Ein 404 wäre hier irreführend
+  // (die Route gibt es ja) und ein 409 zwänge die Seitenleiste zu einer
+  // Fallunterscheidung, die niemandem hilft — abgebrochen ist abgebrochen.
+  brichAb(ctx.siteDir);
+  return json({ ok: true });
+}
+
+/** Ein Ereignis als SSE-Rahmen. Der Ereignisname ist `t`, der Rest die Daten. */
+function sseRahmen(e: AgentEreignis): string {
+  const { t, ...daten } = e;
+  const nutzlast = t === "fehler" ? { grund: agentFehlerText(e.grund) } : daten;
+  // EINE `data:`-Zeile je Ereignis: `JSON.stringify` maskiert Zeilenumbrüche
+  // selbst und kann ein Ereignis daher nie zerschneiden. Ein roher Umbruch im
+  // Text des Agenten würde den Rahmen sonst mitten im Satz beenden.
+  return `event: ${t}\ndata: ${JSON.stringify(nutzlast)}\n\n`;
+}
+
+function handleAgentEvents(req: Request, ctx: HostCtx, srv?: AnfrageZeitgrenze): Response {
+  // Bun beendet jede Antwort, die `idleTimeout` lang (Vorgabe 10 s) kein Byte
+  // geliefert hat. Ein Agentenlauf schweigt minutenlang, während das Modell
+  // nachdenkt — ohne diese Abschaltung risse der Strom reproduzierbar ab, und
+  // zwar erst in Produktion.
+  srv?.timeout(req, 0);
+
+  const quelle = ereignisse(ctx.siteDir);
+  const enc = new TextEncoder();
+  let offen = true;
+
+  // Klassischer ReadableStream, NICHT `type: "direct"`: dort feuert `cancel()`
+  // unzuverlässig (oven-sh/bun#18315), und ein nicht feuerndes `cancel` hieße
+  // hier, dass der Zuhörer bis zum Prozessende registriert bleibt.
+  const strom = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      // SOFORT ein Byte senden, bevor irgendetwas passiert.
+      //
+      // Gemessen an Caddy 2.11.4: direkt am Bun-Host liegen 0,0003 s zwischen
+      // Anfrage und erstem Byte, durch den Proxy 4 s — genau so lange, bis das
+      // erste echte Ereignis kam. `flush_interval -1` ändert daran nichts,
+      // denn gepuffert wird nicht der Körper, sondern die ANTWORT-HEADER: Go
+      // gibt sie erst mit dem ersten Körper-Byte heraus. Im Browser feuert
+      // `onopen` deshalb erst mit dem ersten Ereignis — bei einem Agentenlauf
+      // sind das Minuten, in denen die Seitenleiste leer steht und jede
+      // Zwischenstation die Verbindung für tot halten darf.
+      //
+      // Eine SSE-Kommentarzeile OHNE abschließende Leerzeile: Sie schiebt
+      // Bytes auf die Leitung, löst aber kein Ereignis aus. Mit Leerzeile wäre
+      // es ein leerer `message`-Rahmen — der Browser ignoriert den zwar, aber
+      // jeder mitlesende Parser zählte ihn als Ereignis.
+      controller.enqueue(enc.encode(": verbunden\n"));
+      try {
+        for await (const e of quelle) {
+          if (!offen) break;
+          controller.enqueue(enc.encode(sseRahmen(e)));
+        }
+      } catch (err) {
+        // Der Lauf ist ein fremder Prozess; ein Fehler hier darf den Server
+        // nicht mitreißen. Ins Log, nicht in den Browser — die Meldung könnte
+        // interne Pfade enthalten.
+        console.error(
+          `[regoro] Ereignisstrom abgebrochen: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      if (offen) {
+        offen = false;
+        try {
+          controller.close();
+        } catch {
+          /* der Client war schneller weg */
+        }
+      }
+    },
+    cancel() {
+      // Der Kunde hat den Tab geschlossen oder neu geladen. Das hängt NUR den
+      // Zuhörer ab und beendet den Lauf nicht (§13.14): Ein versehentlicher
+      // Reload wäre sonst ein Abbruchknopf für Arbeit, deren Kontingent schon
+      // gebucht ist. Abgebrochen wird ausschließlich über /edit/agent/abort.
+      offen = false;
+      void quelle.return(undefined as never);
+    },
+  });
+
+  return new Response(strom, {
+    status: 200,
+    headers: withHeaders({ "Content-Type": "text/event-stream; charset=utf-8" }),
+  });
 }
 
 /**
