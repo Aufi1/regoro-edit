@@ -166,6 +166,70 @@ describe.skipIf(!haveBwrap())("das Worker-Protokoll", () => {
     expect(antwort.fehler).toMatch(/[a-zäöüß]{4,}/i); // deutscher Klartext
   }, 30_000);
 
+  describe("die Verbindung zur Recherche — nicht die Recherche selbst", () => {
+    /**
+     * WARUM DIESE TESTS EXISTIEREN. `recherche.test.ts` prüft `holeSeite` direkt,
+     * mit siebzig Fällen, und war die ganze Zeit grün. Trotzdem bekam der Agent
+     * bei JEDER Adresse „Der Zugang zum Seitenabruf wurde abgelehnt": Die
+     * Aufrufstelle in `agent.ts` übergab nur ein Argument, `firecrawlKey` war
+     * `undefined`, und weil `undefined !== ""` ist, ging `Authorization: Bearer
+     * undefined` hinaus. Gegen die echte API gemessen: mit diesem Kopf 401,
+     * ohne ihn 200.
+     *
+     * Der Prüfling war also richtig, die VERBINDUNG war ungeprüft. Deshalb
+     * fahren diese Fälle den Weg, den der Agent wirklich nimmt — über das
+     * Worker-Protokoll —, und nicht `holeSeite` von Hand.
+     *
+     * Und sie kommen ohne Netz aus: `holeSeite` prüft `firecrawlKey === null`
+     * VOR der Zieladresse. Eine Loopback-Adresse trennt die beiden Fälle
+     * deshalb sauber — „nicht eingerichtet" gegen „private Adresse gesperrt" —,
+     * ohne dass je eine Anfrage hinausgeht.
+     */
+    async function frage(art: "frage-abruf" | "frage-suche", kiTeil: Partial<KiConfig>): Promise<string> {
+      ctx = { ...ctx, ki: { ...KI, ...kiTeil } };
+      expect(start(art).ok).toBe(true);
+      const e = await sammle();
+      const roh = text(e).replace(/^antwort:/, "");
+      return JSON.stringify(JSON.parse(roh));
+    }
+
+    test("ohne Firecrawl-Schlüssel: fail-closed, mit dem Grund „nicht eingerichtet“", async () => {
+      // Der Regressionswächter für den Fehler oben: Käme hier statt dessen die
+      // Adressmeldung, wäre `firecrawlKey` unterwegs zu `undefined` geworden —
+      // denn `undefined === null` ist falsch, und die Prüfung fiele aus.
+      const antwort = await frage("frage-abruf", { firecrawlKey: null });
+      expect(antwort).toContain("nicht eingerichtet");
+    }, 30_000);
+
+    test("mit Firecrawl-Schlüssel: der Wert kommt an — es scheitert erst an der Adresse", async () => {
+      // Dieselbe Anfrage, nur mit Schlüssel: Jetzt MUSS die Ablehnung von der
+      // SSRF-Sperre kommen, nicht von der Einrichtungsprüfung. Das ist der
+      // Beweis, dass der Wert durchgereicht wird und nicht unterwegs verloren
+      // geht — ohne dass eine einzige Anfrage das Loopback verlässt.
+      const antwort = await frage("frage-abruf", { firecrawlKey: "fc-attrappe-nie-benutzt" });
+      expect(antwort).not.toContain("nicht eingerichtet");
+      // Nur die RICHTUNG der Ablehnung, nicht ihr Wortlaut: Den besitzt
+      // Dev-Netz, und ihn hier zu zitieren hieße, ihn an zwei Stellen zu führen.
+      expect(antwort).toMatch(/Adresse/i);
+    }, 30_000);
+
+    test("ein LEERER Firecrawl-Schlüssel ist eingerichtet, nicht abwesend", async () => {
+      // Die Unterscheidung, die schon zweimal verloren ging: "" heißt „ein
+      // ausgehender Proxy hängt die Anmeldung an", nicht „aus". Wer sie hier
+      // einebnet, schaltet den Seitenabruf in der Entwicklung wortlos ab.
+      const antwort = await frage("frage-abruf", { firecrawlKey: "" });
+      expect(antwort).not.toContain("nicht eingerichtet");
+      expect(antwort).toMatch(/Adresse/i);
+    }, 30_000);
+
+    test("ohne Brave-Schlüssel wird gar nicht erst gesucht", async () => {
+      // Derselbe Schnitt für den anderen Weg. Fail-closed heißt hier: nicht
+      // suchen, statt ersatzweise irgendetwas anderes zu tun.
+      const antwort = await frage("frage-suche", { braveKey: null });
+      expect(antwort).toContain("nicht eingerichtet");
+    }, 30_000);
+  });
+
   test("stderr des Workers geht ins Log, nie in den Ereignisstrom", async () => {
     // Die Attrappe schreibt auf stderr, was sie geschrieben hat — samt Pfaden
     // aus der Arbeitskopie. Landete das im Strom, sähe der Kunde interne

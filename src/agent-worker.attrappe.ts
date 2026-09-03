@@ -319,6 +319,16 @@ async function lauf(): Promise<void> {
       return;
     }
 
+    // Fragt einen SEITENABRUF an und meldet die Antwort wörtlich zurück.
+    // Gegenstück zu `frage-suche`, für den zweiten Recherche-Weg.
+    case "frage-abruf": {
+      sende({ t: "frage", id: 1, art: "fetch_page", url: ziel === "" ? "http://127.0.0.1:9/x" : ziel });
+      const antwort = await ersteAntwort();
+      sende({ t: "text", inhalt: `antwort:${JSON.stringify(antwort)}` });
+      sende({ t: "fertig", zusammenfassung: "Abruf verwertet." });
+      return;
+    }
+
     default: {
       sende({ t: "fehler", meldung: `Attrappe kennt das Szenario "${szenario}" nicht.` });
       process.exit(2);

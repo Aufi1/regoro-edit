@@ -859,6 +859,80 @@ describe("regoro ki", () => {
     expect(gelesen().baseUrl).toBe("https://cortecs.ai/v1");
   });
 
+  test("eine Schlüsselrotation lässt Endpunkt, Modell und die anderen Schlüssel stehen", () => {
+    // DER CORTECS-FALL, und der Grund, warum dieser Test wichtiger ist als er
+    // aussieht. Vorher ersetzte jeder Aufruf die ganze Datei: Eine
+    // Routine-Rotation des Modellschlüssels löschte Brave und Firecrawl UND
+    // setzte baseUrl und model auf die Vorgaben zurück.
+    //
+    // Die zwei fehlenden Schlüssel merkt man beim nächsten Lauf. Den stillen
+    // Rückfall von Cortecs auf OpenRouter merkt NIEMAND — und damit hat sich
+    // der Verarbeitungsort geändert, bei einem Betreiber, der ihn bewusst in
+    // die EU gelegt hatte. Sichtbar nur in `--list`, wo nach einer Rotation
+    // niemand hinsieht.
+    runKi(["--stdin", "--base-url", "https://cortecs.ai/v1", "--model", "z-ai/glm-4.6"], {
+      zeilen: ["modell=sk-alt-0000000000000000000", "brave=brv-bleibt", "firecrawl=fc-bleibt"],
+    });
+    const vorher = gelesen();
+
+    // Die Rotation: nur der Modellschlüssel, sonst nichts.
+    const r = runKi(["--stdin"], { zeilen: ["modell=sk-neu-0000000000000000000"] });
+    expect(r.code).toBe(0);
+
+    const nachher = gelesen();
+    expect(nachher.apiKey).toBe("sk-neu-0000000000000000000"); // geändert
+    expect(nachher.baseUrl).toBe(vorher.baseUrl); // und sonst NICHTS
+    expect(nachher.model).toBe(vorher.model);
+    expect(nachher.braveKey).toBe("brv-bleibt");
+    expect(nachher.firecrawlKey).toBe("fc-bleibt");
+  });
+
+  test("nur den Endpunkt ändern geht ohne Modellschlüssel", () => {
+    // Beim ÄNDERN eines bestehenden Zugangs ist ein Aufruf ohne `modell=` in
+    // Ordnung — sonst müsste der Betreiber den Schlüssel jedes Mal wieder
+    // durch die Standardeingabe schicken, nur um den Endpunkt zu wechseln.
+    runKi(["--stdin"], { zeilen: ["modell=sk-alt-0000000000000000000"] });
+    const r = runKi(["--base-url", "https://cortecs.ai/v1"]);
+    expect(r.code).toBe(0);
+    expect(gelesen().baseUrl).toBe("https://cortecs.ai/v1");
+    expect(gelesen().apiKey).toBe("sk-alt-0000000000000000000");
+  });
+
+  test("`--ohne brave` schaltet ab, ein leeres `brave=` schaltet wieder an", () => {
+    // Die drei Zustände eines Nebendienstes, in der Reihenfolge, in der ein
+    // Betreiber sie durchläuft. Ohne `--ohne` gäbe es keinen Weg zurück nach
+    // `null`: Ein einmal gesetzter Schlüssel bliebe für immer stehen, weil ein
+    // fehlendes Präfix „unverändert" heißt und nicht „weg".
+    runKi(["--stdin"], { zeilen: ["modell=sk-a-00000000000000000000", "brave=brv-1"] });
+    expect(gelesen().braveKey).toBe("brv-1");
+
+    expect(runKi(["--ohne", "brave"]).code).toBe(0);
+    expect(gelesen().braveKey).toBeNull(); // nicht eingerichtet
+
+    expect(runKi(["--stdin"], { zeilen: ["brave="] }).code).toBe(0);
+    expect(gelesen().braveKey).toBe(""); // eingerichtet, Schlüssel von außen
+  });
+
+  test("`--ohne modell` wird abgewiesen und nennt die zwei richtigen Wege", () => {
+    // Ohne Modellzugang gibt es keine KI — das ist kein Nebendienst, den man
+    // einzeln abschaltet. Wer es versucht, meint eines von zwei anderen Dingen,
+    // und beide müssen in der Meldung stehen, sonst rät er.
+    runKi(["--stdin"], { zeilen: ["modell=sk-a-00000000000000000000"] });
+    const r = runKi(["--ohne", "modell"]);
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("--off");
+    expect(r.stderr).toContain("--key-from-proxy");
+    expect(gelesen().apiKey).toBe("sk-a-00000000000000000000"); // unangetastet
+  });
+
+  test("derselbe Name auf stdin UND in --ohne ist ein Fehler", () => {
+    // Eine der beiden Angaben stillschweigend gewinnen zu lassen wäre dieselbe
+    // Falle wie „der letzte gewinnt" beim doppelten Präfix.
+    runKi(["--stdin"], { zeilen: ["modell=sk-a-00000000000000000000"] });
+    const r = runKi(["--stdin", "--ohne", "brave"], { zeilen: ["brave=brv-1"] });
+    expect(r.code).toBe(1);
+  });
+
   test("--off entfernt die Datei — und damit die Seitenleiste bei allen Kunden", () => {
     runKi(["--stdin"], { zeilen: ["modell=sk-a-00000000000000000000"] });
     expect(runKi(["--off"]).code).toBe(0);
