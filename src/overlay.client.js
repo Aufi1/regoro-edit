@@ -2222,6 +2222,28 @@
    * Text vom Agenten anhängen — an die laufende Blase, wenn es eine gibt.
    * Siehe agentTextBlase: Das Modell liefert einzelne Wortstücke.
    */
+  /**
+   * Ans Ende scrollen — aber NUR, wenn der Leser ohnehin schon unten steht.
+   *
+   * Vorher stand hier ein unbedingtes `scrollTop = scrollHeight` an drei
+   * Stellen. Wer während eines Laufs nach oben scrollte, um nachzulesen, was
+   * der Agent vorhin getan hat, wurde beim nächsten Ereignis wieder nach unten
+   * gerissen — und ein Lauf sendet viele Ereignisse. Zurücklesen war damit
+   * praktisch unmöglich, obwohl der Text die ganze Zeit dastand.
+   *
+   * Die Toleranz ist nicht null, sondern eine Zeilenhöhe: Ein Leser, der „unten
+   * genug" steht, will dem Strom folgen; wer bewusst hochgescrollt hat, nicht.
+   */
+  function agentAnsEnde(erzwingen) {
+    var v = ui.agent && ui.agent.verlauf;
+    if (!v) return;
+    if (!erzwingen) {
+      var abstand = v.scrollHeight - v.scrollTop - v.clientHeight;
+      if (abstand > 40) return;
+    }
+    v.scrollTop = v.scrollHeight;
+  }
+
   function agentText(stueck) {
     if (!agentPanel || !stueck) return;
     if (!agentTextBlase) {
@@ -2229,7 +2251,7 @@
       return;
     }
     agentTextBlase.textContent += stueck;
-    ui.agent.verlauf.scrollTop = ui.agent.verlauf.scrollHeight;
+    agentAnsEnde(false);
   }
 
   /** Eine Zeile in den Verlauf hängen und ans Ende scrollen. */
@@ -2242,7 +2264,8 @@
     else klasse += "__regoro-avon-agent";
     var node = el("div", { class: klasse, text: text });
     ui.agent.verlauf.appendChild(node);
-    ui.agent.verlauf.scrollTop = ui.agent.verlauf.scrollHeight;
+    // Eine eigene Nachricht des Kunden zieht den Blick immer mit.
+    agentAnsEnde(art === "kunde");
     return node;
   }
 
@@ -2255,7 +2278,7 @@
       el("span", { text: kurz })
     ]);
     ui.agent.verlauf.appendChild(node);
-    ui.agent.verlauf.scrollTop = ui.agent.verlauf.scrollHeight;
+    agentAnsEnde(false);
   }
 
   function setAgentLaeuft(laeuft) {
