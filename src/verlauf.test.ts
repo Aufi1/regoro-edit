@@ -18,6 +18,7 @@ import {
   AUFBEWAHRUNG_MS,
   MAX_NACHRICHTEN_JE_SEITE,
   MAX_NACHRICHT_ZEICHEN,
+  NACHRICHTEN_JE_SEITE,
   MAX_VERLAUF_BYTES,
   NEUER_VERLAUF_NACH_MS,
   bereiteSitzungVor,
@@ -454,6 +455,50 @@ describe("leseNachrichten", () => {
     const [info] = await listeVerlaeufe(site);
     const seite = (await leseNachrichten(site, info!.id, { anzahl: 1_000_000 }))!;
     expect(seite.nachrichten.length).toBe(MAX_NACHRICHTEN_JE_SEITE);
+  });
+
+  test("der Deckel hält auch gegen eine ZAHL, die keine ist", async () => {
+    /**
+     * DER TEST DARÜBER KONNTE DIESEN FALL NICHT FINDEN, und das ist der Punkt:
+     * `1_000_000` ist eine gültige Zahl und läuft sauber durch `min`/`max`.
+     * `?anzahl=abc` kommt dagegen als `NaN` an, rechnet sich unverändert durch
+     * — und `slice(NaN, gesamt)` behandelt `NaN` wie 0.
+     *
+     * Gemessen, bevor es behoben war, an einem Gespräch mit 600 Zeilen: heraus
+     * kamen ALLE 600 statt höchstens 100. Der Deckel war umgangen, und nichts
+     * daran sah nach einem Fehler aus.
+     */
+    const site = frischeSite();
+    legeRundenAn(site, 80);                              // 160 Zeilen
+    const [info] = await listeVerlaeufe(site);
+    for (const anzahl of [Number.NaN, Number("abc"), Number(undefined)]) {
+      const seite = (await leseNachrichten(site, info!.id, { anzahl }))!;
+      expect(`${anzahl} → ${seite.nachrichten.length}`).toBe(`${anzahl} → ${NACHRICHTEN_JE_SEITE}`);
+      expect(Number.isFinite(seite.ab)).toBe(true);
+    }
+  });
+
+  test("auch eine Werkzeugzeile wird gekürzt", async () => {
+    // `MAX_NACHRICHT_ZEICHEN` galt zuerst nur für Kunden- und Agententext. Die
+    // Werkzeugzeile entsteht aber aus Argumenten des MODELLS — eine einzige
+    // halluzinierte Riesen-URL machte die Seitenleiste unbrauchbar, also genau
+    // das, wogegen die Konstante gebaut ist.
+    const site = frischeSite();
+    const sm = SessionManager.create(mkdtempSync(join(tmpdir(), "verlauf-cwd-")), verlaufDir(site));
+    sm.appendMessage({ role: "user", content: "such was" } as never);
+    sm.appendMessage({
+      role: "assistant",
+      content: [{
+        type: "toolCall", id: "t1", name: "fetch_page",
+        arguments: { url: `https://beispiel.de/${"x".repeat(MAX_NACHRICHT_ZEICHEN * 2)}` },
+      }],
+    } as never);
+
+    const [info] = await listeVerlaeufe(site);
+    const seite = (await leseNachrichten(site, info!.id))!;
+    const werkzeug = seite.nachrichten.find((n) => n.von === "werkzeug")!;
+    expect(werkzeug.text.length).toBe(MAX_NACHRICHT_ZEICHEN + 1);
+    expect(werkzeug.text.endsWith("…")).toBe(true);
   });
 
   test("eine überlange Zeile wird sichtbar gekürzt", async () => {

@@ -102,6 +102,22 @@
   // sie liefen beim Hochziehen drei Anfragen parallel und die Zeilen kämen in
   // beliebiger Reihenfolge oben an.
   var agentLaedtAeltere = false;
+  /**
+   * Welche „Generation" von Ladevorgängen gerade gilt.
+   *
+   * `String(seite.id) !== String(agentVerlaufId)` allein reicht NICHT: Das
+   * unterscheidet nur „gehört diese Antwort zum aktuell gezeigten Gespräch",
+   * nicht „gehört sie zu MEINEM Ladevorgang". Der Fall, in dem das auseinander
+   * fällt: Beim Öffnen lädt die Leiste das fortzusetzende Gespräch; der Kunde
+   * klappt währenddessen „Gespräche" auf und wählt DASSELBE noch einmal an.
+   * Dann laufen zwei Anfragen für dieselbe Kennung, beide bestehen die Prüfung,
+   * beide hängen an — und die jüngsten Zeilen stehen doppelt da.
+   *
+   * Jeder Wechsel zählt hoch; ein Callback aus einer alten Generation legt
+   * seine Antwort weg. Ein Zähler statt `AbortController`, weil die Datei
+   * durchgehend mit Zustandsflaggen arbeitet und nirgends abbricht.
+   */
+  var agentLadeGeneration = 0;
   // Bild-Austausch-State.
   var images = [];          // [{ img, imgIdx, badge, imgClickHandler }]
   var fileInput = null;     // verstecktes <input type="file">, lazily erzeugt
@@ -2399,6 +2415,7 @@
     agentVerlaufNeu = false;
     agentAelteste = null;
     agentLaedtAeltere = false;
+    agentLadeGeneration++;
     ui.agent = {
       quota: quota, verlauf: verlauf, eingabe: eingabe,
       senden: senden, abbrechen: abbrechen, hinweis: hinweis,
@@ -2465,20 +2482,28 @@
    * (Routen fehlen, 404) darf die Seitenleiste nicht lahmlegen.
    */
   function ladeGespraech() {
+    var meine = agentLadeGeneration;
     holeListe().then(function (liste) {
-      if (!agentPanel) return 0;
+      if (!agentPanel || meine !== agentLadeGeneration) return;
       zeichneListe(liste);
       var id = liste && liste.fortsetzbar;
-      if (!id) return 0;
+      if (!id) return;
       agentVerlaufId = String(id);
-      return ladeNachrichten(agentVerlaufId, null);
+      return ladeNachrichten(agentVerlaufId, null, meine);
     }).catch(function () {
-      return 0;
-    }).then(function (geladen) {
+      /* kein Verlauf abrufbar — die Leiste arbeitet ohne */
+    }).then(function () {
       if (!agentPanel) return;
-      // Steht schon ein Gespräch da, reicht die Nachlese nur noch den AUSGANG
-      // des letzten Laufs nach — sein Wortlaut steht bereits oben.
-      ladeAgentStatus(false, { nurAbschluss: geladen > 0 });
+      /**
+       * Steht schon ein Gespräch da, reicht die Nachlese nur noch den AUSGANG
+       * des letzten Laufs nach — sein Wortlaut steht bereits oben.
+       *
+       * Gefragt wird das DOM und nicht der Rückgabewert von oben: Hat der Kunde
+       * inzwischen selbst gewählt, ist die Zahl von vorhin überholt, die Fläche
+       * aber immer richtig. Sie ist die Antwort auf genau die Frage, die hier
+       * zählt — „steht da schon etwas?".
+       */
+      ladeAgentStatus(false, { nurAbschluss: ui.agent.verlauf.children.length > 0 });
     });
   }
 
@@ -2593,12 +2618,19 @@
     agentVerlaufNeu = !id;
     agentAelteste = null;
     agentTextBlase = null;
+    // Ab hier gilt eine neue Generation: Antworten der alten legen sich selbst
+    // weg, statt in das frisch gewählte Gespräch zu fallen.
+    var meine = ++agentLadeGeneration;
+    // Und die Sperre lösen: Lief für das VORIGE Gespräch gerade ein Nachladen
+    // nach oben, bliebe sie sonst stehen, bis jene Anfrage sich auflöst — im
+    // neuen Gespräch ließe sich so lange nicht hochscrollen.
+    agentLaedtAeltere = false;
     ui.agent.verlauf.textContent = "";
     setAgentHinweis("");
     ui.agent.liste.hidden = true;
     ui.agent.gespraeche.setAttribute("aria-expanded", "false");
     if (!id) return;                 // neues Gespräch: die leere Fläche IST die Antwort
-    ladeNachrichten(id, null).catch(function () {
+    ladeNachrichten(id, null, meine).catch(function () {
       agentNachricht("Dieses Gespräch lässt sich nicht mehr öffnen.", "fehler");
     });
   }
@@ -2607,7 +2639,8 @@
    * Eine Seite eines Gesprächs holen und einhängen. `vor === null` heißt „die
    * jüngsten", sonst „die davor". Liefert die Zahl der eingehängten Zeilen.
    */
-  function ladeNachrichten(id, vor) {
+  function ladeNachrichten(id, vor, generation) {
+    var meine = generation === undefined ? agentLadeGeneration : generation;
     var u = "/edit/agent/verlauf?id=" + encodeURIComponent(id) + "&anzahl=" + VERLAUF_SEITE;
     if (typeof vor === "number") u += "&vor=" + vor;
     return fetch(u, {
@@ -2618,8 +2651,11 @@
       return res.json();
     }).then(function (seite) {
       if (!agentPanel || !seite || !seite.ok) return 0;
-      // Zwischenzeitlich gewechselt: Diese Antwort gehört zu einem Gespräch,
-      // das niemand mehr sieht. Sie einzuhängen mischte zwei Gespräche.
+      // Zwei Wächter, und beide werden gebraucht:
+      //   - die Generation fängt den überholten Ladevorgang ab, auch wenn er
+      //     zufällig DASSELBE Gespräch meint (sonst hängt er ein zweites Mal an),
+      //   - der Kennungsvergleich fängt die Antwort zu einem anderen Gespräch ab.
+      if (meine !== agentLadeGeneration) return 0;
       if (String(seite.id) !== String(agentVerlaufId)) return 0;
       var zeilen = Array.isArray(seite.nachrichten) ? seite.nachrichten : [];
       zeichneNachrichten(zeilen, typeof vor === "number");

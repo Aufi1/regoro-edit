@@ -88,6 +88,25 @@ interface Fall {
   gespraeche?: Gespraech[];
   /** Weitere Schritte im Browser, nach Öffnen/Abschicken. */
   schritte?: string[];
+  /**
+   * Verzögert NUR `/edit/agent/verlauf`, nicht die Liste.
+   *
+   * Damit wird ein Wettlauf reproduzierbar, der sonst nur auf einer langsamen
+   * Leitung auftritt und sich deshalb nicht prüfen ließe: Der Kunde klickt,
+   * während die erste Antwort noch unterwegs ist. Ohne diese Schraube wäre der
+   * Fall entweder immer grün (schnelles Loopback) oder gar nicht zu stellen.
+   */
+  verlaufVerzoegerungMs?: number;
+  /**
+   * Kein Warten zwischen Öffnen und den Zusatzschritten.
+   *
+   * Normalerweise steht dort `sleep 2`, damit das Gespräch geladen ist, bevor
+   * geklickt wird. Für einen Wettlauf-Fall ist genau das tödlich: Er MUSS in
+   * das offene Zeitfenster klicken. Beim ersten Versuch war der Fall deshalb
+   * auch mit absichtlich entferntem Wächter grün — ein Nachweis, der nicht
+   * anschlagen kann, beweist durch sein Ausbleiben nichts.
+   */
+  sofort?: boolean;
   /** JS-Ausdruck, im Browser ausgewertet — liefert das Prüfergebnis als JSON. */
   pruefung: string;
   /** Was dieser Ausdruck liefern MUSS. */
@@ -348,6 +367,43 @@ const FAELLE: Record<string, Fall> = {
     ereignisse: [rahmen("fehler", { grund: "Kein Lauf aktiv." })],
   },
 
+  "verlauf-wettlauf": {
+    tun:
+      "Leiste öffnen und SOFORT — während das Gespräch noch lädt — „Gespräche“ " +
+      "aufklappen und denselben (obersten) Eintrag anklicken.",
+    erwartung:
+      "Jede Zeile steht GENAU EINMAL da. Zwei Ladevorgänge sind unterwegs, beide " +
+      "für dasselbe Gespräch; der überholte muss seine Antwort wegwerfen. Ein " +
+      "Wächter, der nur „gehört die Antwort zum aktuell gewählten Gespräch?“ " +
+      "fragt, lässt hier beide durch — und die jüngsten Zeilen stünden doppelt.",
+    ki: true,
+    verlaufVerzoegerungMs: 1500,
+    sofort: true,
+    gespraeche: [
+      {
+        id: "g-renn",
+        titel: "Das Gespräch von vorhin",
+        vorMs: 60_000,
+        zeilen: [
+          { von: "kunde", text: "Renn-Zeile 1" },
+          { von: "agent", text: "Renn-Zeile 2" },
+          { von: "kunde", text: "Renn-Zeile 3" },
+        ],
+      },
+    ],
+    schritte: [
+      // KEIN sleep davor: Der Klick MUSS in das offene Zeitfenster fallen.
+      LISTE_AUF,
+      "js \"Array.from(document.querySelectorAll('.__regoro-aetitel'))" +
+        ".find(function(n){return n.textContent==='Das Gespräch von vorhin'}).click()\"",
+      "sleep 5",
+    ],
+    pruefung: `JSON.stringify({zeilen:${Q.zeilen},dubletten:${Q.zeilen}.length-new Set(${Q.zeilen}).size})`,
+    sollwert:
+      '{"zeilen":["Renn-Zeile 1","Renn-Zeile 2","Renn-Zeile 3"],"dubletten":0}',
+    ereignisse: [rahmen("fehler", { grund: "Kein Lauf aktiv." })],
+  },
+
   "verlauf-fehlt": {
     tun: "Leiste öffnen, irgendeinen Auftrag abschicken.",
     erwartung:
@@ -404,7 +460,9 @@ function seite(ki: boolean): string {
 <h1 data-edit-idx="0">Prüfstand</h1>
 <p data-edit-idx="1">Dieser Absatz ist editierbar — damit der Dirty-Guard der Leiste
 prüfbar ist: Text ändern, dann einen Auftrag abschicken. Die Leiste muss ihn ablehnen
-und sagen, warum.</p>
+und sagen, warum. <strong>Speichern kann dieser Prüfstand nicht</strong> — er bildet
+die KI-Seitenleiste nach, nicht den Text-Editor; „Speichern" antwortet deshalb mit
+einer Erklärung statt mit einem nackten Fehler.</p>
 <script>window.__REGORO_EDIT__ = ${JSON.stringify(cfg).replace(/</g, "\\u003c")};</script>
 <script src="/edit-assets/overlay.js"></script>
 </body></html>`;
@@ -476,6 +534,29 @@ function starte(): void {
     const erschoepft = fallName === ERSCHOEPFT;
     const fall = FAELLE[fallName] ?? FAELLE["mit-dateien"]!;
 
+    /**
+     * Die Routen des TEXT-Editors gibt es hier nicht — und das muss man lesen
+     * können.
+     *
+     * Der Prüfstand bildet die KI-Seitenleiste nach, nicht den Editor: kein
+     * Site-Verzeichnis, kein git, nichts zu speichern. Vorher fiel ein Klick auf
+     * „Speichern" in den 404-Zweig ganz unten, und der Browser meldete nur
+     * „Speichern fehlgeschlagen (404)". Das liest sich wie ein Fehler im Editor
+     * und ist keiner — der Prüfer sucht dann an der falschen Stelle. Passiert,
+     * gemeldet, hier behoben.
+     *
+     * 501 statt 404, mit einem Satz im Rumpf: Das Overlay hängt den Rumpf an
+     * seine Meldung an, damit steht die Erklärung im Dialog.
+     */
+    if (/\/edit\/(save|upload|restore|versions)$/.test(pfad) || /\/edit\/version\//.test(pfad)) {
+      return new Response(
+        "Der Prüfstand speichert nicht — er bildet nur die KI-Seitenleiste nach. " +
+          "Text ändern ist trotzdem sinnvoll: Es prüft den Dirty-Guard, der einen " +
+          "Auftrag bei ungespeicherten Änderungen ablehnt.",
+        { status: 501, headers: { "Content-Type": "text/plain; charset=utf-8" } },
+      );
+    }
+
     if (pfad.endsWith("/edit-assets/overlay.js")) {
       // BEI JEDER ANFRAGE frisch von Platte, nicht einmal beim Start. Sonst
       // prüft man nach einer Änderung an overlay.client.js weiter die alte
@@ -525,7 +606,7 @@ function starte(): void {
       const vorRoh = vorTxt === null || vorTxt === "" ? Number.NaN : Number(vorTxt);
       const bis = Number.isFinite(vorRoh) && vorRoh >= 0 && vorRoh <= gesamt ? vorRoh : gesamt;
       const ab = Math.max(0, bis - anzahl);
-      return Response.json({
+      const antwort = {
         ok: true,
         id: g.id,
         titel: g.titel,
@@ -533,7 +614,10 @@ function starte(): void {
         nachrichten: g.zeilen.slice(ab, bis).map((z) => ({ ...z, zeit: Date.now() - g.vorMs })),
         ab,
         gesamt,
-      });
+      };
+      const warte = fall.verlaufVerzoegerungMs ?? 0;
+      if (warte > 0) return Bun.sleep(warte).then(() => Response.json(antwort));
+      return Response.json(antwort);
     }
     if (pfad.endsWith("/edit/agent/status")) {
       // Nach einem gesprengten Kontingent meldet der echte Server „erschöpft" —
@@ -625,7 +709,7 @@ function anleitung(name: string, fall: Fall): void {
   console.log(`     $B goto ${basis}/${name}/edit`);
   if (fall.ki) console.log(`     $B ${OEFFNEN}`);
   if (fall.auftrag) console.log(`     $B ${ABSCHICKEN}`);
-  if (fall.gespraeche || fall.schritte) console.log("     sleep 2");
+  if ((fall.gespraeche || fall.schritte) && !fall.sofort) console.log("     sleep 2");
   for (const schritt of fall.schritte ?? []) {
     if (schritt.startsWith("sleep ")) console.log(`     ${schritt}`);
     else console.log(`     $B ${schritt}`);

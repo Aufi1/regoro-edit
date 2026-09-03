@@ -1128,6 +1128,12 @@ async function handleAgentVerlaeufe(ctx: HostCtx): Promise<Response> {
 async function handleAgentVerlauf(url: URL, ctx: HostCtx): Promise<Response> {
   const id = url.searchParams.get("id") ?? "";
   if (id === "") return json({ ok: false, grund: "Kennung fehlt." }, 400);
+  // Dieselbe Grenze wie beim Auftrag. Nicht ausnutzbar (es folgt nur ein
+  // Zeichenkettenvergleich), aber zwei Wege in dieselbe Funktion sollen nicht
+  // verschieden streng sein — sonst rät beim nächsten Mal jemand, welcher gilt.
+  if (id.length > MAX_VERLAUF_KENNUNG) {
+    return json({ ok: false, grund: "Ungültige Gesprächskennung." }, 400);
+  }
 
   const vorRoh = url.searchParams.get("vor");
   const anzahlRoh = url.searchParams.get("anzahl");

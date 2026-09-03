@@ -505,6 +505,14 @@ describe("ein Gespräch zum Nachlesen", () => {
     expect(await r.json()).toEqual({ ok: false, grund: "Kennung fehlt." });
   });
 
+  test("eine absurd lange Kennung: 400, wie beim Auftrag", async () => {
+    // Zwei Wege führen in dieselbe Suche; sie sollen nicht verschieden streng
+    // sein, sonst rät beim nächsten Mal jemand, welche Grenze gilt.
+    const r = await ruf("GET", `/edit/agent/verlauf?id=${"x".repeat(500)}`, { cookie: cookie() });
+    expect(r.status).toBe(400);
+    expect(await r.json()).toEqual({ ok: false, grund: "Ungültige Gesprächskennung." });
+  });
+
   test("eine unbekannte Kennung: 404, kein Fehler", async () => {
     const r = await ruf("GET", "/edit/agent/verlauf?id=gibt-es-nicht", { cookie: cookie() });
     expect(r.status).toBe(404);

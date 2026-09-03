@@ -317,10 +317,24 @@ export async function leseNachrichten(
   const flach = leseFlach(info.datei);
   const gesamt = flach.length;
 
-  const anzahl = Math.min(
-    MAX_NACHRICHTEN_JE_SEITE,
-    Math.max(1, Math.trunc(opts.anzahl ?? NACHRICHTEN_JE_SEITE)),
-  );
+  /**
+   * `Number.isFinite` ZUERST, sonst hält der Deckel nicht.
+   *
+   * Gemessen an einem Gespräch mit 600 Zeilen: `?anzahl=abc` kommt als `NaN`
+   * an, rechnet sich durch `min`/`max`/`trunc` unverändert zu `NaN` durch, und
+   * `slice(NaN, gesamt)` behandelt `NaN` wie 0 — heraus kamen ALLE 600 Zeilen
+   * statt höchstens 100. Der Deckel war umgangen, ohne dass etwas nach einem
+   * Fehler aussah.
+   *
+   * Der Test dazu prüfte mit `anzahl: 1_000_000` und war grün: eine gültige
+   * Zahl kann diesen Weg gar nicht auslösen. Ein Nachweis, der nicht anschlagen
+   * kann, beweist durch sein Ausbleiben nichts.
+   */
+  const anzahlRoh = opts.anzahl;
+  const anzahl =
+    typeof anzahlRoh === "number" && Number.isFinite(anzahlRoh)
+      ? Math.min(MAX_NACHRICHTEN_JE_SEITE, Math.max(1, Math.trunc(anzahlRoh)))
+      : NACHRICHTEN_JE_SEITE;
   // `vor` ist der Index, VOR dem gelesen wird — der `ab`-Wert der vorigen
   // Antwort. Alles Unsinnige (negativ, zu groß, keine Zahl) fällt auf „ganz
   // hinten" zurück, statt eine leere Seite zu liefern.
@@ -409,7 +423,15 @@ function leseFlach(datei: string): VerlaufNachricht[] {
         if (b?.type === "text" && typeof b.text === "string") text += b.text;
         else if (b?.type === "toolCall") {
           schiebeText();
-          zeilen.push({ von: "werkzeug", text: kurzfassung(String(b.name ?? ""), b.arguments), zeit });
+          // AUCH hier `kuerze`: Die Zeile entsteht aus Argumenten des Modells
+          // (`web_search`-Anfrage, `fetch_page`-URL). Ohne den Deckel macht eine
+          // einzige halluzinierte Riesen-URL die Seitenleiste unbrauchbar — genau
+          // wofür `MAX_NACHRICHT_ZEICHEN` da ist. Stand hier zuerst nicht.
+          zeilen.push({
+            von: "werkzeug",
+            text: kuerze(kurzfassung(String(b.name ?? ""), b.arguments)),
+            zeit,
+          });
         }
         // `thinking` fällt hier heraus: Denkschritte sind kein Gespräch.
       }
