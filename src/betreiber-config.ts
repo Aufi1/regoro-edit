@@ -30,6 +30,23 @@ export const KI_CONFIG_PFAD = "/etc/regoro/ki.json";
  */
 export const MIN_API_KEY_LEN = 20;
 
+/**
+ * Was ein Schlüsselfeld bedeutet — für ALLE Felder dieser Datei gleich:
+ *
+ *   fehlt / falscher Typ  → `null`: Funktion **aus**, fail-closed.
+ *   `""`                  → Funktion **an**, der Schlüssel kommt von außen
+ *                           (ausgehender Proxy, Agent Vault).
+ *   Zeichenkette          → Funktion an, der Schlüssel steht in der Datei.
+ *
+ * Zwei benachbarte Felder derselben Datei dürfen nicht verschiedene Semantik
+ * für denselben leeren String führen — das behält niemand im Kopf, und die
+ * Abweichung fällt nicht auf, weil sie nicht scheitert, sondern nur nicht wirkt.
+ *
+ * `apiKey` ist die eine Ausnahme, und sie ist ausdrücklich gemacht: Dort
+ * verlangt `""` zusätzlich das Bekenntnis `keyFromProxy: true`, weil ein
+ * fehlender Modellschlüssel den ganzen Zugang betrifft und nicht nur eine
+ * Zusatzfunktion.
+ */
 export type KiConfig = {
   /** "" ist nur zulässig, wenn `keyFromProxy` gesetzt ist. */
   apiKey: string;
@@ -108,7 +125,13 @@ export function loadKiConfig(pfad: string = betreiberConfigPfad()): KiConfig | n
     keyFromProxy,
     // Ohne Brave-Schlüssel gibt es keine Websuche — der Agent arbeitet dann
     // ohne Recherche weiter, statt dass der ganze Zugang ausfällt.
-    braveKey: typeof obj.braveKey === "string" && obj.braveKey !== "" ? obj.braveKey : null,
+    //
+    // Der leere String bleibt erhalten und wird NICHT zu null: Er heißt
+    // „Funktion an, Schlüssel kommt von außen" — auf dieser Maschine setzt ein
+    // ausgehender Proxy ihn ein, genau wie bei `apiKey` mit `keyFromProxy`.
+    // Ihn wegzunormalisieren hieße: keine Websuche, ohne Fehler, ohne Logzeile,
+    // ohne dass irgendetwas rot wird. Es scheitert nicht, es wirkt nur nicht.
+    braveKey: typeof obj.braveKey === "string" ? obj.braveKey : null,
     baseUrl: typeof obj.baseUrl === "string" && obj.baseUrl !== "" ? obj.baseUrl : STANDARD_BASE_URL,
     model: typeof obj.model === "string" && obj.model !== "" ? obj.model : STANDARD_MODELL,
   };
