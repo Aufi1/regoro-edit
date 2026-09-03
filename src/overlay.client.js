@@ -387,7 +387,31 @@
   function injectStyles() {
     if (document.getElementById("__regoro-style")) return;
     var css = [
-      "#__regoro-bar{position:fixed;top:0;left:0;right:0;z-index:2147483600;",
+      /**
+       * UNSERE OBERFLÄCHE IST EINE FLEX-SPALTE, KEINE RECHNUNG.
+       *
+       * Vorher war jedes Stück einzeln `position:fixed` mit `top:0`, und damit
+       * musste die Höhe der Leiste an drei Stellen bekannt sein — erst als
+       * feste 52, dann als gemessene Variable. Beides ist eine Rechnung, die
+       * falsch werden kann: Die Leiste hat `flex-wrap:wrap` und wird schmal
+       * zweizeilig.
+       *
+       * Jetzt sagt die Struktur, was gilt: Die Hülle spannt den Bildschirm,
+       * die Leiste ist der erste Block, darunter kommt ein Block, der die
+       * Panels trägt. Wo die Panels anfangen, RECHNET DER BROWSER aus — die
+       * Höhe der Leiste steht nirgends mehr im CSS.
+       *
+       * `pointer-events` ist der Preis dafür: Die Hülle liegt über der
+       * Website, also lässt sie Klicks durch (`none`), und die Teile, die
+       * wirklich da sind, holen sie sich zurück (`auto`).
+       */
+      "#__regoro-shell{position:fixed;inset:0;z-index:2147483600;",
+      "display:flex;flex-direction:column;pointer-events:none;}",
+      "#__regoro-shell>*{pointer-events:auto;}",
+      "#__regoro-unten{flex:1 1 auto;min-height:0;display:flex;justify-content:flex-end;",
+      "pointer-events:none;}",
+      "#__regoro-unten>*{pointer-events:auto;}",
+      "#__regoro-bar{flex:0 0 auto;",
       "display:flex;align-items:center;gap:10px;flex-wrap:wrap;",
       "padding:8px 14px;background:#14324f;color:#fff;",
       "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;",
@@ -435,7 +459,7 @@
       ".__regoro-img-badge:hover{background:#e2571e;}",
       ".__regoro-img-badge[disabled]{opacity:.6;cursor:wait;}",
       // Versionen-Panel
-      "#__regoro-versions{position:fixed;top:0;right:0;bottom:0;width:380px;max-width:92vw;",
+      "#__regoro-versions{width:380px;max-width:92vw;height:100%;",
       "z-index:2147483601;background:#fff;color:#16222e;box-shadow:-4px 0 18px rgba(0,0,0,.28);",
       "display:flex;flex-direction:column;",
       "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;}",
@@ -504,7 +528,7 @@
       // höherer z-index (2147483603 > 2147483601): Beide schließen sich zwar
       // gegenseitig aus, aber wenn doch einmal beide offen sind, soll das
       // Chatfenster oben liegen — dort tippt der Kunde.
-      "#__regoro-agent{position:fixed;top:0;right:0;bottom:0;width:420px;max-width:96vw;",
+      "#__regoro-agent{width:var(--regoro-apanel);max-width:96vw;height:100%;",
       "z-index:2147483603;background:#fff;color:#16222e;box-shadow:-4px 0 18px rgba(0,0,0,.28);",
       "display:flex;flex-direction:column;",
       "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;}",
@@ -552,7 +576,7 @@
       "background:#e2571e;animation:__regoro-apuls 1.1s ease-in-out infinite;}",
       "@keyframes __regoro-apuls{0%,100%{opacity:.25}50%{opacity:1}}",
       // Body-Offset, damit der fixe Balken nichts verdeckt
-      "body.__regoro-offset{padding-top:52px;}",
+      "body.__regoro-offset{padding-top:var(--regoro-barh,52px);}",
 
       /**
        * DIE SEITENLEISTE SCHIEBT, SIE ÜBERDECKT NICHT.
@@ -568,6 +592,20 @@
        * können sie nicht.
        */
       ":root{--regoro-apanel:420px;}",
+
+      /**
+       * DIE PANELS BEGINNEN UNTER DER LEISTE, NICHT ÜBER IHR.
+       *
+       * Sie stand vorher unter dem Panel (z-index 2147483600 gegen …603) und
+       * war damit verdeckt — inklusive „Speichern", „Versionen" und dem
+       * Schließen-Knopf. Man kam aus dem Chat nur über seinen eigenen Knopf
+       * heraus und konnte nicht speichern, ohne ihn zu verlassen.
+       *
+       * `--regoro-barh` wird GEMESSEN, nicht angenommen: Die Leiste hat
+       * `flex-wrap:wrap` und wird auf schmalen Fenstern zweizeilig. Die feste
+       * 52 stimmte dort nie — sie stand vorher schon im Body-Abstand und war
+       * dort genauso falsch, nur weniger sichtbar.
+       */
       "body.__regoro-agent-offen{padding-right:var(--regoro-apanel);}",
       "body.__regoro-agent-offen #__regoro-bar{right:var(--regoro-apanel);}",
 
@@ -588,7 +626,7 @@
       "@media (max-width:899px){",
       "  body.__regoro-agent-offen{padding-right:0;}",
       "  body.__regoro-agent-offen #__regoro-bar{right:0;}",
-      "  #__regoro-agent,#__regoro-versions{top:52px;left:0;right:0;width:auto;max-width:none;",
+      "  #__regoro-agent,#__regoro-versions{flex:1 1 auto;width:auto;max-width:none;",
       "  box-shadow:0 -4px 18px rgba(0,0,0,.28);}",
       "}"
     ].join("");
@@ -641,9 +679,47 @@
     ui.btnVersions.addEventListener("click", onVersions);
     if (ui.btnAgent) ui.btnAgent.addEventListener("click", onAgent);
 
-    document.body.appendChild(bar);
+    var shell = el("div", { id: "__regoro-shell" });
+    shell.appendChild(bar);
+    shell.appendChild(el("div", { id: "__regoro-unten" }));
+    document.body.appendChild(shell);
     document.body.classList.add("__regoro-offset");
+    messeLeiste(bar);
+    // Die Leiste bricht um, wenn das Fenster schmal wird. Die PANELS geht das
+    // nichts mehr an — sie sitzen in der Hülle und rutschen von selbst mit.
+    // Nur die Website darunter braucht den Wert noch (siehe messeLeiste).
+    if (typeof ResizeObserver === "function") {
+      new ResizeObserver(function () { messeLeiste(bar); }).observe(bar);
+    } else {
+      window.addEventListener("resize", function () { messeLeiste(bar); });
+    }
     updateButtons();
+  }
+
+  /** Der Platz, in den die Panels gehängt werden — unter der Leiste. */
+  function unten() {
+    return document.getElementById("__regoro-unten");
+  }
+
+  /**
+   * Der EINZIGE verbliebene gemessene Wert, und nur noch für die Website.
+   *
+   * Die Panels brauchen ihn nicht mehr — sie sitzen als Blöcke unter der
+   * Leiste, der Browser rechnet das aus. Für den Abstand des fremden `<body>`
+   * geht es nicht ohne: Die Leiste liegt über der Seite, und um ihren Inhalt
+   * nicht zu verdecken, muss die Seite wissen, wie hoch sie ist.
+   *
+   * Ganz ohne ginge es nur, indem wir den Inhalt der Kundenseite in einen
+   * eigenen Container einwickeln — dann würde der Browser auch das ausrechnen.
+   * Das ist bewusst NICHT gemacht: Es ist ein fremdes Dokument, und Regeln wie
+   * `body > header` brechen, sobald etwas dazwischen steht.
+   *
+   * `ResizeObserver` statt `resize`, weil die Leiste auch ohne Fenstergrößen-
+   * änderung umbrechen kann — etwa wenn ein Knopf dazukommt.
+   */
+  function messeLeiste(bar) {
+    var h = bar && bar.offsetHeight ? bar.offsetHeight : 52;
+    document.documentElement.style.setProperty("--regoro-barh", h + "px");
   }
 
   // ---------------------------------------------------------------------------
@@ -1982,7 +2058,8 @@
 
     panel.appendChild(head);
     panel.appendChild(body);
-    document.body.appendChild(panel);
+    // Wie die KI-Seitenleiste: unter die Leiste, nicht darüber.
+    (unten() || document.body).appendChild(panel);
     versionsPanel = panel;
 
     fetch("/edit/versions?page=" + encodeURIComponent(pageBasename), {
@@ -2155,7 +2232,7 @@
     panel.appendChild(quota);
     panel.appendChild(verlauf);
     panel.appendChild(form);
-    document.body.appendChild(panel);
+    (unten() || document.body).appendChild(panel);
     agentPanel = panel;
     // Erst JETZT, nicht vorher: Der Body soll nicht Platz freihalten für ein
     // Panel, das wegen eines Fehlers im Aufbau gar nicht erscheint.
