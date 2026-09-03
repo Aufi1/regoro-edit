@@ -6,7 +6,7 @@
  * Baseline-Commit (auth.json existiert beim Commit noch nicht) UND sorgt dafür,
  * dass ein fehlschlagendes git keine nutzlose Auth-Datei hinterlässt.
  */
-import { describe, expect, test, beforeEach, afterEach } from "bun:test";
+import { describe, expect, test, beforeEach, afterAll, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -703,5 +703,316 @@ describe("regoro kennung", () => {
     expect(runInit([site], { cwd: dir }).code).toBe(0);
     expect(existsSync(join(site, ".regoro", "auth.json"))).toBe(true);
     expect(existsSync(join(dir, ".regoro"))).toBe(false);
+  });
+});
+
+// ===========================================================================
+// `regoro ki` — der BETREIBERWEITE Modellzugang (Contract §0.3, §1)
+// ===========================================================================
+describe("regoro ki", () => {
+  /**
+   * Kein Site-Argument, und in den Tests auch nicht /etc/regoro: Der Pfad wird
+   * über $CREDENTIALS_DIRECTORY umgelenkt — genau der Weg, den systemd im
+   * Betrieb nimmt. Ein Test, der nach /etc schreiben müsste, wäre entweder rot
+   * oder gefährlich.
+   */
+  function runKi(args: string[], opts: { key?: string; creds?: string } = {}) {
+    const proc = Bun.spawnSync(["bun", CLI, "ki", ...args], {
+      cwd: dir,
+      env: { ...process.env, CREDENTIALS_DIRECTORY: opts.creds ?? dir },
+      stdin: opts.key === undefined ? undefined : new TextEncoder().encode(`${opts.key}\n`),
+    });
+    return { code: proc.exitCode, stdout: proc.stdout.toString(), stderr: proc.stderr.toString() };
+  }
+
+  test("nimmt KEIN Site-Argument — der Modellzugang gilt für alle Kunden", () => {
+    // Der Plan widerspricht sich hier; verbindlich ist „betreiberweit". Ein
+    // Site-Argument hieße: ein Schlüssel je Kunde, und beim zweiten Kunden
+    // fragt sich jemand, warum er ihn nochmal eintragen soll.
+    const site = join(dir, "site");
+    mkdirSync(site);
+    makeSite(site);
+    const r = runKi([site, "--key-stdin"], { key: "sk-test" });
+    expect(r.code).toBe(1);
+    expect(r.stderr).toMatch(/betreiberweit/i);
+    // Und vor allem: kein Schlüssel landet im Kundenordner.
+    expect(existsSync(join(site, ".regoro", "ki.json"))).toBe(false);
+  });
+
+  test("schreibt die Datei mit 0600 und dem Schlüssel aus stdin", () => {
+    const r = runKi(["--key-stdin"], { key: "sk-geheim-123" });
+    expect(r.code).toBe(0);
+    const datei = join(dir, "ki");
+    expect(existsSync(datei)).toBe(true);
+    expect(statSync(datei).mode & 0o777).toBe(0o600);
+    expect(JSON.parse(readFileSync(datei, "utf8")).apiKey).toBe("sk-geheim-123");
+  });
+
+  test("der Schlüssel steht nie in argv — nur auf stdin", () => {
+    // argv liest jeder Prozess dieses Hosts über /proc, und die Shell-History
+    // schreibt ihn auf die Platte.
+    const r = runKi(["--key", "sk-in-argv"]);
+    expect(r.code).toBe(1);
+    expect(r.stderr).toMatch(/--key-stdin|Verwendung/);
+  });
+
+  test("Vorgaben für Modell und baseUrl, überschreibbar", () => {
+    runKi(["--key-stdin"], { key: "sk-a" });
+    const vorgabe = JSON.parse(readFileSync(join(dir, "ki"), "utf8"));
+    expect(vorgabe.baseUrl).toBe("https://openrouter.ai/api/v1");
+    expect(vorgabe.model).toBe("z-ai/glm-5.3-flash");
+
+    runKi(["--key-stdin", "--model", "z-ai/glm-4.6", "--base-url", "https://cortecs.ai/v1"], { key: "sk-b" });
+    const eigen = JSON.parse(readFileSync(join(dir, "ki"), "utf8"));
+    expect(eigen.model).toBe("z-ai/glm-4.6");
+    expect(eigen.baseUrl).toBe("https://cortecs.ai/v1");
+  });
+
+  test("--off entfernt die Datei — und damit die Seitenleiste bei allen Kunden", () => {
+    runKi(["--key-stdin"], { key: "sk-a" });
+    expect(runKi(["--off"]).code).toBe(0);
+    expect(existsSync(join(dir, "ki"))).toBe(false);
+  });
+
+  test("`regoro disable` rührt die betreiberweite Datei NICHT an", () => {
+    // Sonst schaltete das Abschalten eines einzelnen Kunden die KI für alle ab.
+    makeSite(dir);
+    runInit([], { cwd: dir });
+    runKi(["--key-stdin"], { key: "sk-a" });
+    const proc = Bun.spawnSync(["bun", CLI, "disable", dir], {
+      cwd: dir,
+      env: { ...process.env, CREDENTIALS_DIRECTORY: dir },
+      stdin: new TextEncoder().encode("ja\n"),
+    });
+    expect(proc.exitCode).toBe(0);
+    expect(existsSync(join(dir, "ki"))).toBe(true);
+  });
+});
+
+// ===========================================================================
+// `regoro integration` — die Schlüssel des KUNDEN, pro Site
+// ===========================================================================
+describe("regoro integration", () => {
+  function runInteg(args: string[], key?: string) {
+    const proc = Bun.spawnSync(["bun", CLI, "integration", ...args], {
+      cwd: dir,
+      stdin: key === undefined ? undefined : new TextEncoder().encode(`${key}\n`),
+    });
+    return { code: proc.exitCode, stdout: proc.stdout.toString(), stderr: proc.stderr.toString() };
+  }
+
+  beforeEach(() => {
+    makeSite(dir);
+    runInit([], { cwd: dir });
+  });
+
+  test("legt eine benannte Integration an, Datei 0600", () => {
+    const r = runInteg([dir, "stripe", "--base-url", "https://api.stripe.com", "--key-stdin"], "rk_live_geheim");
+    expect(r.code).toBe(0);
+    const datei = join(dir, ".regoro", "integrationen.json");
+    expect(statSync(datei).mode & 0o777).toBe(0o600);
+    const inhalt = JSON.parse(readFileSync(datei, "utf8"));
+    expect(inhalt.integrationen.stripe.baseUrl).toBe("https://api.stripe.com");
+  });
+
+  test("--list zeigt den Schlüssel NIE, auch nicht gekürzt", () => {
+    // Bei kurzen Schlüsseln sind schon die letzten vier Zeichen zu viel. Nur
+    // „gesetzt/nicht gesetzt" plus Anlagedatum.
+    runInteg([dir, "stripe", "--base-url", "https://api.stripe.com", "--key-stdin"], "rk_live_geheim");
+    const r = runInteg([dir, "--list"]);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain("stripe");
+    expect(r.stdout).not.toContain("rk_live_geheim");
+    expect(r.stdout).not.toContain("geheim");
+    expect(r.stdout).not.toContain("live");
+  });
+
+  test("--off entfernt genau eine Integration, die andere bleibt", () => {
+    runInteg([dir, "stripe", "--base-url", "https://api.stripe.com", "--key-stdin"], "rk_a");
+    runInteg([dir, "brevo", "--base-url", "https://api.brevo.com", "--key-stdin"], "rk_b");
+    expect(runInteg([dir, "stripe", "--off"]).code).toBe(0);
+    const inhalt = JSON.parse(readFileSync(join(dir, ".regoro", "integrationen.json"), "utf8"));
+    expect(Object.keys(inhalt.integrationen)).toEqual(["brevo"]);
+  });
+
+  test("eine baseUrl ohne https wird abgelehnt", () => {
+    const r = runInteg([dir, "unsicher", "--base-url", "http://api.example.de", "--key-stdin"], "k");
+    expect(r.code).toBe(1);
+    expect(existsSync(join(dir, ".regoro", "integrationen.json"))).toBe(false);
+  });
+
+  test("--browser-herkunft nimmt nur absolute https-Origins", () => {
+    const gut = runInteg(
+      [dir, "stripe", "--base-url", "https://api.stripe.com", "--browser-herkunft", "https://js.stripe.com", "--key-stdin"],
+      "k",
+    );
+    expect(gut.code).toBe(0);
+    const schlecht = runInteg(
+      [dir, "boese", "--base-url", "https://api.example.de", "--browser-herkunft", "js.stripe.com", "--key-stdin"],
+      "k",
+    );
+    expect(schlecht.code).toBe(1);
+  });
+
+  test("integrationen.json ist gitignored wie auth.json", () => {
+    runInteg([dir, "stripe", "--base-url", "https://api.stripe.com", "--key-stdin"], "k");
+    expect(gitTracked(dir)).not.toContain(".regoro/integrationen.json");
+  });
+});
+
+// ===========================================================================
+// Lizenzen und der versteckte Worker-Unterbefehl
+// ===========================================================================
+describe("regoro licenses / agent-worker", () => {
+  test("licenses druckt die mitgelieferte Hinweisdatei", () => {
+    // Rechtspflicht, keine Fleißaufgabe: Ein --compile-Binary trägt von sich aus
+    // keine einzige der Lizenzdateien seiner Abhängigkeiten.
+    const r = runCli(["licenses"]);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain("MIT");
+    expect(r.stdout.length).toBeGreaterThan(1000);
+  });
+
+  test("agent-worker steht nicht in --help", () => {
+    // Er ist eine interne Wiedereinsprungstelle des eigenen Binaries, kein
+    // Bedienbefehl. In der Hilfe zu stehen lädt nur zum Herumprobieren ein.
+    expect(runCli(["--help"]).stdout).not.toContain("agent-worker");
+  });
+
+  test("agent-worker ohne die nötige Umgebung bricht ab, statt irgendetwas zu tun", () => {
+    const r = runCli(["agent-worker"]);
+    expect(r.code).not.toBe(0);
+  });
+});
+
+// ===========================================================================
+// Das KOMPILIERTE Binary — die Lücke, die `bun test` sonst offen lässt
+// ===========================================================================
+describe("das kompilierte Binary", () => {
+  /**
+   * WARUM DAS EIN EIGENER TEST SEIN MUSS. Die ganze übrige Suite fährt den
+   * dev-Pfad: dort liest `host.ts` das Overlay aus einer echten Datei. Im
+   * `--compile`-Binary liegt es unter `/$bunfs`, und ein Rückbau auf
+   * `import.meta.url` zeigt dort ins Leere. Der Editor wäre dann **stumm
+   * funktionslos** — die Seite lädt, die Leiste erscheint nie, und keine
+   * einzige Zusicherung dieser Suite bricht.
+   *
+   * CLAUDE.md verlangt diese Prüfung seit Langem von Hand („Binary bauen,
+   * PATH=/usr/bin:/bin, init + run, /edit-assets/overlay.js muss 200 liefern").
+   * Von Hand heißt: irgendwann macht es niemand mehr.
+   *
+   * `env -i` ist kein Beiwerk: Der Kundenhost hat weder bun noch node noch ein
+   * HOME. Ein Binary, das sich still auf eines davon stützt, fiele erst dort auf.
+   */
+  const BIN = join(tmpdir(), `regoro-bintest-${process.pid}`);
+
+  /**
+   * GEBAUT WIRD AUF MODULEBENE, nicht in `beforeAll`.
+   *
+   * `test.skipIf(bedingung)` wertet die Bedingung beim EINSAMMELN der Tests aus
+   * — also bevor irgendein `beforeAll` gelaufen ist. Mit einem dort gesetzten
+   * Flag sind alle Fälle dauerhaft übersprungen, und `bun test` meldet fröhlich
+   * grün. Genau die Klasse Fehler, gegen die dieser Block angetreten ist: Der
+   * Test existiert, läuft nie, und niemand merkt es.
+   */
+  const gebaut: boolean = (() => {
+    const res = Bun.spawnSync(
+      ["bun", "build", "--compile", new URL("./cli.ts", import.meta.url).pathname, "--outfile", BIN],
+      { cwd: join(import.meta.dir, ".."), stdout: "pipe", stderr: "pipe" },
+    );
+    if (res.exitCode !== 0 || !existsSync(BIN)) {
+      console.warn(`[test] Binary-Bau fehlgeschlagen: ${new TextDecoder().decode(res.stderr).slice(0, 400)}`);
+      return false;
+    }
+    return true;
+  })();
+
+  afterAll(() => {
+    rmSync(BIN, { force: true });
+  });
+
+  /** Ohne bun/node im PATH und ohne HOME — wie auf dem Kundenhost. */
+  function nackt(args: string[], opts: { cwd?: string; stdin?: string } = {}) {
+    const proc = Bun.spawnSync([BIN, ...args], {
+      cwd: opts.cwd ?? dir,
+      env: { PATH: "/usr/bin:/bin" },
+      stdin: opts.stdin === undefined ? undefined : new TextEncoder().encode(opts.stdin),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    return {
+      code: proc.exitCode,
+      stdout: new TextDecoder().decode(proc.stdout),
+      stderr: new TextDecoder().decode(proc.stderr),
+    };
+  }
+
+  test("es baut überhaupt", () => {
+    expect(gebaut).toBe(true);
+    expect(statSync(BIN).size).toBeGreaterThan(50 * 1024 * 1024);
+  });
+
+  test.skipIf(!gebaut)("läuft ohne bun, ohne node, ohne HOME", () => {
+    const r = nackt(["--version"]);
+    expect(r.code).toBe(0);
+    expect(r.stdout.trim()).toMatch(/^\d+\.\d+\.\d+$/);
+  });
+
+  test.skipIf(!gebaut)("liefert /edit-assets/overlay.js aus dem eingebetteten Asset", async () => {
+    // DER KERN DIESES TESTS. 404 hier heißt: der Editor ist in Produktion tot.
+    const site = join(dir, "site");
+    mkdirSync(site);
+    makeSite(site);
+    expect(nackt(["init", site, "--nummer", TEST_NUMMER]).code).toBe(0);
+
+    const port = 18_900 + (process.pid % 500);
+    const server = Bun.spawn([BIN, "run", site], {
+      env: { PATH: "/usr/bin:/bin", PORT: String(port) },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    try {
+      let antwort: Response | null = null;
+      for (let i = 0; i < 100 && antwort === null; i++) {
+        try {
+          antwort = await fetch(`http://127.0.0.1:${port}/edit-assets/overlay.js`);
+        } catch {
+          await Bun.sleep(100);
+        }
+      }
+      expect(antwort).not.toBeNull();
+      expect(antwort!.status).toBe(200);
+      const js = await antwort!.text();
+      // Nicht nur 200: eine leere Antwort mit 200 wäre derselbe stumme Ausfall.
+      expect(js.length).toBeGreaterThan(50_000);
+      expect(js).toContain("__regoro");
+
+      // Und die öffentliche Seite steht auch.
+      const seite = await fetch(`http://127.0.0.1:${port}/index.html`);
+      expect(seite.status).toBe(200);
+      await seite.text();
+    } finally {
+      server.kill();
+      await server.exited;
+    }
+  }, 60_000);
+
+  test.skipIf(!gebaut)("`licenses` findet die eingebettete Hinweisdatei", () => {
+    // Zweites Asset nach demselben Muster (`with { type: "file" }`). Es bricht
+    // genauso lautlos und ist zugleich eine Rechtspflicht.
+    const r = nackt(["licenses"]);
+    expect(r.code).toBe(0);
+    expect(r.stdout.length).toBeGreaterThan(1000);
+    // Keine Bau-Pfade in der ausgelieferten Datei.
+    expect(r.stdout).not.toContain("node_modules/");
+    expect(r.stdout).not.toContain("/srv/work/repos");
+  });
+
+  test.skipIf(!gebaut)("der versteckte agent-worker existiert im Binary", () => {
+    // Der Worker ist DASSELBE Binary mit einem anderen ersten Argument. Fehlt
+    // der Unterbefehl dort, scheitert jeder Agentenlauf erst in Produktion.
+    const r = nackt(["agent-worker"]);
+    expect(r.code).not.toBe(0);
+    expect(r.stderr + r.stdout).not.toContain("Unbekannter Befehl");
   });
 });

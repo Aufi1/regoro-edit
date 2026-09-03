@@ -5,7 +5,7 @@
  * Vorlage, die nicht parst, ist schlimmer als keine.
  */
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -103,6 +103,85 @@ describe("systemdUnit", () => {
   });
 });
 
+// ===========================================================================
+// Die Unit für den Agentenbetrieb (Contract §8)
+// ===========================================================================
+describe("systemdUnit trägt, was ein Agentenlauf braucht", () => {
+  test("der Modellschlüssel kommt über LoadCredential, nicht über die Umgebung", () => {
+    // systemd liest /etc/regoro/ki.json als root und legt sie in ein tmpfs, das
+    // nur dieser Dienst sieht. Damit muss sie für den Dienst-Benutzer gar nicht
+    // lesbar sein, taucht in KEINEM Prozess-Environment auf und nicht in /proc.
+    // Ein `Environment=OPENROUTER_KEY=…` stünde dagegen in `systemctl show` und
+    // in der Umgebung jedes Kindprozesses — auch der des Agenten.
+    const u = systemdUnit(base);
+    expect(u).toContain("LoadCredential=ki:/etc/regoro/ki.json");
+    expect(u).not.toMatch(/^Environment=.*(KEY|TOKEN|SECRET)/im);
+  });
+
+  test("RuntimeDirectory gibt der Arbeitskopie ihren Platz", () => {
+    // Ohne das läge die Kopie in /tmp — geteilt mit jedem anderen Dienst des
+    // Hosts. RuntimeDirectory räumt systemd beim Dienstende zudem selbst auf.
+    expect(systemdUnit(base)).toMatch(/^RuntimeDirectory=regoro-mueller$/m);
+  });
+
+  test("Ressourcengrenzen: ein entgleister Lauf reißt den Host nicht mit", () => {
+    const u = systemdUnit(base);
+    for (const zeile of ["MemoryHigh=2G", "MemoryMax=3G", "TasksMax=512", "CPUQuota=200%"]) {
+      expect(u).toContain(zeile);
+    }
+  });
+
+  test("zusätzliche Härtung, die bwrap nicht stört", () => {
+    const u = systemdUnit(base);
+    for (const zeile of [
+      "ProtectProc=invisible",
+      "RestrictSUIDSGID=yes",
+      "LockPersonality=yes",
+      "ProtectKernelModules=yes",
+      "ProtectClock=yes",
+    ]) {
+      expect(u).toContain(zeile);
+    }
+  });
+
+  test("die zwei Schalter, die bwrap LAUTLOS brechen, stehen nicht drin", () => {
+    // Beide sehen nach gutem Hardening aus. `RestrictNamespaces=yes` sperrt ALLE
+    // Namespace-Typen, `bwrap` braucht user, mnt und pid. `SystemCallFilter=
+    // @system-service` schließt @mount aus — genau das, was bwrap tut. Der Dienst
+    // startet in beiden Fällen sauber, und erst der erste Agentenlauf scheitert;
+    // dann sucht jemand tagelang im falschen Code.
+    const u = systemdUnit(base);
+    expect(u).not.toMatch(/^RestrictNamespaces=yes$/m);
+    expect(u).not.toMatch(/^SystemCallFilter=@system-service$/m);
+    if (/^RestrictNamespaces=/m.test(u)) expect(u).toMatch(/^RestrictNamespaces=~/m);
+    if (/^SystemCallFilter=/m.test(u)) expect(u).toMatch(/^SystemCallFilter=.*@mount/m);
+  });
+
+  test("NoNewPrivileges bleibt — es stört bwrap nicht", () => {
+    // Das Ubuntu-bwrap hat kein Setuid-Bit (nachgemessen). Auf einem System mit
+    // setuid-bwrap wäre NoNewPrivileges ein Problem; hier ist es keines und
+    // gehört nicht „vorsichtshalber" entfernt.
+    expect(systemdUnit(base)).toContain("NoNewPrivileges=yes");
+  });
+
+  test("ProtectSystem=strict + ReadWritePaths gelten auch für den Agentenprozess", () => {
+    // Über den Mount-Namespace, und ein Kind kann das nicht abstreifen. Das ist
+    // die eigentliche Begründung dafür, dass die Abschottung trägt — sie gehört
+    // als Kommentar in die Unit, sonst entfernt es irgendwann jemand als
+    // „unnötig, wir haben ja bwrap".
+    const u = systemdUnit(base);
+    expect(u).toContain("ProtectSystem=strict");
+    expect(u).toMatch(/Kindprozess|Kindprozesse/);
+  });
+
+  test("auch im Sammelbetrieb", () => {
+    const u = systemdUnit({ ...base, siteDir: "/srv/sites", slug: "sites", multi: true, domain: undefined });
+    expect(u).toContain("LoadCredential=ki:/etc/regoro/ki.json");
+    expect(u).toMatch(/^RuntimeDirectory=regoro-sites$/m);
+    expect(u).toContain("MemoryMax=3G");
+  });
+});
+
 describe("caddyBlock", () => {
   test("enthält Domain, Editor-Proxy auf den Port und die Site-Root", () => {
     const c = caddyBlock(base);
@@ -164,12 +243,36 @@ describe("DOMAIN_RE", () => {
 describe("Pfade mit Leerzeichen", () => {
   const spaced = { ...base, siteDir: "/srv/sites/Meine Firma/site", execPath: "/opt/my tools/regoro" };
 
-  test("systemd: ExecStart, WorkingDirectory, ReadWritePaths sind gequotet", () => {
+  test("systemd: ExecStart und ReadWritePaths gequotet, WorkingDirectory NICHT", () => {
+    // NICHT VEREINHEITLICHEN — die drei Direktiven lesen verschieden.
+    //
+    // Quoting gilt in Unit-Dateien nur für Einstellungen, die eine LISTE lesen.
+    // `WorkingDirectory=` nimmt den Rest der Zeile wörtlich; die Anführungs-
+    // zeichen werden Teil des Pfades. Nachgemessen auf systemd 255:
+    //
+    //   WorkingDirectory="/tmp"  → „path is not absolute: "/tmp"",
+    //                              „Unit configuration has fatal error", Exit 1
+    //   WorkingDirectory=/tmp    → Exit 0
+    //   WorkingDirectory=/tmp/mit leerzeichen → Exit 0 (Leerzeichen sind egal)
+    //
+    // Diese Datei hat das Quoting früher für alle drei verlangt. Folge: `regoro
+    // service --systemd | sudo tee …` erzeugte eine Unit, die NIE startete —
+    // und der Test hielt den Fehler fest, statt ihn zu finden.
     const u = systemdUnit(spaced);
-    // Ohne Quoting startete systemd `regoro run /srv/sites/Meine`.
     expect(u).toContain('ExecStart="/opt/my tools/regoro" run "/srv/sites/Meine Firma/site"');
-    expect(u).toContain('WorkingDirectory="/srv/sites/Meine Firma/site"');
     expect(u).toContain('ReadWritePaths="/srv/sites/Meine Firma/site"');
+    expect(u).toContain("WorkingDirectory=/srv/sites/Meine Firma/site");
+  });
+
+  test("WorkingDirectory= beginnt nie mit einem Anführungszeichen", () => {
+    // Ausdrücklich negativ formuliert, damit das Quoting bei der nächsten
+    // „Vereinheitlichung" nicht zurückkommt: Ein Test, der nur den richtigen
+    // Wert erwartet, ließe `WorkingDirectory="…"` in einer anderen Schreibweise
+    // wieder durch.
+    for (const opts of [spaced, base, baseMulti]) {
+      const zeile = systemdUnit(opts).match(/^WorkingDirectory=.*$/m)![0];
+      expect(zeile).not.toMatch(/^WorkingDirectory="/);
+    }
   });
 
   test("Caddy: root-Pfad ist gequotet", () => {
@@ -196,6 +299,77 @@ function haveCaddy(): boolean {
     return false;
   }
 }
+
+/** Wie `haveCaddy()`: Bun.spawnSync WIRFT, wenn die Binary fehlt. */
+function haveSystemdAnalyze(): boolean {
+  try {
+    return Bun.spawnSync(["systemd-analyze", "--version"]).exitCode === 0;
+  } catch {
+    return false;
+  }
+}
+
+describe("die erzeugte Unit ist für systemd gültig", () => {
+  /**
+   * DAS IST DIE EIGENTLICHE ABSICHERUNG. Die Zeichenketten-Prüfungen oben
+   * halten fest, was wir für richtig HALTEN — und lagen beim Quoting von
+   * `WorkingDirectory=` jahrelang falsch, ohne dass es jemandem auffiel. Ein
+   * Vergleich mit der eigenen Erwartung kann so einen Fehler grundsätzlich
+   * nicht finden; nur systemd selbst kann das.
+   *
+   * `--recursive-errors=no`, weil `verify` sonst über Abhängigkeiten wie
+   * network.target mitklagt, die in einem tmp-Verzeichnis nicht existieren.
+   */
+  function verify(unit: string): { code: number | null; ausgabe: string } {
+    const dir = mkdtempSync(join(tmpdir(), "regoro-unit-"));
+    const datei = join(dir, "regoro-probe.service");
+    writeFileSync(datei, unit);
+    const res = Bun.spawnSync(["systemd-analyze", "verify", "--recursive-errors=no", datei]);
+    rmSync(dir, { recursive: true, force: true });
+    const dec = new TextDecoder();
+    return { code: res.exitCode, ausgabe: dec.decode(res.stderr) + dec.decode(res.stdout) };
+  }
+
+  /** Site-Ordner und Binary müssen existieren, sonst klagt verify über beides. */
+  function echteOpts(extra: Partial<typeof base> = {}) {
+    const site = mkdtempSync(join(tmpdir(), "regoro-unitsite-"));
+    return { ...base, siteDir: site, execPath: "/bin/true", ...extra };
+  }
+
+  test.skipIf(!haveSystemdAnalyze())("Einzelbetrieb: keine fatale Konfiguration", () => {
+    const { code, ausgabe } = verify(systemdUnit(echteOpts()));
+    expect(`${ausgabe}`).not.toContain("fatal error");
+    expect(ausgabe).not.toContain("bad unit file setting");
+    expect(code).toBe(0);
+  });
+
+  test.skipIf(!haveSystemdAnalyze())("Sammelbetrieb: keine fatale Konfiguration", () => {
+    const site = mkdtempSync(join(tmpdir(), "regoro-unitsites-"));
+    const { code, ausgabe } = verify(systemdUnit({ ...baseMulti, siteDir: site, execPath: "/bin/true" }));
+    expect(ausgabe).not.toContain("fatal error");
+    expect(code).toBe(0);
+  });
+
+  test.skipIf(!haveSystemdAnalyze())("auch mit Leerzeichen im Site-Pfad", () => {
+    // Der Fall, an dem das Quoting überhaupt hängt.
+    const eltern = mkdtempSync(join(tmpdir(), "regoro-unitraum-"));
+    const site = join(eltern, "Meine Firma");
+    mkdirSync(site, { recursive: true });
+    const { code, ausgabe } = verify(systemdUnit(echteOpts({ siteDir: site })));
+    expect(ausgabe).not.toContain("fatal error");
+    expect(code).toBe(0);
+  });
+
+  test.skipIf(!haveSystemdAnalyze())("GEGENPROBE: ein gequotetes WorkingDirectory würde auffallen", () => {
+    // Ohne diese Zeile wüsste niemand, ob `verify` den Fehler überhaupt sieht —
+    // ein Test, der nur „keine fatale Konfiguration" prüft, ist auch grün, wenn
+    // das Werkzeug gar nichts prüft.
+    const kaputt = systemdUnit(echteOpts()).replace(/^WorkingDirectory=(.*)$/m, 'WorkingDirectory="$1"');
+    const { code, ausgabe } = verify(kaputt);
+    expect(ausgabe).toContain("fatal error");
+    expect(code).not.toBe(0);
+  });
+});
 
 describe("der erzeugte Caddy-Block ist gültiges Caddyfile", () => {
   function validate(block: string): string {
@@ -237,7 +411,7 @@ describe("systemdUnit --multi", () => {
   test("ExecStart ruft `serve` auf das Sammelverzeichnis", () => {
     const unit = systemdUnit(baseMulti);
     expect(unit).toContain('ExecStart="/home/aufi/.local/bin/regoro" serve "/srv/sites"');
-    expect(unit).toContain('WorkingDirectory="/srv/sites"');
+    expect(unit).toContain("WorkingDirectory=/srv/sites"); // ohne Quoting, siehe oben
     expect(unit).toContain('ReadWritePaths="/srv/sites"');
     expect(unit).not.toContain(" run ");
   });

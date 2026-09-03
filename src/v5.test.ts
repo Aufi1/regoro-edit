@@ -12,7 +12,7 @@
  */
 import { test, expect, describe, beforeAll, beforeEach, afterAll } from "bun:test";
 import { parseHTML } from "linkedom";
-import { mkdtempSync, rmSync, mkdirSync, cpSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, cpSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -298,5 +298,71 @@ describe("apply.ts — v5 Hüllen-Aufräum-Kanten", () => {
     expect(document.querySelector("strong")).toBeNull();
     expect(document.querySelector("u")).toBeNull();
     expect(document.querySelector("p")).not.toBeNull(); // p NIE entfernt
+  });
+});
+
+// ===========================================================================
+// git.ts — ein Agentenlauf ist EIN Commit, auch bei mehreren Dateien
+// ===========================================================================
+describe("commitEdit nimmt mehrere Pfade in EINEN Commit", () => {
+  let git: typeof import("./git.ts");
+  let repoRoot: string;
+
+  beforeAll(async () => {
+    git = await import("./git.ts");
+  });
+
+  beforeEach(() => {
+    repoRoot = makeTmpDir("regoro-commit-");
+    mkdirSync(repoRoot, { recursive: true });
+    writeFileSync(join(repoRoot, "index.html"), "<p>alt</p>");
+    git.ensureRepo(repoRoot);
+  });
+
+  test("zwei geänderte Dateien ergeben genau einen Commit", () => {
+    // Ein Lauf ist eine Änderung. Wären es zwei Commits, müsste der Kunde in der
+    // Versionsliste zweimal zurückgehen, um einen misslungenen Lauf loszuwerden —
+    // und beim ersten Klick stünde die Seite in einem Zwischenzustand, den es nie
+    // gab.
+    const vorher = git.countCommits(repoRoot)!;
+    writeFileSync(join(repoRoot, "index.html"), "<p>neu</p>");
+    writeFileSync(join(repoRoot, "leistungen.html"), "<p>Leistungen</p>");
+
+    git.commitEdit(repoRoot, ["index.html", "leistungen.html"], "KI-Lauf: Unterseite angelegt");
+
+    expect(git.countCommits(repoRoot)).toBe(vorher + 1);
+    expect(git.listVersions(repoRoot, "leistungen.html")).toHaveLength(1);
+    expect(git.listVersions(repoRoot, "index.html").length).toBeGreaterThanOrEqual(1);
+  });
+
+  test("ein einzelner Pfad als Zeichenkette wirkt unverändert", () => {
+    // Rückwärtskompatibilität: der Text-Editor ruft weiter mit einem String.
+    // (index.html steckt schon im Baseline-Commit, deshalb wird gezählt, nicht
+    // verglichen.)
+    const vorher = git.countCommits(repoRoot)!;
+    writeFileSync(join(repoRoot, "index.html"), "<p>neu</p>");
+    expect(() => git.commitEdit(repoRoot, "index.html", "Text-Edit")).not.toThrow();
+    expect(git.countCommits(repoRoot)).toBe(vorher + 1);
+  });
+
+  test("eine leere Liste ist ein no-op, kein Fehler", () => {
+    const vorher = git.countCommits(repoRoot);
+    expect(() => git.commitEdit(repoRoot, [], "nichts passiert")).not.toThrow();
+    expect(git.countCommits(repoRoot)).toBe(vorher);
+  });
+
+  test("ohne Änderung entsteht kein Leer-Commit", () => {
+    const vorher = git.countCommits(repoRoot);
+    expect(() => git.commitEdit(repoRoot, ["index.html"], "keine Änderung")).not.toThrow();
+    expect(git.countCommits(repoRoot)).toBe(vorher);
+  });
+
+  test("ein Dateiname, der mit - beginnt, wird nicht zum Flag", () => {
+    // Deshalb steht das `--` in commitEdit. Ohne es liest git `-f.html` als
+    // Option und bricht ab — oder tut, je nach Version, etwas anderes.
+    writeFileSync(join(repoRoot, "-f.html"), "<p>x</p>");
+    writeFileSync(join(repoRoot, "index.html"), "<p>y</p>");
+    expect(() => git.commitEdit(repoRoot, ["-f.html", "index.html"], "seltsamer Name")).not.toThrow();
+    expect(git.listVersions(repoRoot, "-f.html")).toHaveLength(1);
   });
 });
