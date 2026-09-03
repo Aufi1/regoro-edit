@@ -27,7 +27,13 @@ import { pathInsideSite } from "./apply.ts";
 import { commitEdit, git } from "./git.ts";
 import { AUTH_DIR_NAME } from "./auth.ts";
 import { bwrapVerfuegbar, sandboxArgv, standardVerstecke } from "./sandbox.ts";
-import { ermittleAenderungen, legeArbeitskopieAn, raeumeAuf } from "./arbeitskopie.ts";
+import {
+  ermittleAenderungen,
+  legeArbeitskopieAn,
+  leseStand,
+  raeumeAuf,
+  type Ausgangsstand,
+} from "./arbeitskopie.ts";
 import {
   bereiteSitzungVor,
   raeumeAlteVerlaeufe,
@@ -264,9 +270,22 @@ async function fuehreAus(ctx: HostCtx, auftrag: string, opts: StartOptionen, lau
   let geseheneTokens = 0;
 
   let sitzungDatei: string | null = null;
+  let ausgang: Ausgangsstand | null = null;
 
   try {
     kopie = legeArbeitskopieAn(ctx.siteDir);
+    /**
+     * Der Stand der Website zum Zeitpunkt der Kopie.
+     *
+     * Ohne ihn verglich die Übernahme die Arbeitskopie mit dem JETZIGEN Stand —
+     * und schrieb damit eine Datei, die der Kunde während des Laufs von Hand
+     * gespeichert hatte, mit dem alten Inhalt aus der Kopie zu. An einer Datei,
+     * die der Agent nie angefasst hat. Reiner Verlust, ohne Meldung.
+     *
+     * Direkt NACH dem Kopieren gelesen, nicht davor: Was zwischen beiden Zeilen
+     * geschieht, gehört noch zum Ausgangszustand.
+     */
+    ausgang = leseStand(ctx.siteDir);
 
     /**
      * Verlauf: aufräumen, auswählen, in die Arbeitskopie legen.
@@ -297,7 +316,7 @@ async function fuehreAus(ctx: HostCtx, auftrag: string, opts: StartOptionen, lau
 
     // Ab hier ist der Worker beendet (§13.15): zwischen `lstat` und Lesen darf
     // er kein Fenster mehr haben, das er selbst aufmacht.
-    const uebernahme = uebernehmen(ctx, kopie, integrationen);
+    const uebernahme = uebernehmen(ctx, kopie, integrationen, ausgang);
     if (!uebernahme.ok) {
       sende(lauf, { t: "fehler", grund: uebernahme.grund });
       return;
@@ -733,7 +752,12 @@ function findeSymlink(kopie: string, rel = ""): string | null {
  * übernommene Änderung wäre eine Website in einem Zustand, den niemand gewollt
  * und niemand geprüft hat.
  */
-function uebernehmen(ctx: HostCtx, kopie: string, integrationen: ReturnType<typeof loadIntegrationen>): Uebernahme {
+function uebernehmen(
+  ctx: HostCtx,
+  kopie: string,
+  integrationen: ReturnType<typeof loadIntegrationen>,
+  ausgang: Ausgangsstand | null,
+): Uebernahme {
   // ZUERST: Hat der Lauf irgendwo einen Symlink hinterlassen?
   //
   // `ermittleAenderungen` überspringt Symlinks, die aus der Kopie hinauszeigen —
@@ -746,7 +770,29 @@ function uebernehmen(ctx: HostCtx, kopie: string, integrationen: ReturnType<type
   const symlink = findeSymlink(kopie);
   if (symlink) return { ok: false, grund: `symlink:${symlink}` };
 
-  const aenderungen = ermittleAenderungen(kopie, ctx.siteDir);
+  const aenderungen = ermittleAenderungen(kopie, ctx.siteDir, ausgang ?? undefined);
+
+  /**
+   * HAT WÄHREND DES LAUFS JEMAND ANDERES GESCHRIEBEN? Dann NICHT übernehmen.
+   *
+   * Der Fall ist real und heute erreichbar: Der Kunde speichert im Text-Editor,
+   * während ein Auftrag läuft — im zweiten Tab, auf dem Telefon, oder einfach
+   * weil ihn die Wartezeit langweilt. Ohne diese Prüfung schriebe die Übernahme
+   * seine frische Änderung mit dem Stand von vor dem Lauf zu, und zwar auch an
+   * Dateien, die der Agent nie angefasst hat.
+   *
+   * Abgebrochen wird der GANZE Lauf, nicht die einzelne Datei: Ein Lauf ist
+   * eine Einheit (dieselbe Regel wie bei der Rücknahme). Teilweise zu
+   * übernehmen hieße, eine Website in einem Zustand zu hinterlassen, den weder
+   * der Agent noch der Kunde je so gewollt hat.
+   *
+   * Die Arbeit ist damit verloren — der Verlauf bleibt aber erhalten, der Kunde
+   * kann den Auftrag also wiederholen. Das ist der bessere Tausch: lieber ein
+   * Lauf umsonst als eine stillschweigend überschriebene Kundenänderung.
+   */
+  if (aenderungen.fremdGeaendert.length > 0) {
+    return { ok: false, grund: `fremd-geaendert:${aenderungen.fremdGeaendert.join(",")}` };
+  }
 
   // Punkt-Segmente gehören nie zur Website: `.pi-home` legt der Worker selbst
   // an, und `.git`/`.regoro` werden gar nicht erst kopiert. Sie hier

@@ -21,6 +21,7 @@ import {
   runtimeWurzel,
   legeArbeitskopieAn,
   ermittleAenderungen,
+  leseStand,
   raeumeAuf,
   raeumeVerwaisteAuf,
   type Aenderungen,
@@ -229,9 +230,66 @@ describe("arbeitskopie.ts — ermittleAenderungen()", () => {
     return { aend: ermittleAenderungen(kopie, siteDir), siteDir, kopie };
   }
 
+  /**
+   * DER DATENVERLUST, DEN GREPTILE GEFUNDEN HAT.
+   *
+   * `ermittleAenderungen` verglich die Arbeitskopie mit dem JETZIGEN Stand der
+   * Website. Speichert der Kunde während eines Laufs eine Seite von Hand, sieht
+   * dieser Vergleich einen Unterschied — und meldet die Datei als „vom Agenten
+   * geändert", obwohl der Agent sie nie angefasst hat. Die Übernahme schrieb
+   * die frische Kundenänderung daraufhin mit dem alten Stand aus der Kopie zu.
+   * Ohne Meldung, an einer Datei, mit der der Auftrag nichts zu tun hatte.
+   *
+   * Der Fall ist heute erreichbar: zweiter Tab, Telefon, oder schlicht
+   * Langeweile während der vier Minuten, die ein Lauf dauert.
+   */
+  function laufMitFremdaenderung(
+    tuInKopie: (kopie: string) => void,
+    tuAufSite: (siteDir: string) => void,
+  ): Aenderungen {
+    mitRuntimeWurzel();
+    const siteDir = makeSite();
+    const kopie = legeArbeitskopieAn(siteDir);
+    const ausgang = leseStand(siteDir);   // wie in agent.ts: direkt nach dem Kopieren
+    tuInKopie(kopie);
+    tuAufSite(siteDir);                    // der Kunde speichert währenddessen
+    return ermittleAenderungen(kopie, siteDir, ausgang);
+  }
+
+  test("eine Seite, die der Kunde WÄHREND des Laufs speichert, wird als fremd erkannt", () => {
+    const aend = laufMitFremdaenderung(
+      (k) => writeFileSync(join(k, "index.html"), "<html>vom Agenten</html>"),
+      (s) => writeFileSync(join(s, "index.html"), "<html>vom Kunden</html>"),
+    );
+    expect(aend.fremdGeaendert).toEqual(["index.html"]);
+  });
+
+  test("eine Datei, die der Agent NIE angefasst hat, gilt nicht als geändert", () => {
+    // Der eigentliche Verlust: Vorher landete sie in `geaendert` — allein weil
+    // die Website inzwischen anders aussah als die Kopie — und wurde
+    // zurückgeschrieben.
+    const aend = laufMitFremdaenderung(
+      () => {},
+      (s) => writeFileSync(join(s, "index.html"), "<html>vom Kunden</html>"),
+    );
+    expect(aend.geaendert).toEqual([]);
+    expect(aend.fremdGeaendert).toEqual([]);
+  });
+
+  test("Gegenprobe: ohne Fremdänderung bleibt fremdGeaendert leer", () => {
+    // Ohne diesen Fall wäre der Test darüber auch dann grün, wenn JEDE
+    // Änderung als fremd gälte — dann käme nie ein Auftrag durch.
+    const aend = laufMitFremdaenderung(
+      (k) => writeFileSync(join(k, "index.html"), "<html>vom Agenten</html>"),
+      () => {},
+    );
+    expect(aend.geaendert).toEqual(["index.html"]);
+    expect(aend.fremdGeaendert).toEqual([]);
+  });
+
   test("unveränderte Kopie → alles leer", () => {
     const { aend } = laufMit(() => {});
-    expect(aend).toEqual({ geaendert: [], neu: [], geloescht: [] });
+    expect(aend).toEqual({ geaendert: [], neu: [], geloescht: [], fremdGeaendert: [] });
   });
 
   test("geänderte Datei landet in geaendert", () => {
@@ -296,7 +354,12 @@ describe("arbeitskopie.ts — ermittleAenderungen()", () => {
       writeFileSync(join(k, "leistungen.html"), "<html>neu</html>");
       rmSync(join(k, "agb.html"));
     });
-    expect(aend).toEqual({ geaendert: ["index.html"], neu: ["leistungen.html"], geloescht: ["agb.html"] });
+    expect(aend).toEqual({
+      geaendert: ["index.html"],
+      neu: ["leistungen.html"],
+      geloescht: ["agb.html"],
+      fremdGeaendert: [],
+    });
   });
 });
 

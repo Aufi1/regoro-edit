@@ -659,7 +659,15 @@ async function route(
     // hin und nicht zu den View-Routen: Ohne den Auth-Gate könnte ein Fremder
     // einen Agentenlauf auslösen — der kostet Token und schreibt in die Website.
     // Unangemeldet also 404 (nicht 401), wie bei jeder anderen API-Route.
-    /^\/edit\/agent(\/(events|abort|status))?$/.test(path) ||
+    // WER HIER EINE ROUTE ERGÄNZT, MUSS SIE AUCH IN DIESE AUFZÄHLUNG SCHREIBEN.
+    // `verlauf`/`verlaeufe` fehlten: Sie waren damit nie API-Route, fielen bis
+    // zum statischen Zweig durch und gaben IMMER 404 — auch angemeldet. Der
+    // Gesprächsverlauf war dadurch wirkungslos, ohne dass etwas rot wurde.
+    //
+    // Die Handprüfung bestätigte den Fehler sogar: unangemeldet geben diese
+    // Routen ohnehin 404, das erwartete Ergebnis kam also aus dem falschen
+    // Grund. Deshalb prüft `agent-routes.test.ts` sie jetzt ANGEMELDET.
+    /^\/edit\/agent(\/(events|abort|status|verlauf|verlaeufe))?$/.test(path) ||
     /^\/edit\/version\/[^/]+$/.test(path);
   if (isApiRoute) {
     if (!isAuthed(req, ctx)) return notFound();
@@ -958,6 +966,19 @@ export function agentFehlerText(grund: string): string {
   // eines Ausbruchsversuchs an genau den, der ihn ausgelöst hat. `agent.ts`
   // schreibt selbst nichts ins Log (kein einziges console.*), also passiert es
   // hier — sonst ginge die einzige Spur verloren, die eine Störung erklärt.
+  /**
+   * Kein Sicherheitsbefund, sondern ein Zusammenstoß — deshalb ein eigener Satz.
+   *
+   * Der Kunde hat während des Laufs selbst gespeichert. Er MUSS erfahren, dass
+   * seine eigene Änderung erhalten ist: Sonst sieht er nur, dass der Auftrag
+   * nichts bewirkt hat, und startet ihn erneut — was dasselbe noch einmal
+   * kostet. Die Dateinamen bleiben im Log, sie sagen ihm nichts.
+   */
+  if (grund.startsWith("fremd-geaendert:")) {
+    console.error(`[regoro] Übernahme verworfen, fremde Änderung: ${grund}`);
+    return "Die Website wurde während des Auftrags von Hand geändert. Der Auftrag wurde verworfen, deine eigene Änderung ist erhalten.";
+  }
+
   const trenner = grund.indexOf(":");
   if (trenner > 0 && UEBERNAHME_ABLEHNUNGEN.has(grund.slice(0, trenner))) {
     console.error(`[regoro] Übernahme abgelehnt: ${grund}`);

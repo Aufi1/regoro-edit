@@ -76,6 +76,8 @@ const ROUTEN: [string, string][] = [
   ["GET", "/edit/agent/status"],
   ["GET", "/edit/agent/events"],
   ["POST", "/edit/agent/abort"],
+  ["GET", "/edit/agent/verlauf"],
+  ["GET", "/edit/agent/verlaeufe"],
 ];
 
 const dirs: string[] = [];
@@ -152,7 +154,7 @@ function laufImHintergrund(auftrag: string) {
 // Die Auth-Wand
 // ===========================================================================
 describe("unangemeldet gibt es diese Routen nicht", () => {
-  test("alle vier antworten 404 — nicht 401, nicht 403", async () => {
+  test("alle antworten 404 — nicht 401, nicht 403", async () => {
     for (const [methode, pfad] of ROUTEN) {
       const r = await ruf(methode, pfad, { body: methode === "POST" ? { auftrag: "mach was" } : undefined });
       expect(`${methode} ${pfad} → ${r.status}`).toBe(`${methode} ${pfad} → 404`);
@@ -184,7 +186,7 @@ describe("unangemeldet gibt es diese Routen nicht", () => {
 });
 
 describe("ohne betreiberweite ki.json gibt es die Seitenleiste nicht", () => {
-  test("angemeldet, aber ctx.ki fehlt → alle vier 404", async () => {
+  test("angemeldet, aber ctx.ki fehlt → alle 404", async () => {
     const c = cookie();
     ctx = { ...ctx, ki: null };
     for (const [methode, pfad] of ROUTEN) {
@@ -202,6 +204,50 @@ describe("ohne betreiberweite ki.json gibt es die Seitenleiste nicht", () => {
     for (const [methode, pfad] of ROUTEN) {
       expect((await ruf(methode, pfad, { cookie: c, body: { auftrag: "x" } })).status).toBe(404);
     }
+  });
+});
+
+describe("angemeldet MÜSSEN diese Routen erreichbar sein", () => {
+  /**
+   * DER TEST, DER GEFEHLT HAT — und der teuerste Einzelfehler dieses Zweigs.
+   *
+   * `/edit/agent/verlauf` und `/edit/agent/verlaeufe` fehlten in der
+   * `isApiRoute`-Aufzählung in `host.ts`. Sie waren damit nie API-Route, fielen
+   * bis zum statischen Zweig durch und gaben **immer** 404 — auch angemeldet.
+   * Der Gesprächsverlauf war wirkungslos, und nichts wurde rot: Jeder
+   * bestehende Test prüft diese Routen UNANGEMELDET, und dort ist 404 das
+   * richtige Ergebnis.
+   *
+   * Die Handprüfung hat den Fehler sogar bestätigt statt gefunden — 404
+   * gesehen, für korrekt gehalten, das erwartete Ergebnis kam aus dem falschen
+   * Grund. Genau die Fehlerklasse, die CLAUDE.md beschreibt.
+   *
+   * Deshalb prüft dieser Fall die ANWESENHEIT, nicht die Abwesenheit: Nicht
+   * „gibt 404 ohne Anmeldung", sondern „gibt NICHT 404 mit Anmeldung". Wer eine
+   * Route ergänzt und die Aufzählung vergisst, wird hier rot.
+   */
+  test("mit Cookie und ki-Zugang gibt keine dieser Routen mehr 404", async () => {
+    const c = cookie();
+    for (const [methode, pfad] of ROUTEN) {
+      const r = await ruf(methode, pfad, { cookie: c, body: methode === "POST" ? { auftrag: "x" } : undefined });
+      // Was sie antworten, ist hier egal — nur dass sie ÜBERHAUPT antworten.
+      // 404 hieße: der Router kennt sie nicht.
+      expect(`${methode} ${pfad} → ${r.status === 404 ? "404 (unerreichbar!)" : "erreichbar"}`)
+        .toBe(`${methode} ${pfad} → erreichbar`);
+    }
+  });
+
+  test("die Verlaufs-Routen liefern angemeldet echte Daten, nicht nur „nicht 404“", async () => {
+    // Gegenprobe zum Test darüber: „nicht 404" allein wäre auch bei einem 500
+    // erfüllt. Hier zählt, dass die Antwort die vereinbarte Form hat.
+    const c = cookie();
+    const liste = await ruf("GET", "/edit/agent/verlaeufe", { cookie: c });
+    expect(liste.status).toBe(200);
+    expect(await liste.json()).toEqual({ ok: true, verlaeufe: [] });
+
+    const einzeln = await ruf("GET", "/edit/agent/verlauf", { cookie: c });
+    expect(einzeln.status).toBe(200);
+    expect(await einzeln.json()).toEqual({ ok: true, id: null, nachrichten: [] });
   });
 });
 

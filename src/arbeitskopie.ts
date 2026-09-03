@@ -137,6 +137,20 @@ function* siteDateien(
  * Mode 0700: Auf einem Host, der mehrere Kunden bedient, soll kein anderer
  * Benutzer den Zwischenstand eines fremden Laufs lesen.
  */
+/**
+ * Der Ausgangsstand, gegen den am Ende verglichen wird.
+ *
+ * WARUM DAS NICHT AM ENDE NEU GELESEN WERDEN DARF: `ermittleAenderungen` verglich
+ * die Arbeitskopie ursprünglich mit dem JETZIGEN Stand der Website. Speichert
+ * der Kunde während eines Laufs eine Seite, die der Agent nie angefasst hat,
+ * sieht dieser Vergleich einen Unterschied — und schreibt die frische Änderung
+ * mit dem alten Stand aus der Kopie zu. Reiner Verlust der Kundenarbeit, ohne
+ * Meldung, an einer Datei, mit der der Auftrag nichts zu tun hatte.
+ *
+ * Mit dem festgehaltenen Ausgangsstand lassen sich die beiden Fragen trennen,
+ * die vorher zu einer verschmolzen waren: „hat der AGENT das geändert?"
+ * (Kopie ≠ Ausgang) und „hat jemand ANDERES das geändert?" (live ≠ Ausgang).
+ */
 export function legeArbeitskopieAn(siteDir: string): string {
   const wurzel = runtimeWurzel();
   mkdirSync(wurzel, { recursive: true });
@@ -158,7 +172,15 @@ export type Aenderungen = {
   geaendert: string[];
   neu: string[];
   geloescht: string[];
+  /**
+   * Dateien, die sich WÄHREND des Laufs auf der Website geändert haben — von
+   * fremder Hand, nicht vom Agenten. Leer im Normalfall.
+   */
+  fremdGeaendert: string[];
 };
+
+/** Der Zustand der Website beim Anlegen der Kopie: relativer Pfad → Byte-Hash. */
+export type Ausgangsstand = Map<string, string>;
 
 /**
  * Alle Einträge der Arbeitskopie — Symlinks ausdrücklich MITGEMELDET.
@@ -213,13 +235,14 @@ function byteHash(pfad: string): string {
  * Verglichen wird über den Inhalt, nicht über die Änderungszeit: Sonst entstünde
  * bei jedem Lauf ein Commit über die ganze Website.
  */
-export function ermittleAenderungen(kopie: string, siteDir: string): Aenderungen {
-  const original = new Map<string, string>();
+/** Liest den Ist-Zustand der Website als Pfad→Hash. */
+export function leseStand(siteDir: string): Ausgangsstand {
+  const stand: Ausgangsstand = new Map();
   try {
     const realeWurzel = realpathSync(siteDir);
     for (const rel of siteDateien(siteDir, realeWurzel)) {
       try {
-        original.set(rel, byteHash(join(siteDir, rel)));
+        stand.set(rel, byteHash(join(siteDir, rel)));
       } catch {
         // Unlesbar heißt „nicht vergleichbar" — die Datei taucht dann weder als
         // geändert noch als gelöscht auf und bleibt, wie sie ist.
@@ -228,6 +251,25 @@ export function ermittleAenderungen(kopie: string, siteDir: string): Aenderungen
   } catch {
     // Site nicht auflösbar: nichts zu vergleichen.
   }
+  return stand;
+}
+
+/**
+ * Was der Agent geändert hat — und was sich unterdessen von fremder Hand
+ * geändert hat.
+ *
+ * `ausgang` ist der beim Anlegen der Kopie festgehaltene Stand. Fehlt er, wird
+ * der Ist-Zustand genommen; dann gilt wieder das alte Verhalten, und fremde
+ * Änderungen sind nicht erkennbar. Der Parameter ist deshalb an der einzigen
+ * produktiven Aufrufstelle Pflicht — optional ist er nur für ältere Tests.
+ */
+export function ermittleAenderungen(
+  kopie: string,
+  siteDir: string,
+  ausgang?: Ausgangsstand,
+): Aenderungen {
+  const original = ausgang ?? leseStand(siteDir);
+  const jetzt = leseStand(siteDir);
 
   const geaendert: string[] = [];
   const neu: string[] = [];
@@ -260,10 +302,24 @@ export function ermittleAenderungen(kopie: string, siteDir: string): Aenderungen
   }
 
   const geloescht = [...original.keys()].filter((rel) => !gesehen.has(rel));
+
+  // Fremde Änderung = die Website weicht vom Ausgangsstand ab. Betrachtet
+  // werden nur Dateien, die der Agent auch anfassen will — an allen anderen
+  // ändert die Übernahme ohnehin nichts.
+  const betroffen = new Set([...geaendert, ...neu]);
+  const fremdGeaendert = [...betroffen]
+    .filter((rel) => {
+      const vorher = original.get(rel);
+      if (vorher === undefined) return jetzt.has(rel); // neu angelegt, existiert jetzt
+      return jetzt.get(rel) !== vorher;
+    })
+    .sort();
+
   return {
     geaendert: geaendert.sort(),
     neu: neu.sort(),
     geloescht: geloescht.sort(),
+    fremdGeaendert,
   };
 }
 
