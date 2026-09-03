@@ -336,6 +336,21 @@ describe("POST /edit/agent/abort", () => {
     }
   });
 
+  test.skipIf(!haveBwrap())("nach dem Abbruch gibt POST /edit/agent wieder 200, nicht 409", async () => {
+    // Der Weg, den der Kunde wirklich geht: abbrechen, dann neu formulieren.
+    // Bliebe der Lauf in der Registratur stehen, bekäme er hier für immer 409 —
+    // „Es läuft bereits ein Auftrag", obwohl nichts läuft. Eine Website, die
+    // sich nur durch einen Dienst-Neustart wieder öffnen lässt.
+    expect(laufImHintergrund("warten").ok).toBe(true);
+    expect((await ruf("POST", "/edit/agent/abort", { cookie: cookie() })).status).toBe(200);
+    for (let i = 0; i < 1200 && laufAktiv(siteDir) !== null; i++) await Bun.sleep(50);
+    expect(laufAktiv(siteDir)).toBeNull();
+
+    const r = await ruf("POST", "/edit/agent", { cookie: cookie(), body: { auftrag: "harmlos" } });
+    expect(`${r.status}: ${JSON.stringify(await r.json())}`).toContain("200");
+    brichAb(siteDir);
+  }, 90_000);
+
   test.skipIf(!haveBwrap())("beendet einen laufenden Auftrag", async () => {
     expect(laufImHintergrund("warten").ok).toBe(true);
     expect((await ruf("POST", "/edit/agent/abort", { cookie: cookie() })).status).toBe(200);

@@ -271,6 +271,42 @@ describe.skipIf(!haveBwrap())("Abbruch", () => {
     expect(readdirSync(runtime).filter((n) => n.startsWith("lauf-"))).toEqual([]);
   }, 90_000);
 
+  test("nach einem Abbruch nimmt die Website sofort wieder einen Auftrag an", async () => {
+    // DER EIGENTLICHE SCHADEN eines hängenden Abbruchs — und er ist schlimmer
+    // als der verschwendete Lauf: Bleibt der Eintrag in der Registratur stehen,
+    // ist die Website DAUERHAFT gesperrt. Jeder weitere Auftrag prallt mit
+    // "laeuft-bereits" ab, bis jemand den Dienst neu startet. Der Kunde sieht
+    // eine Seitenleiste, die nie wieder etwas annimmt, und erfährt nicht warum.
+    //
+    // Gemessen war genau das der Fall: Der stdout-Strom endete nicht, wenn der
+    // Prozess im Anlaufen getötet wurde, `for await` hing für immer, und die
+    // Aufräumroutine lief nie.
+    expect(start("warten").ok).toBe(true);
+    await Bun.sleep(200);
+    brichAb(siteDir);
+    await warteBisRuhig(siteDir);
+
+    // Und jetzt der Beweis, dass die Sperre wirklich weg ist: ein zweiter Lauf,
+    // der auch durchläuft.
+    const zweiter = start("harmlos");
+    expect(zweiter).toEqual({ ok: true, laufId: expect.any(String) });
+    const e = await sammle();
+    expect(e.at(-1)?.t).toBe("fertig");
+    expect(existsSync(join(siteDir, "leistungen.html"))).toBe(true);
+  }, 90_000);
+
+  test("auch ein SOFORT abgebrochener Lauf sperrt die Website nicht", async () => {
+    // Der Fall, der es aufgedeckt hat: Abbruch, während der Worker noch anläuft.
+    // Ohne Vorlauf trifft der Abbruch die heikelste Stelle.
+    for (let i = 0; i < 3; i++) {
+      expect(start("warten").ok).toBe(true);
+      brichAb(siteDir);
+      await warteBisRuhig(siteDir);
+    }
+    expect(start("harmlos").ok).toBe(true);
+    expect((await sammle()).at(-1)?.t).toBe("fertig");
+  }, 90_000);
+
   test("brichAb ohne laufenden Lauf ist folgenlos", () => {
     // Die Route ist idempotent (Contract §7). Ein Wurf hier ergäbe dort 500.
     expect(() => brichAb(siteDir)).not.toThrow();
