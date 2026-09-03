@@ -192,20 +192,38 @@ describe.skipIf(!haveBwrap())("das Worker-Protokoll", () => {
     expect(countCommits(siteDir)).toBe(commitsVorher); // und wirklich kein Commit
   }, 30_000);
 
-  test("eine unverständliche Zeile des Workers bringt den Lauf nicht zum Absturz", async () => {
-    // Der Worker ist ein fremder Prozess; sein stdout ist Eingabe. Ein
-    // JSON.parse ohne Netz darum ist ein Absturz des Servers, ausgelöst vom
-    // unsichersten Teil des Systems.
-    const kaputt = join(tmp("regoro-agent-skript-"), "kaputt.ts");
-    writeFileSync(
-      kaputt,
-      `process.stdout.write("kein json\\n");
-       process.stdout.write(JSON.stringify({ t: "fertig", zusammenfassung: "trotzdem fertig" }) + "\\n");`,
-    );
-    const s = starteLauf(ctx, "egal", { workerBefehl: [process.execPath, "run", kaputt] });
-    expect(s.ok).toBe(true);
+  test("ein `fertig` OHNE abschließenden Zeilenumbruch geht nicht verloren", async () => {
+    // DER SCHADEN: Der Kunde bekommt einen GELUNGENEN Lauf als gescheitert
+    // gemeldet. Seine Website ist geändert, die Seitenleiste sagt das Gegenteil
+    // — er versucht es noch einmal und bezahlt denselben Lauf zweimal.
+    //
+    // Die Leseschleife zerteilt an "\n" und verwirft, was danach ohne Umbruch
+    // im Puffer steht. Ein Prozess muss seinen letzten Umbruch nicht schreiben.
+    expect(start("ohne-umbruch").ok).toBe(true);
     const e = await sammle();
-    expect(e.at(-1)?.t).toBeOneOf(["fertig", "fehler"]);
+
+    expect(e.map((x) => x.t)).toContain("werkzeug"); // die Zeile MIT Umbruch kam an
+    expect(e.at(-1)?.t).toBe("fertig"); // und die ohne auch
+    expect(existsSync(join(siteDir, "leistungen.html"))).toBe(true); // und wurde übernommen
+  }, 30_000);
+
+  test("unverständliche Zeilen bringen den Lauf nicht zum Absturz", async () => {
+    // Der Worker ist der unsicherste Teil des Systems und sein stdout ist
+    // Eingabe. Ein `JSON.parse` ohne Netz darum wäre ein Serverabsturz,
+    // ausgelöst von genau diesem Teil.
+    //
+    // Das Szenario steckt in der ATTRAPPE, nicht in einem Skript unter /tmp:
+    // `agent.ts` deckelt `dirname(ctx.siteDir)` — in Tests ist das ganz `/tmp`,
+    // und ein Helferskript dort ist für den Worker unsichtbar. Ein Test, der es
+    // trotzdem versucht, bekommt „Module not found", einen `fehler` — und ist
+    // grün, wenn er nur „endet mit fertig ODER fehler" verlangt. Genau so stand
+    // er hier, und er hat den geprüften Pfad nie betreten.
+    expect(start("kaputte-zeile").ok).toBe(true);
+    const e = await sammle();
+
+    expect(e.at(-1)?.t).toBe("fertig"); // NICHT bloß „fertig oder fehler"
+    expect(e.map((x) => x.t)).toContain("werkzeug"); // die guten Zeilen danach kamen an
+    expect(existsSync(join(siteDir, "leistungen.html"))).toBe(true);
   }, 30_000);
 });
 

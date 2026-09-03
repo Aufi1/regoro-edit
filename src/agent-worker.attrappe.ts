@@ -272,6 +272,34 @@ async function lauf(): Promise<void> {
       return;
     }
 
+    // Schreibt die LETZTE Zeile OHNE abschließenden Zeilenumbruch.
+    //
+    // `sende()` hängt "\n" immer an — deshalb hier roh auf stdout. Ein Prozess
+    // muss seinen letzten Umbruch nicht schreiben, und die Leseschleife des
+    // Elternprozesses zerteilt an "\n": Was ohne Umbruch im Puffer stehen
+    // bleibt, ginge verloren. Verloren ginge hier ausgerechnet das
+    // Abschlussereignis — der Kunde bekäme einen GELUNGENEN Lauf als
+    // gescheitert gemeldet, seine Website wäre geändert, und er versuchte es
+    // ein zweites Mal auf eigene Rechnung.
+    case "ohne-umbruch": {
+      sende({ t: "werkzeug", name: "write_file", kurz: "schreibt leistungen.html" });
+      log(`schreibe leistungen.html: ${schreibe("leistungen.html", HARMLOS)}`);
+      process.stdout.write(JSON.stringify({ t: "fertig", zusammenfassung: "ohne letzten Umbruch" }));
+      return;
+    }
+
+    // Eine unverständliche Zeile mitten im Strom. Der Worker ist der unsicherste
+    // Teil des Systems und sein stdout ist Eingabe — ein `JSON.parse` ohne Netz
+    // darum wäre ein Serverabsturz, ausgelöst von genau diesem Teil.
+    case "kaputte-zeile": {
+      process.stdout.write("das ist kein json\n");
+      process.stdout.write("{\"t\":\"werkzeug\",\"name\":\n"); // abgeschnitten
+      sende({ t: "werkzeug", name: "write_file", kurz: "schreibt leistungen.html" });
+      log(`schreibe leistungen.html: ${schreibe("leistungen.html", HARMLOS)}`);
+      sende({ t: "fertig", zusammenfassung: "trotz kaputter Zeilen fertig" });
+      return;
+    }
+
     // Läuft, bis jemand ihn beendet. Für Abbruch, zweiten Lauf (409),
     // `regoro disable` und Serverneustart.
     case "warten": {
