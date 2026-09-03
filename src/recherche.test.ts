@@ -365,6 +365,31 @@ describe("holeSeite() baut die Anfrage an den Abrufdienst", () => {
 });
 
 describe("holeSeite() ist fail-closed und verbrennt kein Guthaben", () => {
+  test("beide Recherche-Wege führen dieselbe Regel — eine Semantik, keine zwei", async () => {
+    // sucheImNetz und holeSeite haben das schon einmal verschieden ausgelegt:
+    // Der eine sagte bei "" ab, der andere ließ ihn durch. Ergebnis war eine
+    // korrekt eingerichtete Proxy-Installation ganz ohne Websuche. Dieser Test
+    // hält die beiden aneinander, damit es nicht wiederkommt.
+    const s = attrappe(() => ({ body: scrapeAntwort("<body><p>x</p></body>") }));
+    const b = attrappe(() => ({ body: JSON.stringify(TREFFER) }));
+    try {
+      // null → beide sagen ab, ohne zu senden.
+      await expect(holeSeite("https://example.de/x", null, s.basis)).rejects.toThrow();
+      await expect(sucheImNetz("x", null, b.basis)).rejects.toThrow();
+      expect(s.empfangen.length).toBe(0);
+      expect(b.empfangen.length).toBe(0);
+
+      // "" → beide senden, beide ohne Anmeldungskopf.
+      await holeSeite("https://example.de/x", "", s.basis);
+      await sucheImNetz("x", "", b.basis);
+      expect(s.empfangen[0]!.kopf["authorization"]).toBeUndefined();
+      expect(b.empfangen[0]!.kopf["x-subscription-token"]).toBeUndefined();
+    } finally {
+      s.stop();
+      b.stop();
+    }
+  });
+
   test("firecrawlKey null heißt „nicht eingerichtet\" — ohne eine einzige Anfrage", async () => {
     const s = attrappe();
     try {
@@ -644,7 +669,30 @@ describe("sucheImNetz() baut die Anfrage an den Suchdienst", () => {
   });
 });
 
-describe("sucheImNetz() — der leere Schlüssel heißt „von außen\", nicht „aus\" (§16)", () => {
+describe("sucheImNetz() — die drei Zustände des Schlüssels (§16)", () => {
+  test("null schaltet die Websuche ab — fail-closed, ohne eine Anfrage zu stellen", async () => {
+    // Die andere Hälfte der Regel. Ohne diesen Test hieße „"" läuft" im
+    // schlimmsten Fall „alles läuft", und ein nicht eingerichteter Server
+    // schickte unangemeldete Anfragen an Brave, bis jemand die Rechnung sieht.
+    const s = attrappe();
+    try {
+      await expect(sucheImNetz("Badsanierung", null, s.basis)).rejects.toThrow();
+      expect(s.empfangen.length).toBe(0);
+    } finally {
+      s.stop();
+    }
+  });
+
+  test("ein echter Schlüssel setzt den Token-Kopf", async () => {
+    const s = attrappe(() => ({ body: JSON.stringify(TREFFER) }));
+    try {
+      await sucheImNetz("x", "BSA-echt", s.basis);
+      expect(s.empfangen[0]!.kopf["x-subscription-token"]).toBe("BSA-echt");
+    } finally {
+      s.stop();
+    }
+  });
+
   test("ein leerer Brave-Schlüssel sucht ohne Token-Kopf, statt abzusagen", async () => {
     // §16 gilt für ALLE Schlüsselfelder, und `loadKiConfig` bewahrt "" seit
     // c780826 ausdrücklich auf, damit es hier ankommt. `holeSeite` setzt es
