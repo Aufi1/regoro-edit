@@ -570,6 +570,31 @@
       "font-weight:600;flex:1 1 auto;}",
       "#__regoro-agent button.__regoro-asenden:hover{background:#cf4d18;}",
       "#__regoro-agent .__regoro-ahinweis{font-size:12.5px;color:#5a6b78;line-height:1.45;}",
+
+      /**
+       * Der Stopp-Knopf IST die Laufanzeige.
+       *
+       * Vorher gab es einen Knopf „Abbrechen", der immer dastand und nur grau
+       * wurde — als Zustandsanzeige taugt das nicht, weil ein grauer Knopf auch
+       * einfach ein grauer Knopf sein kann. Jetzt ist er nur da, WÄHREND
+       * gearbeitet wird, und er pulst dabei. Wer ihn sieht, weiß: es läuft.
+       */
+      "#__regoro-agent button.__regoro-astop{flex:0 0 auto;width:34px;height:34px;padding:0;",
+      "display:none;align-items:center;justify-content:center;border-radius:50%;",
+      "border:1px solid #e2571e;background:#fff;color:#e2571e;cursor:pointer;}",
+      "#__regoro-agent.__regoro-alaeuft button.__regoro-astop{display:inline-flex;}",
+      "#__regoro-agent button.__regoro-astop::before{content:\"\";width:11px;height:11px;",
+      "border-radius:2px;background:currentColor;",
+      "animation:__regoro-apuls 1.1s ease-in-out infinite;}",
+      "#__regoro-agent button.__regoro-astop:disabled{opacity:.5;cursor:default;}",
+      "#__regoro-agent button.__regoro-astop:disabled::before{animation:none;}",
+
+      /** „Es passiert gerade etwas" — im Verlauf, wo der Blick ohnehin liegt. */
+      "#__regoro-agent .__regoro-atut{display:flex;gap:6px;align-items:center;padding:6px 2px;}",
+      "#__regoro-agent .__regoro-atut i{width:6px;height:6px;border-radius:50%;background:#8fa3b0;",
+      "animation:__regoro-apuls 1.1s ease-in-out infinite;}",
+      "#__regoro-agent .__regoro-atut i:nth-child(2){animation-delay:.18s;}",
+      "#__regoro-agent .__regoro-atut i:nth-child(3){animation-delay:.36s;}",
       "#__regoro-agent .__regoro-ahinweis.__regoro-awarn{color:#a83c12;font-weight:600;}",
       // Punkt-Animation, solange der Agent arbeitet.
       "#__regoro-agent .__regoro-apuls{display:inline-block;width:8px;height:8px;border-radius:50%;",
@@ -2217,14 +2242,20 @@
       placeholder: "Zum Beispiel: Leg eine Unterseite über Badsanierung an und verlink sie in der Navigation.",
       "aria-label": "Auftrag an den KI-Assistenten"
     });
-    var senden = el("button", { class: "__regoro-abtn __regoro-asenden", type: "button", text: "Auftrag geben" });
-    var abbrechen = el("button", { class: "__regoro-abtn", type: "button", text: "Abbrechen" });
-    abbrechen.disabled = true;
+    var senden = el("button", { class: "__regoro-abtn __regoro-asenden", type: "button", text: "Senden" });
+    // Kein Text, sondern ein Symbol — und links vom Senden, weil er zum
+    // laufenden Auftrag gehört und nicht zum nächsten.
+    var abbrechen = el("button", {
+      class: "__regoro-abtn __regoro-astop",
+      type: "button",
+      title: "Auftrag stoppen",
+      "aria-label": "Auftrag stoppen"
+    });
     var hinweis = el("div", { class: "__regoro-ahinweis" });
 
     var form = el("div", { class: "__regoro-aform" }, [
       eingabe,
-      el("div", { class: "__regoro-azeile" }, [senden, abbrechen]),
+      el("div", { class: "__regoro-azeile" }, [abbrechen, senden]),
       hinweis
     ]);
 
@@ -2383,6 +2414,9 @@
     else klasse += "__regoro-avon-agent";
     var node = el("div", { class: klasse, text: text });
     ui.agent.verlauf.appendChild(node);
+    // Der Kringel gehört ans Ende — sonst steht er nach einer neuen Zeile
+    // mittendrin und sieht aus, als gehöre er zur alten.
+    if (agentLaeuft) zeigeTut(true);
     // Eine eigene Nachricht des Kunden zieht den Blick immer mit.
     agentAnsEnde(art === "kunde");
     return node;
@@ -2398,6 +2432,7 @@
     ]);
     ui.agent.verlauf.appendChild(node);
     agentAnsEnde(false);
+    if (agentLaeuft) zeigeTut(true);
   }
 
   function setAgentLaeuft(laeuft) {
@@ -2408,6 +2443,45 @@
     ui.agent.senden.disabled = laeuft || agentGesperrt;
     ui.agent.eingabe.disabled = laeuft;
     ui.agent.abbrechen.disabled = !laeuft;
+    // Zeigt den Stopp-Knopf und lässt ihn pulsen — er IST die Laufanzeige.
+    agentPanel.classList.toggle("__regoro-alaeuft", !!laeuft);
+    zeigeTut(laeuft);
+    /**
+     * DER HINWEIS GEHÖRT ZUM LAUF UND STIRBT MIT IHM.
+     *
+     * Vorher blieb „Abbruch angefordert…" stehen, nachdem im Verlauf längst
+     * „Der Auftrag wurde abgebrochen" stand — zwei Meldungen über dasselbe,
+     * eine davon veraltet. Der Verlauf ist die Wahrheit; die Zeile unter dem
+     * Feld sagt nur, was JETZT gilt.
+     */
+    if (!laeuft) setAgentHinweis("");
+  }
+
+  /**
+   * Der laufende Kringel im Verlauf.
+   *
+   * Der Stopp-Knopf sagt „es läuft", aber er steht unten am Eingabefeld. Beim
+   * Lesen liegt der Blick im Verlauf, und dort vergingen zwischen zwei
+   * Werkzeugaufrufen gemessen bis zu anderthalb Minuten ohne jedes Zeichen —
+   * lang genug, dass es kaputt aussieht.
+   */
+  function zeigeTut(an) {
+    if (!agentPanel) return;
+    var da = ui.agent.verlauf.querySelector(".__regoro-atut");
+    if (!an) {
+      if (da && da.parentNode) da.parentNode.removeChild(da);
+      return;
+    }
+    if (da) {
+      // Immer ans Ende: Nach einem neuen Ereignis stünde er sonst mittendrin.
+      ui.agent.verlauf.appendChild(da);
+      return;
+    }
+    var node = el("div", { class: "__regoro-atut", "aria-label": "Der Assistent arbeitet" }, [
+      el("i", {}), el("i", {}), el("i", {})
+    ]);
+    ui.agent.verlauf.appendChild(node);
+    agentAnsEnde(false);
   }
 
   function onAuftragSenden() {
@@ -2471,7 +2545,9 @@
       /* Ist der Abbruch nicht angekommen, endet der Lauf regulär — kein Grund
          zur Panik im Browser. Der Strom meldet ohnehin, was passiert ist. */
     });
-    setAgentHinweis("Abbruch angefordert…");
+    // KEINE Hinweiszeile mehr: Der Knopf hört auf zu pulsen, und der Verlauf
+    // meldet den Abbruch, sobald er durch ist. Zwei Meldungen über dasselbe
+    // waren genau das Problem — die zweite blieb stehen.
   }
 
   /**
