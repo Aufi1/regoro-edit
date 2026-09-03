@@ -138,15 +138,39 @@ describe("SMS ueber seven.io", () => {
     s.stop();
   });
 
-  test("ein unbekannter Statuscode wird auf einen Statuscode gekuerzt", async () => {
-    // Ohne diese Klammer stuende der ganze Rumpf in der Meldung.
-    const s = attrappenServer(() => ({ body: "999 \n Code: 424242 an +4915120464812" }));
+  test("kein Rumpf kann den Code ins Log tragen — auch kein kurzer", async () => {
+    // Kuerzen genuegte NICHT: "Code: 424242" ergab nach dem Entfernen der
+    // Sonderzeichen "Code424242" und trug den Code vollstaendig hinein.
+    // Gemessen. Deshalb wird geprueft, nicht gekuerzt.
+    const CODE = "424242";
+    const rumpfe = [
+      `Code: ${CODE}`,
+      CODE,
+      `${CODE} `,
+      `an +4915120464812 Code ${CODE}`,
+      `999 \n Code: ${CODE} an +4915120464812`,
+      JSON.stringify({ success: "x", echo: { text: `Code ${CODE}`, to: "+4915120464812" } }),
+      "<html><body>Wartung</body></html>",
+    ];
+    for (const body of rumpfe) {
+      const s = attrappenServer(() => ({ body }));
+      const v = sevenioVersand({ anbieter: "sevenio", absender: "REGORO" }, s.basis);
+      const meldung = await v
+        .sendeCode(NUMMER, CODE)
+        .catch((e: Error) => e.message)
+        .then((m) => String(m));
+      expect(meldung).not.toContain(CODE);
+      expect(meldung).not.toContain("4915120464812");
+      s.stop();
+    }
+  });
+
+  test("ein echter dreistelliger Statuscode wird genannt", async () => {
+    // Die Diagnose soll nicht verschwinden: dokumentierte Codes bleiben lesbar.
+    const s = attrappenServer(() => ({ body: "777" }));
     const v = sevenioVersand({ anbieter: "sevenio", absender: "REGORO" }, s.basis);
-    const fehler = await v.sendeCode(NUMMER, "424242").catch((e: Error) => e.message);
-    expect(fehler).not.toContain("424242");
-    expect(fehler).not.toContain("4915120464812");
-    expect(fehler).not.toContain("\n");
-    expect(fehler.length).toBeLessThan(80);
+    const meldung = await v.sendeCode(NUMMER, "424242").catch((e: Error) => e.message);
+    expect(meldung).toContain("777");
     s.stop();
   });
 

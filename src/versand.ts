@@ -127,7 +127,7 @@ export function sevenioVersand(konfig: SmsKonfig, basis = "https://gateway.seven
           : String(antwort).trim();
       if (erfolg !== "100") {
         throw new Error(
-          `SMS-Versand fehlgeschlagen: ${SEVENIO_FEHLER[erfolg] ?? `Statuscode ${nurCode(erfolg)}`}`,
+          `SMS-Versand fehlgeschlagen: ${SEVENIO_FEHLER[erfolg] ?? nurCode(erfolg)}`,
         );
       }
     },
@@ -189,15 +189,17 @@ function nachrichtentext(code: string): string {
 }
 
 /**
- * Ein Statuscode des Anbieters, so weit gekürzt, dass er ein Statuscode bleiben
- * kann und nichts anderes: höchstens zwölf Zeichen, nur Buchstaben und Ziffern.
+ * Ein Statuscode von seven.io — oder gar nichts.
  *
- * Ohne diese Klammer stünde bei einer unerwarteten Antwort deren **ganzer Rumpf**
- * in der Meldung — siehe die Begründung an `ruf()`.
+ * Es genügt **nicht**, den Wert zu kürzen: Ein Rumpf wie `Code: 424242` ergäbe
+ * nach dem Entfernen der Sonderzeichen `Code424242` und trüge den Einmalcode
+ * vollständig ins Log. Gemessen. Deshalb wird nicht gekürzt, sondern **geprüft**:
+ * Die dokumentierten Codes sind genau dreistellig (`100`, `900`, `202`, …). Was
+ * dieser Form nicht entspricht, ist kein Statuscode und wird nicht wiedergegeben.
+ * Ein dreistelliger Wert kann keinen sechsstelligen Code enthalten.
  */
 function nurCode(roh: string): string {
-  const geputzt = roh.replace(/[^A-Za-z0-9]/g, "").slice(0, 12);
-  return geputzt || "unbekannt";
+  return /^\d{3}$/.test(roh.trim()) ? roh.trim() : "unerwartete Antwort";
 }
 
 async function ruf(was: string, url: string, init: RequestInit): Promise<unknown> {
