@@ -465,7 +465,17 @@ function sammleText(wurzel: Knoten | null | undefined): string {
   return teile.join("");
 }
 
-/** Eine Zeile je Block, keine Leerzeilen, keine doppelten Leerzeichen. */
+/**
+ * Eine Zeile je Block, keine Leerzeilen, keine doppelten Leerzeichen.
+ *
+ * **Kurze Zeilen werden bewusst NICHT weggeworfen**, obwohl sie die Mehrzahl
+ * stellen (an echten Seiten gezählt: 61 bis 88 von rund 120 Zeilen, im
+ * Branchenverzeichnis 318 von 421). Sie sind die Navigation und die
+ * Überschriften — also welche Unterseiten es gibt und wie der Betrieb seine
+ * Leistungen nennt. Genau das braucht der Agent bei „bau mir eine Seite wie die
+ * von X". Sie zu filtern sähe nach Aufräumen aus und nähme ihm die Struktur;
+ * sie sind kurz und kosten fast nichts.
+ */
 function normalisiere(roh: string): string {
   return roh
     .replace(/[^\S\n]+/g, " ")
