@@ -126,13 +126,24 @@ describe("jeder Grund aus agent.ts wird übersetzt", () => {
     // EHRLICH GESAGT: Diese eine Prüfung liest sehr wohl die Implementierung —
     // sie sucht `case`-Zweige im Rumpf und bricht, wenn `agentFehlerText`
     // einmal keine `switch`-Anweisung mehr ist. Das ist derselbe Griff, den
-    // ich oben als falsch beschreibe, und er ist hier trotzdem vertretbar:
-    // Test und Funktion gehören DEMSELBEN Bereich, liegen zwei Dateien
-    // nebeneinander, und ein Umbau ändert beide in einem Zug. Falsch wird der
-    // Griff, wenn er eine Bereichsgrenze überschreitet — dann pflegt ihn
-    // niemand, der ihn ändern müsste. Wer diese Funktion umbaut, passt die
-    // folgende Zeile mit an; wer sie über Bereichsgrenzen kopiert, sollte es
-    // lassen.
+    // ich oben als falsch beschreibe.
+    //
+    // DIE REGEL, die beide Fälle erklärt (Formulierung von Test-Integration,
+    // gefunden beim Anwenden auf die eigenen Dateien):
+    //
+    //   Über eine Bereichsgrenze hinweg darf ein Test nur ERZEUGNISSE
+    //   vergleichen, nie eine BAUART lesen.
+    //
+    // Deshalb ist es hier erlaubt: Test und Funktion gehören demselben
+    // Bereich, ein Umbau ändert beide in einem Zug. Deshalb war der gelöschte
+    // Wächter in `agent-routes.test.ts` falsch: Derselbe Griff hätte zwei
+    // Bereiche in einem Zug ändern müssen, und der zweite hätte es erst am
+    // roten Balken erfahren. Und deshalb ist `csp.test.ts` in Ordnung, obwohl
+    // es fremde Dateien liest: Es hält die Caddyfile-Vorlage gegen die Ausgabe
+    // des Generators — zwei Erzeugnisse, keine Bauart.
+    //
+    // Wer diese Funktion umbaut, passt die folgende Zeile mit an; wer die Form
+    // über eine Bereichsgrenze kopiert, sollte es lassen.
     const behandelt = [...(agentFehlerText.toString().matchAll(/case "([a-z-]+)"/g))].map((m) => m[1]!);
     const erzeugt = new Set(gruendeAusAgent().map((g) => g.split(":")[0]!));
     for (const fall of behandelt) {
