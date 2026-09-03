@@ -249,6 +249,35 @@ export async function runWorker(): Promise<void> {
   });
   await resourceLoader.reload();
 
+  /**
+   * Der Sitzungsspeicher dieses Laufs.
+   *
+   * Er liegt IN der Arbeitskopie (`.pi-sitzung/`, Punkt-Präfix — der
+   * Übernahme-Scan überspringt Punkt-Einträge, siehe `arbeitskopie.ts`). Der
+   * Grund steht in `verlauf.ts`: Die Sandbox hat genau einen beschreibbaren
+   * Pfad, und ein zweiter in den Kundenordner hinein wäre eine Aufweichung von
+   * Invariante 11 für reine Bequemlichkeit. Der Elternprozess legt einen
+   * fortzusetzenden Verlauf vorher hinein und holt das Ergebnis danach zurück.
+   *
+   * Ohne `REGORO_SITZUNG_DIR` bleibt es beim alten Verhalten (kein Verlauf) —
+   * das hält die Attrappen und ältere Aufrufer lauffähig.
+   */
+  function sitzungsVerwalter(kopie: string) {
+    const dir = process.env.REGORO_SITZUNG_DIR;
+    if (!dir) return SessionManager.inMemory(kopie);
+    const fortsetzen = process.env.REGORO_SITZUNG_DATEI;
+    if (fortsetzen) {
+      try {
+        return SessionManager.open(fortsetzen, dir);
+      } catch (err) {
+        // Ein unlesbarer Verlauf darf den Auftrag nicht verhindern; er beginnt
+        // dann eben neu. Ins Log, nicht an den Kunden.
+        log(`Verlauf nicht fortsetzbar, beginne neu: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    return SessionManager.create(kopie, dir);
+  }
+
   const { session } = await createAgentSession({
     cwd: arbeitskopie,
     agentDir,
@@ -258,7 +287,7 @@ export async function runWorker(): Promise<void> {
     // Vorgabe wäre `true` — ein vom Agenten angelegtes .pi/ würde beim nächsten
     // Lauf ungefragt geladen (Contract §13.12).
     settingsManager: SettingsManager.create(arbeitskopie, agentDir, { projectTrusted: false }),
-    sessionManager: SessionManager.inMemory(arbeitskopie),
+    sessionManager: sitzungsVerwalter(arbeitskopie),
     noTools: "builtin",
     excludeTools: PI_EINGEBAUTE, // harte Entfernung
     tools: [...WERKZEUG_NAMEN], // aktive Allowlist — die einzige, die auf alles wirkt

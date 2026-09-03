@@ -22,6 +22,7 @@ import {
 import { maskiereKennung, normalisiereKennung, type Kanal } from "./kennung.ts";
 import { erzeugeCode, merkeCode, pruefeCode } from "./codes.ts";
 import { entsperreKennung, pruefeBremse, wartezeitText } from "./bremse.ts";
+import { listeVerlaeufe } from "./verlauf.ts";
 import type { Versand } from "./versand.ts";
 import type { KiConfig } from "./betreiber-config.ts";
 import { renderEditView, renderVersionPreview } from "./serve.ts";
@@ -675,6 +676,7 @@ async function route(
       if (ctx.ki == null) return notFound();
       if (path === "/edit/agent" && method === "POST") return handleAgentStart(req, ctx);
       if (path === "/edit/agent/status" && method === "GET") return handleAgentStatus(ctx);
+      if (path === "/edit/agent/verlaeufe" && method === "GET") return handleAgentVerlaeufe(ctx);
       if (path === "/edit/agent/abort" && method === "POST") return handleAgentAbort(ctx);
       if (path === "/edit/agent/events" && method === "GET") return handleAgentEvents(req, ctx, srv);
       return notFound();
@@ -1034,6 +1036,30 @@ function istEigenerKlartext(s: string): boolean {
   if (!s.includes(" ")) return false;
   // Deutlich länger als jeder unserer Sätze heißt: da hängt etwas dran.
   return s.length <= 200;
+}
+
+/**
+ * Die Liste vergangener Gespräche dieser Website.
+ *
+ * Titel sind KUNDENTEXT — der erste Satz eines Auftrags. Sie gehen als JSON
+ * hinaus und werden im Overlay per `textContent` gesetzt, nie als HTML. Wer das
+ * hier je zu einer gerenderten Liste umbaut, muss maskieren.
+ *
+ * Kein Kontingent-Verbrauch, kein Lauf: reines Lesen. Trotzdem hinter der
+ * Auth-Wall wie alle `/edit/agent*`-Routen — der Verlauf enthält wörtlich, was
+ * der Kunde geschrieben hat.
+ */
+async function handleAgentVerlaeufe(ctx: HostCtx): Promise<Response> {
+  const alle = await listeVerlaeufe(ctx.siteDir);
+  return Response.json({
+    ok: true,
+    verlaeufe: alle.map((v) => ({
+      id: v.id,
+      titel: v.titel,
+      geaendert: v.geaendert,
+      nachrichten: v.nachrichten,
+    })),
+  });
 }
 
 async function handleAgentStart(req: Request, ctx: HostCtx): Promise<Response> {

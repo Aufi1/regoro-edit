@@ -28,6 +28,13 @@ import { commitEdit, git } from "./git.ts";
 import { AUTH_DIR_NAME } from "./auth.ts";
 import { bwrapVerfuegbar, sandboxArgv, standardVerstecke } from "./sandbox.ts";
 import { ermittleAenderungen, legeArbeitskopieAn, raeumeAuf } from "./arbeitskopie.ts";
+import {
+  bereiteSitzungVor,
+  raeumeAlteVerlaeufe,
+  sitzungDirInKopie,
+  uebernimmSitzung,
+  waehleFortsetzung,
+} from "./verlauf.ts";
 import { pruefeKontingent, verbucheTokens } from "./kontingent.ts";
 import { validateAgentOutput } from "./validate.ts";
 import { alleBrowserHerkuenfte, loadIntegrationen } from "./integrationen.ts";
@@ -256,11 +263,31 @@ async function fuehreAus(ctx: HostCtx, auftrag: string, opts: StartOptionen, lau
   let relay: { port: number; stop(): void } | null = null;
   let geseheneTokens = 0;
 
+  let sitzungDatei: string | null = null;
+
   try {
     kopie = legeArbeitskopieAn(ctx.siteDir);
+
+    /**
+     * Verlauf: aufräumen, auswählen, in die Arbeitskopie legen.
+     *
+     * Das Aufräumen hängt am Laufstart und nicht an einem Zeitgeber — derselbe
+     * Aufhänger wie beim Kontingent. Ein Prozess ohne Läufe erzeugt keine
+     * Verläufe, die aufzuräumen wären.
+     *
+     * Alles hier ist bewusst folgenlos im Fehlerfall: Ein kaputter Verlauf darf
+     * einen Auftrag nicht verhindern, er beginnt dann eben neu.
+     */
+    try {
+      raeumeAlteVerlaeufe(ctx.siteDir);
+      sitzungDatei = bereiteSitzungVor(kopie, await waehleFortsetzung(ctx.siteDir));
+    } catch (err) {
+      process.stderr.write(`[agent] Verlauf nicht vorbereitet: ${String(err)}\n`);
+    }
+
     relay = starteRelay(ki, integrationen);
 
-    const ergebnis = await begleiteWorker(ctx, auftrag, opts, lauf, kopie, relay.port, ki, integrationen, kontingent.frei);
+    const ergebnis = await begleiteWorker(ctx, auftrag, opts, lauf, kopie, relay.port, ki, integrationen, kontingent.frei, sitzungDatei);
     geseheneTokens = ergebnis.tokens;
 
     if (!ergebnis.sauberFertig) {
@@ -292,6 +319,28 @@ async function fuehreAus(ctx: HostCtx, auftrag: string, opts: StartOptionen, lau
       relay?.stop();
     } catch (err) {
       process.stderr.write(`[agent] Weiterleitung ließ sich nicht schließen: ${String(err)}\n`);
+    }
+    /**
+     * Den Verlauf ZURÜCKHOLEN, bevor die Arbeitskopie verschwindet — und auch
+     * nach einem gescheiterten Lauf.
+     *
+     * Ein Auftrag, der an der Übernahme scheitert (Validator lehnt ab), hat
+     * trotzdem stattgefunden: Das Modell hat geantwortet, Token sind
+     * ausgegeben, und der Kunde will beim nächsten Mal daran anknüpfen können
+     * („das eben hat nicht geklappt, mach es anders"). Nur Erfolge zu sichern
+     * hieße, ausgerechnet die Gespräche zu verlieren, in denen nachgehakt wird.
+     */
+    if (kopie) {
+      try {
+        const zurueck = uebernimmSitzung(kopie, ctx.siteDir);
+        if (zurueck.uebersprungen.length > 0) {
+          process.stderr.write(
+            `[agent] Verlauf zu groß, nicht gesichert: ${zurueck.uebersprungen.join(", ")}\n`,
+          );
+        }
+      } catch (err) {
+        process.stderr.write(`[agent] Verlauf nicht gesichert: ${String(err)}\n`);
+      }
     }
     // Aufräumen gehört ins finally, auch bei Abbruch — sonst füllt sich /run,
     // bis kein Lauf mehr startet.
@@ -326,6 +375,7 @@ async function begleiteWorker(
   ki: NonNullable<HostCtx["ki"]>,
   integrationen: ReturnType<typeof loadIntegrationen>,
   freiesKontingent: number,
+  sitzungDatei: string | null,
 ): Promise<WorkerErgebnis> {
   const skills = process.env.REGORO_SKILLS || null;
   const befehl = opts.workerBefehl ?? standardWorkerBefehl();
@@ -349,7 +399,7 @@ async function begleiteWorker(
     // OpenRouter-Schlüssel ein: Erbte der Worker HTTP_PROXY, gelänge ein
     // Modellaufruf AM RELAY VORBEI — und ein kaputtes Relay fiele niemandem auf,
     // weil weiterhin alles funktionierte.
-    env: workerUmgebung(auftrag, kopie, skills, relayPort, ki, integrationen, freiesKontingent),
+    env: workerUmgebung(auftrag, kopie, skills, relayPort, ki, integrationen, freiesKontingent, sitzungDatei),
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
@@ -611,6 +661,7 @@ function workerUmgebung(
   ki: NonNullable<HostCtx["ki"]>,
   integrationen: ReturnType<typeof loadIntegrationen>,
   freiesKontingent: number,
+  sitzungDatei: string | null,
 ): Record<string, string> {
   // pi schriebe sonst nach ~/.pi/agent/: Sitzungen samt vollem Kundenauftrag
   // und einen Auth-Speicher. Beides zeigt in die Arbeitskopie, die mit dem Lauf
@@ -638,6 +689,11 @@ function workerUmgebung(
       [...integrationen.entries()].map(([name]) => ({ name, zweck: `Dienst „${name}“` })),
     ),
     REGORO_BROWSER_HERKUENFTE: JSON.stringify(alleBrowserHerkuenfte(integrationen)),
+    // Der Gesprächsverlauf. Beides zeigt IN die Arbeitskopie — der Worker
+    // bekommt keinen Schreibzugriff auf den Kundenordner (Invariante 11,
+    // Begründung in `verlauf.ts`). Leerer Dateiname heißt „neuer Verlauf".
+    REGORO_SITZUNG_DIR: sitzungDirInKopie(kopie),
+    REGORO_SITZUNG_DATEI: sitzungDatei ?? "",
   };
 }
 
