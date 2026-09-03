@@ -376,12 +376,22 @@ function rohText(html: string): string {
   return html
     .replace(/<!--[\s\S]*?-->/g, " ")
     .replace(/<(script|style|noscript|template)\b[\s\S]*?<\/\1\s*>/gi, " ")
-    // Auch hier muss `hidden` fallen, sonst ist eine unparsbare Seite der Umweg,
-    // auf dem ein Köder doch beim Modell landet — gemessen an "<<<>>><div
-    // hidden>…". Grob und ohne Verschachtelungswissen: Dieser Weg läuft nur,
-    // wenn der Parser schon aufgegeben hat, und dort ist zu viel zu entfernen
-    // das kleinere Übel.
+    // Auch hier müssen `hidden` UND `display:none` fallen, sonst ist eine
+    // unparsbare Seite der Umweg, auf dem ein Köder doch beim Modell landet —
+    // und kaputtes Markup muss niemand vermeiden, der Text unterschieben will.
+    // `display:none` ist dabei die wichtigere der beiden: Sie ist die Form, die
+    // jemand zuerst nimmt, und sie fehlte hier, obwohl direkt darüber steht, der
+    // Notfallweg räume dieselben Verstecke wie der DOM-Durchgang.
+    //
+    // Grob und ohne Verschachtelungswissen, das ist Absicht: Dieser Weg läuft
+    // nur, wenn der Parser schon aufgegeben hat, und dort ist zu viel zu
+    // entfernen das kleinere Übel. `i` deckt Großschreibung in Attributname und
+    // CSS-Schlüsselwort ab (`STYLE="DISPLAY:NONE"`).
     .replace(/<(\w+)\b[^>]*\shidden(?=[\s>=])[^>]*>[\s\S]*?<\/\1\s*>/gi, " ")
+    .replace(
+      /<(\w+)\b[^>]*\sstyle\s*=\s*(["'])[^"']*(?:display\s*:\s*none|visibility\s*:\s*hidden)[^"']*\2[^>]*>[\s\S]*?<\/\1\s*>/gi,
+      " ",
+    )
     .replace(/<[^>]*>/g, " ")
     .replace(/\s+/g, " ")
     .trim();
