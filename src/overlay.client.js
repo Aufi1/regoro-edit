@@ -552,7 +552,45 @@
       "background:#e2571e;animation:__regoro-apuls 1.1s ease-in-out infinite;}",
       "@keyframes __regoro-apuls{0%,100%{opacity:.25}50%{opacity:1}}",
       // Body-Offset, damit der fixe Balken nichts verdeckt
-      "body.__regoro-offset{padding-top:52px;}"
+      "body.__regoro-offset{padding-top:52px;}",
+
+      /**
+       * DIE SEITENLEISTE SCHIEBT, SIE ÜBERDECKT NICHT.
+       *
+       * Vorher lag sie als `position:fixed` über der Website — der Kunde
+       * bearbeitete eine Seite, deren rechtes Viertel er nicht sehen konnte,
+       * und genau dort steht bei diesen Vorlagen oft der Inhalt, um den es
+       * geht. Jetzt bekommt der Body rechts Platz, und die Editor-Leiste endet
+       * an derselben Kante.
+       *
+       * Nur eine Breite an einer Stelle: `--regoro-apanel`. Wer sie ändert,
+       * ändert Panel, Body-Abstand und Leiste zugleich — auseinanderlaufen
+       * können sie nicht.
+       */
+      ":root{--regoro-apanel:420px;}",
+      "body.__regoro-agent-offen{padding-right:var(--regoro-apanel);}",
+      "body.__regoro-agent-offen #__regoro-bar{right:var(--regoro-apanel);}",
+
+      /**
+       * AUF DEM HANDY GILT DAS GEGENTEIL: Die Seitenleiste nimmt die ganze
+       * Breite — bei 420px neben einer 360px-Seite bliebe von beidem nichts
+       * Brauchbares. Sie beginnt aber UNTER der Editor-Leiste (`top:52px`), und
+       * der Body bekommt keinen rechten Abstand.
+       *
+       * Der Grund für die Ausnahme der Leiste: Sie trägt „Speichern",
+       * „Versionen" und den Schließen-Knopf. Deckte der Chat sie zu, käme man
+       * aus ihm nur noch über seinen eigenen Knopf heraus — und das Gespräch
+       * ließe sich nicht speichern, ohne es zu verlassen.
+       *
+       * Dieselbe Regel für die Versionsliste: Auch sie ist ein Panel und würde
+       * sonst auf dem Handy neben einer zu schmalen Seite kleben.
+       */
+      "@media (max-width:899px){",
+      "  body.__regoro-agent-offen{padding-right:0;}",
+      "  body.__regoro-agent-offen #__regoro-bar{right:0;}",
+      "  #__regoro-agent,#__regoro-versions{top:52px;left:0;right:0;width:auto;max-width:none;",
+      "  box-shadow:0 -4px 18px rgba(0,0,0,.28);}",
+      "}"
     ].join("");
     var style = el("style", { id: "__regoro-style" });
     style.appendChild(document.createTextNode(css));
@@ -2077,6 +2115,7 @@
       agentPanel.parentNode.removeChild(agentPanel);
     }
     agentPanel = null;
+    document.body.classList.remove("__regoro-agent-offen");
   }
 
   function openAgent() {
@@ -2118,6 +2157,9 @@
     panel.appendChild(form);
     document.body.appendChild(panel);
     agentPanel = panel;
+    // Erst JETZT, nicht vorher: Der Body soll nicht Platz freihalten für ein
+    // Panel, das wegen eines Fehlers im Aufbau gar nicht erscheint.
+    document.body.classList.add("__regoro-agent-offen");
 
     agentGesperrt = false;
     agentGesamt = null;
