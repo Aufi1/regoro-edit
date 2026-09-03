@@ -69,6 +69,15 @@ export type StartOptionen = {
   workerBefehl?: string[];
   /** Sammelverzeichnis, damit die Sandbox die anderen Kunden zudecken kann. */
   sitesRoot?: string | null;
+  /**
+   * Welches Gespräch fortgesetzt wird: `"auto"` (24-Stunden-Regel), `"neu"`
+   * oder die Kennung eines Verlaufs aus `GET /edit/agent/verlaeufe`.
+   *
+   * Fehlt das Feld, gilt `"auto"` — das ist das Verhalten von vor der
+   * Gesprächsliste und bleibt der Vorgabefall für jeden Aufrufer, der von ihr
+   * nichts weiß.
+   */
+  verlauf?: string | null;
 };
 
 /** Höchstens so viele Ereignisse werden für einen Neuverbinder aufgehoben (§13.14). */
@@ -300,7 +309,10 @@ async function fuehreAus(ctx: HostCtx, auftrag: string, opts: StartOptionen, lau
      */
     try {
       raeumeAlteVerlaeufe(ctx.siteDir);
-      sitzungDatei = bereiteSitzungVor(kopie, await waehleFortsetzung(ctx.siteDir));
+      sitzungDatei = bereiteSitzungVor(
+        kopie,
+        await waehleFortsetzung(ctx.siteDir, Date.now(), opts.verlauf ?? "auto"),
+      );
     } catch (err) {
       process.stderr.write(`[agent] Verlauf nicht vorbereitet: ${String(err)}\n`);
     }

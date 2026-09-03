@@ -24,7 +24,7 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
-import { erstelleWerkzeuge, WERKZEUG_NAMEN, type IntegrationHinweis } from "./agent-tools.ts";
+import { erstelleWerkzeuge, kurzfassung, WERKZEUG_NAMEN, type IntegrationHinweis } from "./agent-tools.ts";
 
 /**
  * Die eingebauten Werkzeuge von pi, vollständig. `noTools: "builtin"` nimmt sie
@@ -411,30 +411,6 @@ function modellFehlerAus(session: { state: { messages: unknown[] } }): string | 
     return m.errorMessage ?? "Der Modellzugang antwortete nicht.";
   }
   return null;
-}
-
-/** Eine Zeile für die Seitenleiste: „schreibt leistungen.html". */
-function kurzfassung(name: string, args: unknown): string {
-  const a = (args ?? {}) as Record<string, unknown>;
-  const pfad = typeof a.path === "string" ? a.path : "";
-  switch (name) {
-    case "write_file":
-      return `schreibt ${pfad}`;
-    case "edit_file":
-      return `ändert ${pfad}`;
-    case "read_file":
-      return `liest ${pfad}`;
-    case "list_files":
-      return `sieht sich ${pfad || "die Website"} an`;
-    case "web_search":
-      return `sucht nach „${typeof a.query === "string" ? a.query : ""}“`;
-    case "fetch_page":
-      return `liest ${typeof a.url === "string" ? a.url : "eine Seite"}`;
-    case "call_api":
-      return `ruft ${typeof a.integration === "string" ? a.integration : "einen Dienst"} auf`;
-    default:
-      return name;
-  }
 }
 
 /** Die letzte Textantwort des Modells — sie ist die Zusammenfassung für den Kunden. */

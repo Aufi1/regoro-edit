@@ -32,6 +32,8 @@ import { join } from "node:path";
 
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 
+import { kurzfassung } from "./agent-tools.ts";
+
 /** `<siteDir>/.regoro/verlauf/` — nicht ausgeliefert (Dotfile-Sperre), gitignored. */
 export function verlaufDir(siteDir: string): string {
   return join(siteDir, ".regoro", "verlauf");
@@ -115,8 +117,25 @@ function titelAus(text: string): string {
 export async function waehleFortsetzung(
   siteDir: string,
   jetzt: number = Date.now(),
+  wunsch: string = "auto",
 ): Promise<VerlaufInfo | null> {
+  if (wunsch === "neu") return null;
   const alle = await listeVerlaeufe(siteDir);
+  if (wunsch !== "auto") {
+    /**
+     * Ein ausdrücklich gewähltes Gespräch wird fortgesetzt, EGAL WIE ALT es ist.
+     * Die 24-Stunden-Regel beantwortet die Frage „was meint der Kunde wohl?" —
+     * hat er selbst geantwortet, gibt es nichts mehr zu raten.
+     *
+     * Eine unbekannte Kennung beginnt ein NEUES Gespräch, statt den Auftrag
+     * abzulehnen: Sie entsteht im Alltag nur durch das Aufräumen nach 30 Tagen
+     * oder eine veraltete Liste im zweiten Tab. Beides ist kein Fehler des
+     * Kunden, und ein 400 für einen sonst gültigen Auftrag wäre die härtere
+     * Antwort. Auf den jüngsten Verlauf auszuweichen wäre dagegen falsch — das
+     * setzte ein anderes Gespräch fort als das gewählte, ohne es zu sagen.
+     */
+    return alle.find((v) => v.id === wunsch) ?? null;
+  }
   const juengster = alle[0];
   if (!juengster) return null;
   return jetzt - juengster.geaendert < NEUER_VERLAUF_NACH_MS ? juengster : null;
@@ -216,52 +235,215 @@ export function raeumeAlteVerlaeufe(siteDir: string, jetzt: number = Date.now())
   return weg;
 }
 
-export type VerlaufNachricht = { rolle: "kunde" | "agent"; text: string };
+
+// ===========================================================================
+// Ein Gespräch zum Nachlesen
+// ===========================================================================
 
 /**
- * Die Nachrichten eines Verlaufs, für die Anzeige in der Seitenleiste.
+ * Eine Zeile im angezeigten Gespräch.
  *
- * NUR Text von Kunde und Assistent. Werkzeugaufrufe, Systemhinweise und
- * Compaction-Zusammenfassungen bleiben draußen: Sie sind Maschinerie, und die
- * Zusammenfassung enthält obendrein Dateipfade des Servers. Was der Kunde beim
- * ersten Mal gesehen hat, soll er wiedersehen — nicht mehr.
- *
- * `id === null` heißt „der aktuelle", also der jüngste innerhalb der
- * 24-Stunden-Frist. Ein unbekannter oder fremder Bezeichner liefert eine leere
- * Liste, nie den Verlauf einer anderen Website: Gesucht wird ausschließlich in
- * `verlaufDir(siteDir)`.
+ * Bewusst NICHT pi's Nachrichtenformat: Der Kunde soll lesen, was er gesagt hat
+ * und was der Assistent geantwortet hat — nicht Werkzeugergebnisse, nicht
+ * Denkschritte, nicht Rollen, die er nicht kennt. Was hier nicht vorkommt,
+ * kommt in der Seitenleiste nicht an.
  */
-export async function leseVerlauf(
+export type VerlaufNachricht = {
+  von: "kunde" | "agent" | "werkzeug";
+  text: string;
+  /** Unix-ms, 0 wenn die Sitzung keinen Zeitstempel führt. */
+  zeit: number;
+};
+
+/** Wie viele Zeilen eine Seite liefert, wenn der Aufrufer nichts sagt. */
+export const NACHRICHTEN_JE_SEITE = 20;
+
+/**
+ * Obergrenze je Anfrage.
+ *
+ * Die Seitenleiste lädt beim Hochscrollen nach; ohne Deckel könnte ein Aufrufer
+ * mit `anzahl=1000000` ein ganzes Gespräch in einer Antwort verlangen und den
+ * Prozess an der Serialisierung beschäftigen.
+ */
+export const MAX_NACHRICHTEN_JE_SEITE = 100;
+
+/**
+ * Obergrenze je Zeile.
+ *
+ * Aufträge sind serverseitig begrenzt und Modellantworten von Natur aus kurz —
+ * das hier ist Notwehr gegen den Fall, den wir nicht vorhersehen: eine einzelne
+ * Nachricht, die die Seitenleiste unbrauchbar macht. Gekürzt wird sichtbar.
+ */
+export const MAX_NACHRICHT_ZEICHEN = 20_000;
+
+export type VerlaufSeite = {
+  id: string;
+  titel: string;
+  geaendert: number;
+  /** Die Zeilen dieser Seite, älteste zuerst. */
+  nachrichten: VerlaufNachricht[];
+  /** Index der ersten gelieferten Zeile im ganzen Gespräch. `> 0` heißt: es geht weiter nach oben. */
+  ab: number;
+  /** Wie viele Zeilen das Gespräch insgesamt hat. */
+  gesamt: number;
+};
+
+/**
+ * Ein Gespräch zum Nachlesen, seitenweise von hinten.
+ *
+ * `null` heißt: Diesen Verlauf gibt es (nicht mehr). Der Aufrufer kennt die
+ * Kennung aus `listeVerlaeufe`, also ist das der Aufräum- oder Wettlauf-Fall,
+ * kein Angriff.
+ *
+ * **Die Kennung wird NIE zu einem Pfad.** Gesucht wird in der Liste, die
+ * `listeVerlaeufe` aus dem Verzeichnis dieser Website aufbaut; der Dateiname
+ * kommt von dort. Eine Kennung aus dem Browser kann damit auf nichts zeigen,
+ * was nicht ohnehin zu dieser Website gehört — es gibt keinen Weg von einer
+ * erfundenen Kennung zu einer fremden Datei.
+ *
+ * Geblättert wird von HINTEN: Ohne Angabe kommen die jüngsten Zeilen, mit
+ * `vor` alles davor. Das ist die Reihenfolge, in der ein Gespräch gelesen wird
+ * — und der Grund, warum `ab` mitgeliefert wird: Es ist der Cursor für den
+ * nächsten Griff nach oben.
+ */
+export async function leseNachrichten(
   siteDir: string,
-  id: string | null,
-  jetzt: number = Date.now(),
-): Promise<{ id: string; nachrichten: VerlaufNachricht[] } | null> {
-  const ziel = id === null ? await waehleFortsetzung(siteDir, jetzt) : (await listeVerlaeufe(siteDir)).find((v) => v.id === id) ?? null;
-  if (!ziel) return null;
-  let eintraege;
-  try {
-    eintraege = SessionManager.open(ziel.datei, verlaufDir(siteDir)).getEntries();
-  } catch {
-    return null;
-  }
-  const nachrichten: VerlaufNachricht[] = [];
-  for (const e of eintraege as { type?: string; message?: { role?: string; content?: unknown } }[]) {
-    if (e.type !== "message") continue;
-    const rolle = e.message?.role;
-    if (rolle !== "user" && rolle !== "assistant") continue;
-    const text = alsText(e.message?.content);
-    if (text === "") continue;
-    nachrichten.push({ rolle: rolle === "user" ? "kunde" : "agent", text });
-  }
-  return { id: ziel.id, nachrichten };
+  id: string,
+  opts: { vor?: number | null; anzahl?: number | null } = {},
+): Promise<VerlaufSeite | null> {
+  const info = (await listeVerlaeufe(siteDir)).find((v) => v.id === id);
+  if (!info) return null;
+
+  const flach = leseFlach(info.datei);
+  const gesamt = flach.length;
+
+  const anzahl = Math.min(
+    MAX_NACHRICHTEN_JE_SEITE,
+    Math.max(1, Math.trunc(opts.anzahl ?? NACHRICHTEN_JE_SEITE)),
+  );
+  // `vor` ist der Index, VOR dem gelesen wird — der `ab`-Wert der vorigen
+  // Antwort. Alles Unsinnige (negativ, zu groß, keine Zahl) fällt auf „ganz
+  // hinten" zurück, statt eine leere Seite zu liefern.
+  const roh = opts.vor;
+  const bis =
+    typeof roh === "number" && Number.isFinite(roh) && roh >= 0 && roh <= gesamt
+      ? Math.trunc(roh)
+      : gesamt;
+  const ab = Math.max(0, bis - anzahl);
+
+  return {
+    id: info.id,
+    titel: info.titel,
+    geaendert: info.geaendert,
+    nachrichten: flach.slice(ab, bis),
+    ab,
+    gesamt,
+  };
 }
 
-/** Inhalt einer Nachricht als reiner Text — pi erlaubt String oder Teile-Liste. */
-function alsText(inhalt: unknown): string {
-  if (typeof inhalt === "string") return inhalt.trim();
-  if (!Array.isArray(inhalt)) return "";
-  return inhalt
-    .map((t) => (t && typeof t === "object" && typeof (t as { text?: unknown }).text === "string" ? (t as { text: string }).text : ""))
+/**
+ * Die Sitzungsdatei zu einer flachen Folge von Zeilen.
+ *
+ * Über `SessionManager.open`, nicht über eigenes JSONL-Lesen: pi wandert seine
+ * Fassungen (v1 → v3) beim Laden um. Wer hier selbst parst, liest eine ältere
+ * Sitzung entweder falsch oder gar nicht — und merkt es nie, weil frisch
+ * angelegte Sitzungen immer die neueste Fassung haben.
+ *
+ * Gelesen wird `getEntries()` und nicht der Zweig zum Blatt: Wir verzweigen
+ * nirgends, und der Kunde soll sein ganzes Gespräch sehen — auch die Teile vor
+ * einer Verdichtung, die im Modellkontext längst nicht mehr stehen.
+ */
+function leseFlach(datei: string): VerlaufNachricht[] {
+  let eintraege;
+  try {
+    eintraege = SessionManager.open(datei).getEntries();
+  } catch {
+    // Wie in `listeVerlaeufe`: ein unlesbarer Verlauf lähmt die Seitenleiste
+    // nicht, er ist dann eben leer.
+    return [];
+  }
+
+  const zeilen: VerlaufNachricht[] = [];
+  for (const e of eintraege as unknown as RohEintrag[]) {
+    const zeit = Date.parse(String(e?.timestamp ?? "")) || 0;
+
+    /**
+     * Eine Verdichtung ist für den Kunden keine Nachricht, aber ihr Fehlen wäre
+     * ein Rätsel: Ohne diesen Hinweis sähe er, dass der Assistent auf etwas
+     * antwortet, das nicht mehr dasteht.
+     *
+     * HINAUS GEHT NUR DIESER SATZ, nie die Zusammenfassung selbst. Sie ist vom
+     * Modell geschrieben und führt regelmäßig Dateipfade des Servers mit —
+     * pi legt sie unter `summary` ab, wir sehen sie nicht einmal an.
+     */
+    if (e?.type === "compaction") {
+      zeilen.push({ von: "werkzeug", text: "fasst das bisherige Gespräch zusammen", zeit });
+      continue;
+    }
+    if (e?.type !== "message") continue;
+
+    const m = e.message;
+    if (!m || typeof m !== "object") continue;
+
+    if (m.role === "user") {
+      const t = textAus(m.content);
+      if (t) zeilen.push({ von: "kunde", text: kuerze(t), zeit });
+      continue;
+    }
+    if (m.role === "assistant") {
+      // Reihenfolge erhalten: Text und Werkzeugaufrufe stehen in einer
+      // Nachricht nebeneinander und sollen so erscheinen, wie sie fielen.
+      const bloecke = Array.isArray(m.content) ? m.content : null;
+      if (!bloecke) {
+        const t = textAus(m.content);
+        if (t) zeilen.push({ von: "agent", text: kuerze(t), zeit });
+        continue;
+      }
+      let text = "";
+      const schiebeText = () => {
+        const t = text.trim();
+        if (t) zeilen.push({ von: "agent", text: kuerze(t), zeit });
+        text = "";
+      };
+      for (const b of bloecke) {
+        if (b?.type === "text" && typeof b.text === "string") text += b.text;
+        else if (b?.type === "toolCall") {
+          schiebeText();
+          zeilen.push({ von: "werkzeug", text: kurzfassung(String(b.name ?? ""), b.arguments), zeit });
+        }
+        // `thinking` fällt hier heraus: Denkschritte sind kein Gespräch.
+      }
+      schiebeText();
+      continue;
+    }
+    // toolResult, bashExecution, custom, branchSummary: nicht das Gespräch.
+  }
+  return zeilen;
+}
+
+/** Nur, was pi uns aus einer Sitzung reicht — absichtlich lose typisiert. */
+type RohEintrag = {
+  type?: string;
+  timestamp?: string;
+  message?: {
+    role?: string;
+    content?: unknown;
+  };
+};
+
+/** Text aus `string | Block[]`; Bilder und Unbekanntes fallen weg. */
+function textAus(content: unknown): string {
+  if (typeof content === "string") return content.trim();
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((b) => {
+      const c = b as { type?: string; text?: unknown };
+      return c?.type === "text" && typeof c.text === "string" ? c.text : "";
+    })
     .join("")
     .trim();
+}
+
+function kuerze(t: string): string {
+  return t.length > MAX_NACHRICHT_ZEICHEN ? `${t.slice(0, MAX_NACHRICHT_ZEICHEN)}…` : t;
 }

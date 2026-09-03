@@ -25,6 +25,8 @@ import { brichAb, ereignisse, laufAktiv, starteLauf, type AgentEreignis } from "
 import { pruefeKontingent, verbucheTokens, TOKEN_KONTINGENT } from "./kontingent.ts";
 import { startServer } from "./server.ts";
 import { attrappenVersand } from "./versand.ts";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { verlaufDir } from "./verlauf.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
 const REAL_SITE = join(REPO_ROOT, "examples", "site");
@@ -509,4 +511,72 @@ describe("Serverneustart während eines Laufs", () => {
     // Nur `lauf-*` — RUNTIME_DIRECTORY kann in Produktion noch anderes tragen.
     expect(existsSync(fremd)).toBe(true);
   });
+});
+
+
+// ===========================================================================
+// Welches Gespräch fortgesetzt wird — bis zum Arbeiter durchgereicht
+//
+// GEPRÜFT WIRD DIE KETTE, NICHT DIE REGEL. Dass `waehleFortsetzung` richtig
+// wählt, steht in `verlauf.test.ts`. Hier geht es um die Verdrahtung dahinter:
+// `StartOptionen.verlauf` → `bereiteSitzungVor` → `REGORO_SITZUNG_DATEI` in der
+// Umgebung des Arbeiters. Genau dieses Stück fehlte einmal ganz — die Option
+// war angelegt und im Lauf benutzt, aber `handleAgentStart` las das Feld nie
+// aus dem Rumpf. Alle Einzelteile waren grün.
+//
+// Die Attrappe `umgebung-melden` schickt ihre volle Umgebung als Text zurück;
+// daran lässt sich die Kette am Ende ablesen, statt sie zu vermuten.
+// ===========================================================================
+describe("die Gesprächswahl erreicht den Arbeiter", () => {
+  /** Legt einen echten Verlauf im Kundenordner an und liefert Kennung + Datei. */
+  function legeVerlaufAn(auftrag: string): { id: string; datei: string } {
+    const sm = SessionManager.create(tmp("regoro-agent-cwd-"), verlaufDir(siteDir));
+    sm.appendMessage({ role: "user", content: auftrag } as never);
+    sm.appendMessage({ role: "assistant", content: "erledigt" } as never);
+    return { id: sm.getSessionId(), datei: sm.getSessionFile() ?? "" };
+  }
+
+  /** Fährt einen Lauf mit `umgebung-melden` und liefert die gemeldete Umgebung. */
+  async function umgebungAus(verlauf?: string): Promise<Record<string, string>> {
+    starteLauf(ctx, "umgebung-melden", {
+      workerBefehl: [process.execPath, "run", ATTRAPPE],
+      ...(verlauf === undefined ? {} : { verlauf }),
+    });
+    const alle = await sammle();
+    const text = alle
+      .filter((e): e is Extract<AgentEreignis, { t: "text" }> => e.t === "text")
+      .map((e) => e.inhalt)
+      .join("");
+    return (JSON.parse(text) as { env: Record<string, string> }).env;
+  }
+
+  test.skipIf(!haveBwrap())("eine gewählte Kennung landet als Sitzungsdatei beim Arbeiter", async () => {
+    const alt = legeVerlaufAn("das alte Gespräch");
+    await Bun.sleep(5);
+    legeVerlaufAn("das jüngere Gespräch");
+
+    const env = await umgebungAus(alt.id);
+    const datei = env.REGORO_SITZUNG_DATEI ?? "";
+    // Der Name der Sitzungsdatei trägt die Kennung — sie ist der Beweis, dass
+    // der ALTE Verlauf mitgegeben wurde und nicht der jüngere.
+    expect(datei).toContain(alt.id);
+    // Und sie liegt in der Arbeitskopie, nicht im Kundenordner: Die Sandbox hat
+    // genau EINEN beschreibbaren Pfad (Invariante 11).
+    expect(datei.startsWith(siteDir)).toBe(false);
+  }, 30_000);
+
+  test.skipIf(!haveBwrap())('"neu" gibt dem Arbeiter KEINE Sitzungsdatei mit', async () => {
+    legeVerlaufAn("ein frisches Gespräch");
+    const env = await umgebungAus("neu");
+    expect(env.REGORO_SITZUNG_DATEI ?? "").toBe("");
+  }, 30_000);
+
+  test.skipIf(!haveBwrap())("Gegenprobe: ohne Angabe wird der frische Verlauf fortgesetzt", async () => {
+    // OHNE DIESE GEGENPROBE beweist der Test darüber nichts: Eine Verdrahtung,
+    // die NIE eine Sitzungsdatei mitgibt, wäre dort ebenfalls grün — und das
+    // Gedächtnis des Agenten still verloren.
+    const frisch = legeVerlaufAn("ein frisches Gespräch");
+    const env = await umgebungAus();
+    expect(env.REGORO_SITZUNG_DATEI ?? "").toContain(frisch.id);
+  }, 30_000);
 });

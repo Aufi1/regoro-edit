@@ -68,10 +68,39 @@ interface Fall {
   ereignisse: string[];
   /** Muss vor der Prüfung ein Auftrag abgeschickt werden? */
   auftrag?: boolean;
+  /**
+   * Liefert der Ereignisstrom seine Folge AUCH OHNE Auftrag aus?
+   *
+   * Das ist die Nachlese des echten Servers: ein beendeter Lauf, den er beim
+   * Öffnen noch einmal ausreicht. Stand einmal als `fallName === "…"` fest im
+   * Server dieses Prüfstands — dann bekommt ein neuer Nachlese-Fall
+   * stillschweigend „Kein Lauf aktiv." und sieht aus wie ein Fehler im Overlay.
+   * Genau so ist es beim Bauen der Verlaufs-Fälle passiert.
+   */
+  nachlese?: boolean;
+  /**
+   * Gespeicherte Gespräche dieser Website, jüngstes zuerst.
+   *
+   * `undefined` heißt: Die Routen `/edit/agent/verlaeufe` und `.../verlauf`
+   * antworten 404 — ein Server auf älterem Stand. Auch DAS ist ein Prüffall:
+   * Die Leiste muss dann arbeiten wie vor der Gesprächsliste.
+   */
+  gespraeche?: Gespraech[];
+  /** Weitere Schritte im Browser, nach Öffnen/Abschicken. */
+  schritte?: string[];
   /** JS-Ausdruck, im Browser ausgewertet — liefert das Prüfergebnis als JSON. */
   pruefung: string;
   /** Was dieser Ausdruck liefern MUSS. */
   sollwert: string;
+}
+
+/** Ein gespeichertes Gespräch, wie `leseNachrichten` es liefert. */
+interface Gespraech {
+  id: string;
+  titel: string;
+  /** ms vor jetzt — damit die Fälle nicht mit der Uhr veralten. */
+  vorMs: number;
+  zeilen: { von: "kunde" | "agent" | "werkzeug"; text: string }[];
 }
 
 /** Kurzform für die immer gleichen Abfragen im Prüfausdruck. */
@@ -83,7 +112,17 @@ const Q = {
     "!!Array.from(document.querySelectorAll('#__regoro-agent button'))" +
     ".find(b=>b.textContent==='Seite neu laden')",
   gesperrt: "document.querySelector('.__regoro-asenden').disabled",
+  /** Der Verlauf als Text, in Reihenfolge — so sieht der Kunde ihn. */
+  zeilen:
+    "Array.from(document.querySelectorAll('#__regoro-agent .__regoro-averlauf > *'))" +
+    ".map(function(n){return n.textContent})",
+  listeOffen: "!document.querySelector('.__regoro-aliste').hidden",
+  listenTitel:
+    "Array.from(document.querySelectorAll('.__regoro-aetitel')).map(function(n){return n.textContent})",
 };
+
+/** Klick auf „Gespräche" im Kopf der Leiste. */
+const LISTE_AUF = "js \"document.querySelector('.__regoro-agespraeche').click()\"";
 
 const FAELLE: Record<string, Fall> = {
   "mit-dateien": {
@@ -150,6 +189,7 @@ const FAELLE: Record<string, Fall> = {
       "Grund. (Ohne das versucht es der Kunde nach einem Reload noch einmal und bezahlt " +
       "denselben Fehlschlag zweimal.)",
     ki: true,
+    nachlese: true,
     pruefung: `JSON.stringify({werkzeuge:${Q.werkzeuge},fehler:(document.querySelector('.__regoro-afehler')||{}).textContent})`,
     sollwert: '{"werkzeuge":1,"fehler":"Die Datei enthält ein neues Inline-Skript."}',
     ereignisse: [
@@ -177,6 +217,156 @@ const FAELLE: Record<string, Fall> = {
       rahmen("tokens", { gesamt: 999_999_999, frei: 0 }),
       rahmen("fehler", {
         grund: "Das Monatskontingent ist mitten im Auftrag aufgebraucht. Es wurde nichts geändert; am Monatsersten geht es weiter.",
+      }),
+    ],
+  },
+
+  "verlauf-nachlesen": {
+    tun: "Nur die Leiste öffnen, nichts abschicken.",
+    erwartung:
+      "Das Gespräch von vorhin steht da — Auftrag, Werkzeugzeile, Antwort. Der letzte " +
+      "Lauf wird aus dem Puffer NUR mit seinem Ausgang ergänzt (Dateiliste), NICHT " +
+      "noch einmal mit seinem Wortlaut. Genau hier stünde sonst jeder Satz doppelt: " +
+      "einmal aus dem gespeicherten Verlauf, einmal aus der Nachlese.",
+    ki: true,
+    nachlese: true,
+    gespraeche: [
+      {
+        id: "g-heute",
+        titel: "Leg eine Seite über Wärmepumpen an.",
+        vorMs: 60_000,
+        zeilen: [
+          { von: "kunde", text: "Leg eine Seite über Wärmepumpen an." },
+          { von: "werkzeug", text: "schreibt waermepumpen.html" },
+          { von: "agent", text: "Die Seite steht und ist verlinkt." },
+        ],
+      },
+    ],
+    pruefung: `JSON.stringify({zeilen:${Q.zeilen},dateien:Array.from(document.querySelectorAll('.__regoro-adateien li')).map(function(l){return l.textContent}),reload:${Q.reload}})`,
+    sollwert:
+      '{"zeilen":["Leg eine Seite über Wärmepumpen an.","schreibt waermepumpen.html",' +
+      '"Die Seite steht und ist verlinkt.","Der letzte Auftrag hat diese Dateien geändert:' +
+      'waermepumpen.html"],"dateien":["waermepumpen.html"],"reload":false}',
+    // Dieselbe Folge wie ein echter Nachlese-Lauf: Text UND Abschluss. Der Text
+    // muss unterdrückt werden, der Abschluss nicht.
+    ereignisse: [
+      rahmen("text", { inhalt: "Die Seite steht " }),
+      rahmen("text", { inhalt: "und ist verlinkt." }),
+      rahmen("fertig", {
+        zusammenfassung: "Die Seite steht und ist verlinkt.",
+        dateien: ["waermepumpen.html"],
+        commit: "a1b2c3d",
+      }),
+    ],
+  },
+
+  "verlauf-blaettern": {
+    tun: "Leiste öffnen, dann im Chatfenster ganz nach oben scrollen.",
+    erwartung:
+      "Zuerst stehen nur die JÜNGSTEN Zeilen da, darüber „↑ Ältere Beiträge“. Nach dem " +
+      "Hochscrollen sind die älteren davor eingehängt — vollständig, in richtiger " +
+      "Reihenfolge und OHNE Dublette. Ist alles geladen, verschwindet der Hinweis.",
+    ki: true,
+    gespraeche: [
+      {
+        id: "g-lang",
+        titel: "Auftrag 1",
+        vorMs: 60_000,
+        zeilen: Array.from({ length: 46 }, (_, i) => ({
+          von: (i % 2 === 0 ? "kunde" : "agent") as "kunde" | "agent",
+          text: `Zeile ${i + 1}`,
+        })),
+      },
+    ],
+    schritte: [
+      // Zweimal greifen: 46 Zeilen bei 20 je Seite sind drei Seiten.
+      "js \"document.querySelector('.__regoro-averlauf').scrollTop=0\"",
+      "sleep 1",
+      "js \"document.querySelector('.__regoro-averlauf').scrollTop=0\"",
+    ],
+    pruefung:
+      `JSON.stringify({anzahl:${Q.zeilen}.length,erste:${Q.zeilen}[0],letzte:${Q.zeilen}.slice(-1)[0],` +
+      `dubletten:${Q.zeilen}.length-new Set(${Q.zeilen}).size,hinweis:!!document.querySelector('.__regoro-amehr')})`,
+    sollwert: '{"anzahl":46,"erste":"Zeile 1","letzte":"Zeile 46","dubletten":0,"hinweis":false}',
+    ereignisse: [rahmen("fehler", { grund: "Kein Lauf aktiv." })],
+  },
+
+  "verlauf-waehlen": {
+    tun: "Leiste öffnen, oben rechts auf „Gespräche“ klicken, das ÄLTERE Gespräch anklicken.",
+    erwartung:
+      "Die Liste nennt „Neues Gespräch“ und beide Titel. Nach dem Klick auf das ältere " +
+      "steht dessen Inhalt im Chatfenster und der des jüngeren ist WEG — nicht darunter " +
+      "gehängt. Zwei Gespräche zu vermischen wäre schlimmer als keines zu zeigen.",
+    ki: true,
+    gespraeche: [
+      {
+        id: "g-jung",
+        titel: "Das jüngere Gespräch",
+        vorMs: 60_000,
+        zeilen: [{ von: "kunde", text: "jung: Auftrag" }, { von: "agent", text: "jung: Antwort" }],
+      },
+      {
+        id: "g-alt",
+        titel: "Das ältere Gespräch",
+        vorMs: 5 * 24 * 60 * 60 * 1000,
+        zeilen: [{ von: "kunde", text: "alt: Auftrag" }, { von: "agent", text: "alt: Antwort" }],
+      },
+    ],
+    schritte: [
+      LISTE_AUF,
+      "sleep 1",
+      "js \"Array.from(document.querySelectorAll('.__regoro-aetitel'))" +
+        ".find(function(n){return n.textContent==='Das ältere Gespräch'}).click()\"",
+    ],
+    pruefung: `JSON.stringify({zeilen:${Q.zeilen},listeOffen:${Q.listeOffen}})`,
+    sollwert: '{"zeilen":["alt: Auftrag","alt: Antwort"],"listeOffen":false}',
+    ereignisse: [rahmen("fehler", { grund: "Kein Lauf aktiv." })],
+  },
+
+  "verlauf-liste": {
+    tun: "Leiste öffnen, oben rechts auf „Gespräche“ klicken.",
+    erwartung:
+      "Die Liste klappt auf und beginnt mit „Neues Gespräch“, darunter die gespeicherten " +
+      "Gespräche mit ihrem ersten Satz als Titel. Der Titel ist WÖRTLICHER Kundentext — " +
+      "er darf nie als HTML gedeutet werden. Deshalb steht hier eines mit spitzen Klammern.",
+    ki: true,
+    gespraeche: [
+      {
+        id: "g-xss",
+        titel: "<img src=x onerror=alert(1)>Mach was",
+        vorMs: 60_000,
+        zeilen: [{ von: "kunde", text: "<img src=x onerror=alert(1)>Mach was" }],
+      },
+    ],
+    schritte: [LISTE_AUF],
+    pruefung:
+      `JSON.stringify({titel:${Q.listenTitel},offen:${Q.listeOffen},` +
+      "eingeschleust:document.querySelectorAll('#__regoro-agent img').length})",
+    sollwert:
+      '{"titel":["Neues Gespräch","<img src=x onerror=alert(1)>Mach was"],"offen":true,' +
+      '"eingeschleust":0}',
+    ereignisse: [rahmen("fehler", { grund: "Kein Lauf aktiv." })],
+  },
+
+  "verlauf-fehlt": {
+    tun: "Leiste öffnen, irgendeinen Auftrag abschicken.",
+    erwartung:
+      "Ein Server OHNE die Verlaufsrouten (404). Die Leiste muss arbeiten wie vorher: " +
+      "grüne Abschlussblase, Dateiliste, Reload-Knopf. Die Gesprächsliste ist Komfort — " +
+      "sie darf den Auftragsweg nie blockieren.",
+    ki: true,
+    auftrag: true,
+    gespraeche: undefined,
+    pruefung: `JSON.stringify({gruen:${Q.gruen},dateien:Array.from(document.querySelectorAll('.__regoro-adateien li')).map(function(l){return l.textContent}),reload:${Q.reload},blasen:${Q.blasen}})`,
+    sollwert: '{"gruen":1,"dateien":["index.html"],"reload":true,"blasen":2}',
+    ereignisse: [
+      rahmen("werkzeug", { name: "write_file", kurz: "schreibt index.html" }),
+      rahmen("text", { inhalt: "Ich ändere " }),
+      rahmen("text", { inhalt: "den Absatz." }),
+      rahmen("fertig", {
+        zusammenfassung: "Ich ändere den Absatz.",
+        dateien: ["index.html"],
+        commit: "a1b2c3d",
       }),
     ],
   },
@@ -296,6 +486,55 @@ function starte(): void {
         headers: { "Content-Type": "application/javascript; charset=utf-8" },
       });
     }
+    /**
+     * Die Gesprächsliste. `gespraeche: undefined` heißt 404 — ein Server auf
+     * älterem Stand, und ein eigener Prüffall.
+     *
+     * `fortsetzbar` bildet die 24-Stunden-Regel des echten Servers nach: Nur
+     * ein Gespräch, dessen letzte Änderung weniger als 24 h her ist, wird
+     * fortgesetzt. Wer das hier fest auf „das erste" setzte, prüfte den Fall
+     * „alles alt, also neues Gespräch" nie.
+     */
+    if (pfad.endsWith("/edit/agent/verlaeufe")) {
+      if (!fall.gespraeche) return new Response("Nicht gefunden", { status: 404 });
+      const jetzt = Date.now();
+      const alle = fall.gespraeche.map((g) => ({
+        id: g.id,
+        titel: g.titel,
+        geaendert: jetzt - g.vorMs,
+        nachrichten: g.zeilen.length,
+      }));
+      const juengster = alle[0];
+      const fortsetzbar =
+        juengster && jetzt - juengster.geaendert < 24 * 60 * 60 * 1000 ? juengster.id : null;
+      return Response.json({ ok: true, fortsetzbar, verlaeufe: alle });
+    }
+    if (pfad.endsWith("/edit/agent/verlauf")) {
+      if (!fall.gespraeche) return new Response("Nicht gefunden", { status: 404 });
+      const g = fall.gespraeche.find((x) => x.id === url.searchParams.get("id"));
+      if (!g) return Response.json({ ok: false, grund: "Dieses Gespräch gibt es nicht mehr." }, { status: 404 });
+      // Dieselbe Rechnung wie `leseNachrichten`: von hinten, `ab` ist der
+      // Cursor nach oben. Eine eigene Rechnung hier wäre eine zweite Wahrheit.
+      const gesamt = g.zeilen.length;
+      const anzahl = Math.min(100, Math.max(1, Number(url.searchParams.get("anzahl") ?? 20)));
+      // `Number(null)` ist 0, nicht NaN — ohne diese Fallunterscheidung liefert
+      // die erste Anfrage (ohne `vor`) eine LEERE Seite, und der Prüfstand
+      // meldete einen Fehler im Overlay, der keiner ist. Genau hier
+      // hineingelaufen; `host.ts` klammert aus demselben Grund.
+      const vorTxt = url.searchParams.get("vor");
+      const vorRoh = vorTxt === null || vorTxt === "" ? Number.NaN : Number(vorTxt);
+      const bis = Number.isFinite(vorRoh) && vorRoh >= 0 && vorRoh <= gesamt ? vorRoh : gesamt;
+      const ab = Math.max(0, bis - anzahl);
+      return Response.json({
+        ok: true,
+        id: g.id,
+        titel: g.titel,
+        geaendert: Date.now() - g.vorMs,
+        nachrichten: g.zeilen.slice(ab, bis).map((z) => ({ ...z, zeit: Date.now() - g.vorMs })),
+        ab,
+        gesamt,
+      });
+    }
     if (pfad.endsWith("/edit/agent/status")) {
       // Nach einem gesprengten Kontingent meldet der echte Server „erschöpft" —
       // der Prüfstand muss das nachbilden, sonst prüft der Fall eine Lüge.
@@ -320,8 +559,8 @@ function starte(): void {
     if (pfad.endsWith("/edit/agent/events")) {
       // Nachlese-Fälle liefern ihre Folge auch ohne Auftrag aus — das IST der
       // Fall, den sie prüfen: ein beendeter Lauf, den der Server nachreicht.
-      const nachlese = fallName === "nachlese-fehler";
-      if (!auftragLaeuft && !nachlese) {
+      // Am Fall selbst hinterlegt, nicht am Namen: siehe `Fall.nachlese`.
+      if (!auftragLaeuft && !fall.nachlese) {
         return strom([rahmen("fehler", { grund: "Kein Lauf aktiv." })]);
       }
       auftragLaeuft = false;
@@ -386,6 +625,11 @@ function anleitung(name: string, fall: Fall): void {
   console.log(`     $B goto ${basis}/${name}/edit`);
   if (fall.ki) console.log(`     $B ${OEFFNEN}`);
   if (fall.auftrag) console.log(`     $B ${ABSCHICKEN}`);
+  if (fall.gespraeche || fall.schritte) console.log("     sleep 2");
+  for (const schritt of fall.schritte ?? []) {
+    if (schritt.startsWith("sleep ")) console.log(`     ${schritt}`);
+    else console.log(`     $B ${schritt}`);
+  }
   console.log("     sleep 3");
   console.log(`     $B js "${fall.pruefung.replace(/"/g, '\\"')}"`);
   console.log(`   Sollwert:  ${fall.sollwert}\n`);

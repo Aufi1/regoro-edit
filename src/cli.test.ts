@@ -166,6 +166,45 @@ describe("regoro disable", () => {
     expect(r.stdout).toContain("Editor ist für diese Site aus");
   });
 
+  test("gelöschte Gesprächsverläufe werden GENANNT, nicht stillschweigend entfernt", () => {
+    /**
+     * `disable` löscht das ganze `.regoro/` — seit der KI-Seitenleiste liegen
+     * dort auch die Gespräche, und die enthalten wörtlich, was der Kunde
+     * geschrieben hat. Die Meldung sprach nur von der Auth-Datei und davon,
+     * dass die Website weiterläuft; wer sie las, hatte keinen Anlass zu
+     * vermuten, dass er gerade Kundentext löscht.
+     *
+     * Der Test hält die MELDUNG fest, nicht die Löschregel. Ob Verläufe ein
+     * Abschalten überdauern sollen, ist eine offene Frage der Aufbewahrung.
+     */
+    makeSite(dir);
+    expect(runInit([], { cwd: dir }).code).toBe(0);
+    const vdir = join(dir, ".regoro", "verlauf");
+    mkdirSync(vdir, { recursive: true });
+    writeFileSync(join(vdir, "a.jsonl"), '{"type":"session"}\n');
+    writeFileSync(join(vdir, "b.jsonl"), '{"type":"session"}\n');
+
+    const r = runDisable();
+
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain("2 gespeicherte Gespräche");
+    expect(r.stdout).toContain(".regoro/verlauf/");
+    expect(existsSync(vdir)).toBe(false);
+  });
+
+  test("Gegenprobe: ohne Verläufe steht der Satz NICHT da", () => {
+    // Sonst wäre die Prüfung darüber auch dann grün, wenn der Satz IMMER
+    // erschiene — und jedes Abschalten meldete gelöschte Gespräche, die es nie
+    // gab. Eine Warnung, die immer kommt, liest bald niemand mehr.
+    makeSite(dir);
+    expect(runInit([], { cwd: dir }).code).toBe(0);
+
+    const r = runDisable();
+
+    expect(r.code).toBe(0);
+    expect(r.stdout).not.toContain("Gespräch");
+  });
+
   test("ohne .regoro/ → Exit 1, nichts zu tun", () => {
     makeSite(dir);
     const r = runDisable();

@@ -322,6 +322,30 @@ Zwei Fallstricke rund um das Profil:
 sind — **niemals den Schlüssel selbst**, auch nicht gekürzt. `regoro ki --off`
 entfernt den Zugang und schaltet die Seitenleiste bei **allen** Kunden ab.
 
+### Gespräche
+
+Der Agent erinnert sich. Jeder Auftrag landet in einem Gesprächsverlauf, und ein
+Folgeauftrag („lieber als eigene Seite, mit mehr Inhalt") trifft einen Agenten,
+der die Vorseite und den vorigen Wunsch kennt.
+
+- **Beim Öffnen** steht das laufende Gespräch wieder da — ein Neuladen der Seite
+  löscht es nicht mehr. Ältere Beiträge lädt die Leiste beim Hochscrollen nach.
+- **Nach 24 Stunden Ruhe** beginnt ein neues Gespräch. Der alte Verlauf bleibt
+  erhalten und lässt sich über **„Gespräche"** oben rechts wieder aufnehmen;
+  automatisch fortgesetzt wird er nicht.
+- **„Neues Gespräch"** in derselben Liste beginnt bewusst von vorn — nützlich,
+  wenn das nächste Thema mit dem bisherigen nichts zu tun hat.
+- **Nach 30 Tagen ohne Änderung** wird ein Verlauf gelöscht.
+
+Die Verläufe liegen pro Website in `.regoro/verlauf/` — gitignored, nie
+ausgeliefert, und sie enthalten wörtlich, was der Kunde geschrieben hat. Beim
+Sichern eines Kundenordners gehören sie zu den Kundendaten.
+
+> **`regoro disable` löscht sie mit** — schon ohne `--purge`, denn es entfernt
+> das ganze `.regoro/`. Die Website und die Versionshistorie bleiben unberührt,
+> die Gespräche nicht. Der Befehl sagt es beim Abschalten dazu und nennt die
+> Anzahl; wer sie behalten will, sichert `.regoro/verlauf/` vorher weg.
+
 ### Kontingent
 
 Jede Website hat ein Monatskontingent von 200.000 Token; es setzt sich am

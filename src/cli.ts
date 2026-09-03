@@ -18,7 +18,7 @@
  * Auth-Modell: hinterlegte Kontaktwege im Site-Root (fail-closed). Kein Passwort —
  * der Nachweis ist ein Einmalcode per SMS oder E-Mail.
  */
-import { existsSync, readFileSync, statSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync, rmSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 // Bun-"file"-Import: liefert einen Pfad, den `bun build --compile` mit einbettet.
 // Exakt das Muster von overlay.client.js in host.ts — NICHT auf import.meta.url
@@ -37,6 +37,7 @@ import { maskiereKennung, normalisiereKennung } from "./kennung.ts";
 import { countCommits, ensureRepo, shellQuote } from "./git.ts";
 import { startServer } from "./server.ts";
 import { listPageFiles, listSites } from "./sites.ts";
+import { verlaufDir } from "./verlauf.ts";
 import {
   activationSteps,
   caddyBlock,
@@ -464,10 +465,38 @@ function cmdDisable(args: string[]): void {
     );
   }
 
+  /**
+   * VOR dem Löschen zählen, was mit verschwindet.
+   *
+   * `rmSync(authDir)` nimmt das GANZE `.regoro/` mit, nicht nur `auth.json` —
+   * seit der KI-Seitenleiste liegen dort auch die Gesprächsverläufe, und die
+   * enthalten wörtlich, was der Kunde geschrieben hat. Die Meldung darunter
+   * sprach von „Auth-Datei entfernt" und „die Website läuft weiter"; wer das
+   * las, hatte keinen Anlass zu vermuten, dass er gerade Kundentext löscht.
+   *
+   * Hier wird NICHTS am Löschen geändert — nur daran, dass es unausgesprochen
+   * blieb. Ob Verläufe ein Abschalten überdauern sollen, ist eine Frage der
+   * Aufbewahrung und gehört entschieden, nicht nebenbei hier entschieden.
+   */
+  let verlaeufeWeg = 0;
+  try {
+    verlaeufeWeg = readdirSync(verlaufDir(siteDir)).filter((n) => n.endsWith(".jsonl")).length;
+  } catch {
+    // Kein Verlaufsverzeichnis — der Normalfall ohne KI-Seitenleiste.
+  }
+
   rmSync(authDir, { recursive: true, force: true });
   console.log("");
   console.log("Auth-Datei entfernt — der Editor ist für diese Site aus.");
   console.log("  Die Website wird weiter ausgeliefert; /edit* antwortet mit 404.");
+  if (verlaeufeWeg > 0) {
+    console.log(
+      `  ACHTUNG: ${verlaeufeWeg} gespeicherte${verlaeufeWeg === 1 ? "s" : ""} ` +
+        `Gespräch${verlaeufeWeg === 1 ? "" : "e"} mit dem KI-Assistenten wurde${verlaeufeWeg === 1 ? "" : "n"} ` +
+        "mitgelöscht.",
+    );
+    console.log("  Sie lagen in .regoro/verlauf/ und enthielten den Wortlaut des Kunden.");
+  }
 
   if (purge) {
     rmSync(join(siteDir, ".git"), { recursive: true, force: true });

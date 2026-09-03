@@ -83,6 +83,25 @@
   // Anzeige mitten im Lauf das Format wechseln („noch X" statt „noch X von Y"),
   // und das sähe aus wie ein Fehler.
   var agentGesamt = null;
+  // Welches Gespräch die Leiste gerade zeigt. `null` heißt „ein neues" — dann
+  // schickt der nächste Auftrag `verlauf:"neu"` und der Server legt eines an.
+  // Ohne diesen Wert wüsste der Browser nach einem Klick in der Liste nicht
+  // mehr, worin der nächste Auftrag landen soll, und die Auswahl wäre bloße
+  // Anzeige: Man läse ein altes Gespräch und schriebe in ein anderes.
+  var agentVerlaufId = null;
+  // Der Kunde hat ausdrücklich „Neues Gespräch" gewählt. Gilt nur bis zum
+  // nächsten abgeschickten Auftrag: Danach IST das neue Gespräch das jüngste,
+  // und „auto" trifft es von selbst. Bliebe das Flag stehen, begänne jeder
+  // weitere Auftrag wieder von vorn — der Kunde bekäme nach jedem Satz einen
+  // Assistenten ohne Gedächtnis.
+  var agentVerlaufNeu = false;
+  // Der Cursor nach OBEN: Index der ältesten geladenen Zeile im ganzen
+  // Gespräch. `0` heißt „ganz oben angekommen", `null` heißt „nichts geladen".
+  var agentAelteste = null;
+  // Sperre gegen mehrfaches Nachladen. Das Scroll-Ereignis feuert dicht; ohne
+  // sie liefen beim Hochziehen drei Anfragen parallel und die Zeilen kämen in
+  // beliebiger Reihenfolge oben an.
+  var agentLaedtAeltere = false;
   // Bild-Austausch-State.
   var images = [];          // [{ img, imgIdx, badge, imgClickHandler }]
   var fileInput = null;     // verstecktes <input type="file">, lazily erzeugt
@@ -607,6 +626,39 @@
       "#__regoro-agent .__regoro-atut i:nth-child(2){animation-delay:.18s;}",
       "#__regoro-agent .__regoro-atut i:nth-child(3){animation-delay:.36s;}",
       "#__regoro-agent .__regoro-ahinweis.__regoro-awarn{color:#a83c12;font-weight:600;}",
+
+      /**
+       * Die Gesprächsliste ist eine ZEILE IN DER SPALTE, kein aufgelegtes Menü.
+       *
+       * Ein absolut positioniertes Aufklappmenü müsste sich mit `z-index`,
+       * Panelrand und der Höhe der Leiste herumschlagen — genau die Rechnerei,
+       * die der Umbau auf die Flex-Spalte gerade beseitigt hat. Als Zeile
+       * schiebt die Liste den Chat nach unten und bekommt ihren eigenen
+       * Scrollbereich; nichts kann sie abschneiden.
+       */
+      "#__regoro-agent .__regoro-akopfzeile{display:flex;align-items:center;gap:10px;}",
+      "#__regoro-agent button.__regoro-agespraeche{appearance:none;background:transparent;",
+      "border:1px solid rgba(255,255,255,.4);color:#fff;border-radius:999px;padding:4px 12px;",
+      "font:inherit;font-size:12.5px;cursor:pointer;}",
+      "#__regoro-agent button.__regoro-agespraeche:hover{background:rgba(255,255,255,.14);}",
+      "#__regoro-agent button.__regoro-agespraeche[aria-expanded=\"true\"]{background:#fff;color:#14324f;",
+      "border-color:#fff;}",
+      "#__regoro-agent .__regoro-aliste{flex:0 0 auto;max-height:45%;overflow:auto;",
+      "border-bottom:1px solid #e2e8ec;background:#fbfdfe;}",
+      "#__regoro-agent .__regoro-aeintrag{display:block;width:100%;text-align:left;appearance:none;",
+      "background:transparent;border:0;border-bottom:1px solid #eef2f5;padding:9px 16px;",
+      "font:inherit;cursor:pointer;color:#16222e;}",
+      "#__regoro-agent .__regoro-aeintrag:hover{background:#eef4f8;}",
+      "#__regoro-agent .__regoro-aeintrag[aria-current=\"true\"]{background:#e8f0f6;",
+      "box-shadow:inset 3px 0 0 #e2571e;}",
+      "#__regoro-agent .__regoro-aetitel{display:block;font-size:13.5px;line-height:1.35;",
+      "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}",
+      "#__regoro-agent .__regoro-aemeta{display:block;font-size:11.5px;color:#7b8b98;margin-top:2px;}",
+      "#__regoro-agent .__regoro-aneu{font-weight:600;color:#14663a;}",
+      "#__regoro-agent .__regoro-aleerliste{padding:10px 16px;font-size:12.5px;color:#7b8b98;}",
+
+      /** Der Griff nach oben: Ladehinweis am Kopf des Verlaufs. */
+      "#__regoro-agent .__regoro-amehr{align-self:center;font-size:12px;color:#7b8b98;padding:2px 0;}",
       // Punkt-Animation, solange der Agent arbeitet.
       /**
        * Der Punkt vor einem Arbeitsschritt hat ZWEI Zustände, und der
@@ -2280,8 +2332,17 @@
   function openAgent() {
     var panel = el("div", { id: "__regoro-agent" });
 
+    // „Gespräche" sitzt oben rechts neben dem Titel — dort, wo der Kunde eine
+    // Historie sucht, und weit weg vom Absenden.
+    var gespraeche = el("button", {
+      class: "__regoro-agespraeche", type: "button", text: "Gespräche",
+      "aria-expanded": "false"
+    });
     var head = el("div", { class: "__regoro-ahead" }, [
-      el("h2", { text: "KI-Assistent" })
+      el("div", { class: "__regoro-akopfzeile" }, [
+        el("h2", { text: "KI-Assistent" }),
+        gespraeche
+      ])
     ]);
     var closeBtn = el("button", {
       class: "__regoro-aclose", text: "\u00d7", type: "button", "aria-label": "Schließen"
@@ -2290,6 +2351,10 @@
     head.appendChild(closeBtn);
 
     var quota = el("div", { class: "__regoro-aquota", text: "Kontingent wird geladen…" });
+    // Zugeklappt heißt WEG, nicht nur unsichtbar: `hidden` nimmt das Element aus
+    // der Flex-Spalte, sonst bliebe seine Lücke stehen.
+    var liste = el("div", { class: "__regoro-aliste" });
+    liste.hidden = true;
     // aria-live: Der Verlauf wächst asynchron; ohne das bekommt ein Screenreader
     // nichts davon mit.
     var verlauf = el("div", { class: "__regoro-averlauf", role: "log", "aria-live": "polite" });
@@ -2318,6 +2383,7 @@
 
     panel.appendChild(head);
     panel.appendChild(quota);
+    panel.appendChild(liste);
     panel.appendChild(verlauf);
     panel.appendChild(form);
     (unten() || document.body).appendChild(panel);
@@ -2329,13 +2395,20 @@
 
     agentGesperrt = false;
     agentGesamt = null;
+    agentVerlaufId = null;
+    agentVerlaufNeu = false;
+    agentAelteste = null;
+    agentLaedtAeltere = false;
     ui.agent = {
       quota: quota, verlauf: verlauf, eingabe: eingabe,
-      senden: senden, abbrechen: abbrechen, hinweis: hinweis
+      senden: senden, abbrechen: abbrechen, hinweis: hinweis,
+      liste: liste, gespraeche: gespraeche
     };
 
     senden.addEventListener("click", onAuftragSenden);
     abbrechen.addEventListener("click", onAuftragAbbrechen);
+    gespraeche.addEventListener("click", onGespraecheToggle);
+    verlauf.addEventListener("scroll", onVerlaufScroll);
     // Strg/Cmd+Enter schickt ab — Enter allein bleibt ein Zeilenumbruch, weil
     // ein Auftrag oft mehrere Sätze hat.
     eingabe.addEventListener("keydown", function (e) {
@@ -2345,7 +2418,10 @@
       }
     });
 
-    ladeAgentStatus();
+    // Erst das Gespräch, dann der Zustand: `ladeAgentStatus` hängt sich am Ende
+    // an den Ereignisstrom, und ob dabei der ganze letzte Lauf oder nur sein
+    // Ausgang nachgereicht wird, hängt davon ab, ob hier schon etwas steht.
+    ladeGespraech();
   }
 
   /**
@@ -2357,40 +2433,266 @@
    */
   var KEIN_LAUF = "Kein Lauf aktiv.";
 
+  // ---------------------------------------------------------------------------
+  // Gespräche: Liste, Auswahl, Nachlesen
+  //
+  // WER ENTSCHEIDET, WORIN DER NÄCHSTE AUFTRAG LANDET — und warum nicht der
+  // Browser. Das Feld `verlauf` im Auftrag kennt drei Werte:
+  //
+  //   "auto"  — der Server wendet seine 24-Stunden-Regel an (Vorgabe)
+  //   "neu"   — der Kunde hat ausdrücklich „Neues Gespräch" gewählt
+  //   <id>    — der Kunde hat ein bestimmtes Gespräch aus der Liste gewählt
+  //
+  // Der naheliegende Weg wäre gewesen, sich nach jedem Lauf die Kennung des
+  // gerade angelegten Gesprächs zu merken und sie ab dann mitzuschicken. Das
+  // geht nicht: Der Server schickt `fertig`, BEVOR er den Verlauf aus der
+  // Arbeitskopie zurückholt (das Zurückholen steht im `finally`, das Senden
+  // davor). Eine Liste, die der Browser direkt nach `fertig` holt, kennt das
+  // neue Gespräch also noch gar nicht — der zweite Auftrag begänne wieder von
+  // vorn, und niemand sähe warum. „auto" hat dieses Rennen nicht, weil der
+  // Server erst dann nachsieht, wenn der nächste Lauf startet.
+  // ---------------------------------------------------------------------------
+
+  /** Wie viele Zeilen ein Griff nach oben holt. Der Server deckelt bei 100. */
+  var VERLAUF_SEITE = 20;
+
+  /**
+   * Beim Öffnen: welches Gespräch würde ein Auftrag fortsetzen, und was steht
+   * darin?
+   *
+   * Fällt irgendetwas davon aus, geht es OHNE Verlauf weiter — die Liste ist
+   * Komfort, kein Bestandteil des Auftragswegs. Ein Server auf älterem Stand
+   * (Routen fehlen, 404) darf die Seitenleiste nicht lahmlegen.
+   */
+  function ladeGespraech() {
+    holeListe().then(function (liste) {
+      if (!agentPanel) return 0;
+      zeichneListe(liste);
+      var id = liste && liste.fortsetzbar;
+      if (!id) return 0;
+      agentVerlaufId = String(id);
+      return ladeNachrichten(agentVerlaufId, null);
+    }).catch(function () {
+      return 0;
+    }).then(function (geladen) {
+      if (!agentPanel) return;
+      // Steht schon ein Gespräch da, reicht die Nachlese nur noch den AUSGANG
+      // des letzten Laufs nach — sein Wortlaut steht bereits oben.
+      ladeAgentStatus(false, { nurAbschluss: geladen > 0 });
+    });
+  }
+
+  function holeListe() {
+    return fetch("/edit/agent/verlaeufe", {
+      credentials: "same-origin",
+      headers: { "Accept": "application/json" }
+    }).then(function (res) {
+      if (!res.ok) throw new Error("Gesprächsliste nicht abrufbar (" + res.status + ")");
+      return res.json();
+    });
+  }
+
+  function onGespraecheToggle() {
+    if (!agentPanel) return;
+    var box = ui.agent.liste;
+    var oeffnen = box.hidden;
+    box.hidden = !oeffnen;
+    ui.agent.gespraeche.setAttribute("aria-expanded", oeffnen ? "true" : "false");
+    if (!oeffnen) return;
+    // Beim Aufklappen frisch holen: In einem zweiten Tab oder auf dem Handy
+    // kann inzwischen ein Lauf ein Gespräch angelegt haben.
+    holeListe().then(function (l) {
+      if (!agentPanel || ui.agent.liste.hidden) return;
+      // Jetzt ist das Rennen aus dem Weg (der Klick liegt lange nach dem Lauf):
+      // Wer bisher auf „auto" stand, bekommt die Kennung, damit die Liste den
+      // richtigen Eintrag markiert.
+      if (!agentVerlaufId && !agentVerlaufNeu && l && l.fortsetzbar) {
+        agentVerlaufId = String(l.fortsetzbar);
+      }
+      zeichneListe(l);
+    }).catch(function () {
+      /* dann bleibt die zuletzt gezeichnete Liste stehen */
+    });
+  }
+
+  function zeichneListe(daten) {
+    if (!agentPanel) return;
+    var box = ui.agent.liste;
+    box.textContent = "";
+
+    var neu = el("button", { class: "__regoro-aeintrag", type: "button" }, [
+      el("span", { class: "__regoro-aetitel __regoro-aneu", text: "Neues Gespräch" }),
+      el("span", { class: "__regoro-aemeta", text: "Beginnt von vorn, ohne das bisher Gesagte." })
+    ]);
+    if (agentVerlaufNeu) neu.setAttribute("aria-current", "true");
+    neu.addEventListener("click", function () { waehleGespraech(null); });
+    box.appendChild(neu);
+
+    var eintraege = (daten && Array.isArray(daten.verlaeufe)) ? daten.verlaeufe : [];
+    if (eintraege.length === 0) {
+      box.appendChild(el("div", {
+        class: "__regoro-aleerliste", text: "Noch keine gespeicherten Gespräche."
+      }));
+      return;
+    }
+    eintraege.forEach(function (v) {
+      var id = String((v && v.id) || "");
+      if (!id) return;
+      // Der Titel ist WÖRTLICH, was der Kunde geschrieben hat. Über `text:` und
+      // damit `textContent` — nie als HTML, sonst wäre der eigene Auftrag ein
+      // Einstiegspunkt in den Editor.
+      var knopf = el("button", { class: "__regoro-aeintrag", type: "button" }, [
+        el("span", { class: "__regoro-aetitel", text: String(v.titel || "Ohne Titel") }),
+        el("span", { class: "__regoro-aemeta", text: datumKurz(v.geaendert) })
+      ]);
+      if (!agentVerlaufNeu && id === agentVerlaufId) knopf.setAttribute("aria-current", "true");
+      knopf.addEventListener("click", function () { waehleGespraech(id); });
+      box.appendChild(knopf);
+    });
+  }
+
+  /**
+   * Absichtlich NUR das Datum, keine Beitragszahl.
+   *
+   * Die Zahl, die der Server aus pi bekommt, zählt Einträge der Sitzung —
+   * Werkzeugergebnisse eingeschlossen, die hier niemand zu sehen bekommt. Sie
+   * stimmte also nie mit dem überein, was der Kunde beim Öffnen zählen kann,
+   * und eine Zahl, die nicht zu ihrem Gegenstand passt, ist schlimmer als
+   * keine.
+   */
+  function datumKurz(ms) {
+    var t = Number(ms);
+    if (!t) return "ohne Datum";
+    try {
+      var d = new Date(t);
+      var uhr = d.toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" });
+      if (d.toDateString() === new Date().toDateString()) return "heute, " + uhr;
+      return d.toLocaleDateString("de-DE", { day: "2-digit", month: "2-digit", year: "numeric" }) +
+        ", " + uhr;
+    } catch (e) {
+      return "";
+    }
+  }
+
+  function waehleGespraech(id) {
+    if (!agentPanel) return;
+    // Ein Wechsel MITTEN im Lauf schriebe dessen Ausgabe in ein fremdes
+    // Gespräch. Der Lauf gehört der Website, nicht diesem Fenster — beenden
+    // darf ihn nur der Abbruch-Knopf.
+    if (agentLaeuft) {
+      setAgentHinweis("Es läuft gerade ein Auftrag. Warte, bis er fertig ist.", true);
+      return;
+    }
+    // Eine noch offene Nachlese würde sonst in das frisch gewählte Gespräch
+    // hineinschreiben.
+    if (agentQuelle) {
+      agentQuelle.close();
+      agentQuelle = null;
+    }
+    agentVerlaufId = id;
+    agentVerlaufNeu = !id;
+    agentAelteste = null;
+    agentTextBlase = null;
+    ui.agent.verlauf.textContent = "";
+    setAgentHinweis("");
+    ui.agent.liste.hidden = true;
+    ui.agent.gespraeche.setAttribute("aria-expanded", "false");
+    if (!id) return;                 // neues Gespräch: die leere Fläche IST die Antwort
+    ladeNachrichten(id, null).catch(function () {
+      agentNachricht("Dieses Gespräch lässt sich nicht mehr öffnen.", "fehler");
+    });
+  }
+
+  /**
+   * Eine Seite eines Gesprächs holen und einhängen. `vor === null` heißt „die
+   * jüngsten", sonst „die davor". Liefert die Zahl der eingehängten Zeilen.
+   */
+  function ladeNachrichten(id, vor) {
+    var u = "/edit/agent/verlauf?id=" + encodeURIComponent(id) + "&anzahl=" + VERLAUF_SEITE;
+    if (typeof vor === "number") u += "&vor=" + vor;
+    return fetch(u, {
+      credentials: "same-origin",
+      headers: { "Accept": "application/json" }
+    }).then(function (res) {
+      if (!res.ok) throw new Error("Gespräch nicht abrufbar (" + res.status + ")");
+      return res.json();
+    }).then(function (seite) {
+      if (!agentPanel || !seite || !seite.ok) return 0;
+      // Zwischenzeitlich gewechselt: Diese Antwort gehört zu einem Gespräch,
+      // das niemand mehr sieht. Sie einzuhängen mischte zwei Gespräche.
+      if (String(seite.id) !== String(agentVerlaufId)) return 0;
+      var zeilen = Array.isArray(seite.nachrichten) ? seite.nachrichten : [];
+      zeichneNachrichten(zeilen, typeof vor === "number");
+      agentAelteste = typeof seite.ab === "number" ? seite.ab : 0;
+      zeigeMehrHinweis();
+      return zeilen.length;
+    });
+  }
+
+  function zeichneNachrichten(zeilen, voran) {
+    var v = ui.agent.verlauf;
+    var hoeheVorher = v.scrollHeight;
+    var obenVorher = v.scrollTop;
+    var frag = document.createDocumentFragment();
+    zeilen.forEach(function (n) { frag.appendChild(verlaufZeile(n)); });
+    if (voran) {
+      entferneMehrHinweis();
+      v.insertBefore(frag, v.firstChild);
+      // Die Ansicht darf NICHT springen. Ohne diese Korrektur schöbe der neue
+      // Inhalt die gelesene Stelle nach unten aus dem Bild — man läse dieselben
+      // Zeilen noch einmal und stünde dabei sofort wieder oben, was das nächste
+      // Nachladen auslöste. Aus einem Griff nach oben würde eine Lawine.
+      v.scrollTop = obenVorher + (v.scrollHeight - hoeheVorher);
+    } else {
+      v.appendChild(frag);
+      v.scrollTop = v.scrollHeight;
+    }
+  }
+
+  /** Eine gespeicherte Zeile. Ohne Puls: der gehört dem, was JETZT passiert. */
+  function verlaufZeile(n) {
+    var text = String((n && n.text) || "");
+    if (n && n.von === "werkzeug") {
+      return el("div", { class: "__regoro-awerkzeug" }, [el("span", { text: text })]);
+    }
+    return el("div", {
+      class: "__regoro-anachricht " +
+        (n && n.von === "kunde" ? "__regoro-avon-kunde" : "__regoro-avon-agent"),
+      text: text
+    });
+  }
+
+  function entferneMehrHinweis() {
+    var alt = ui.agent.verlauf.querySelector(".__regoro-amehr");
+    if (alt && alt.parentNode) alt.parentNode.removeChild(alt);
+  }
+
+  function zeigeMehrHinweis() {
+    if (!agentPanel) return;
+    entferneMehrHinweis();
+    if (!agentAelteste) return;      // 0 = ganz oben, null = nichts geladen
+    var v = ui.agent.verlauf;
+    v.insertBefore(el("div", { class: "__regoro-amehr", text: "\u2191 Ältere Beiträge" }), v.firstChild);
+  }
+
+  function onVerlaufScroll() {
+    if (!agentPanel || agentLaedtAeltere) return;
+    if (!agentVerlaufId || !agentAelteste) return;
+    if (ui.agent.verlauf.scrollTop > 24) return;
+    agentLaedtAeltere = true;
+    ladeNachrichten(agentVerlaufId, agentAelteste).catch(function () {
+      /* Nachladen ist Komfort — ein Fehlschlag darf das Gelesene nicht stören. */
+    }).then(function () {
+      agentLaedtAeltere = false;
+    });
+  }
+
   /**
    * Zustand vom Server holen: Kontingent, und ob gerade schon etwas läuft.
    * `nurKontingent` = nur die Anzeige auffrischen, nicht erneut anhängen
    * (sonst öffnete jeder Abschluss einen zweiten Strom auf sich selbst).
    */
-  /**
-   * Holt das bisherige Gespräch und stellt es in den Verlauf.
-   *
-   * DER GRUND IST DER SEITENWECHSEL. Der Editor läuft auf jeder Seite der
-   * Website neu an; das Panel-DOM ist dann leer. Lauf und Verlauf hängen aber
-   * am Site-Ordner, nicht an der Seite — es IST dasselbe Gespräch. Ohne diesen
-   * Aufruf sah der Kunde nach dem Wechsel ein leeres Fenster und hielt sein
-   * Gespräch für verloren.
-   *
-   * Fehler bleiben stumm: Ein nicht ladbarer Verlauf ist ärgerlich, aber kein
-   * Grund, die Seitenleiste unbrauchbar zu machen — neue Aufträge gehen weiter.
-   */
-  function ladeVerlauf() {
-    fetch("/edit/agent/verlauf", {
-      credentials: "same-origin",
-      headers: { "Accept": "application/json" }
-    }).then(function (r) { return r.ok ? r.json() : null; }).then(function (v) {
-      if (!agentPanel || !v || !v.nachrichten || !v.nachrichten.length) return;
-      for (var i = 0; i < v.nachrichten.length; i++) {
-        var n = v.nachrichten[i];
-        // `agentNachricht` setzt `textContent` — Kundentext wird nie als HTML
-        // eingesetzt. Wer das je auf innerHTML umstellt, muss maskieren.
-        agentNachricht(n.text, n.rolle === "kunde" ? "kunde" : "agent");
-      }
-      agentAnsEnde(true);
-    }).catch(function () {});
-  }
-
-  function ladeAgentStatus(nurKontingent) {
+  function ladeAgentStatus(nurKontingent, opts) {
     fetch("/edit/agent/status", {
       credentials: "same-origin",
       headers: { "Accept": "application/json" }
@@ -2401,9 +2703,6 @@
       if (!agentPanel) return;                       // zwischenzeitlich geschlossen
       zeigeKontingent(st && st.kontingent);
       if (nurKontingent) return;
-      // Erst den bisherigen Verlauf zeigen, dann anhängen: Sonst stünden neue
-      // Ereignisse über alten Nachrichten.
-      ladeVerlauf();
       if (st && st.laeuft) {
         // Ein Lauf ist schon unterwegs (Reload, Seitenwechsel, zweiter Tab,
         // anderes Gerät). Anhängen statt einen zweiten zu starten — der zweite
@@ -2422,7 +2721,7 @@
         // Reload, gegen den das Nachreichen antritt — und sähe bei einem
         // gescheiterten Lauf gar nicht, DASS er gescheitert ist. Er versuchte
         // es dann noch einmal und bezahlte denselben Fehlschlag zweimal.
-        verbindeStrom({ nachlese: true });
+        verbindeStrom({ nachlese: true, nurAbschluss: !!(opts && opts.nurAbschluss) });
       }
     }).catch(function (err) {
       if (!agentPanel) return;
@@ -2626,7 +2925,12 @@
       method: "POST",
       headers: { "Content-Type": "application/json" },
       credentials: "same-origin",
-      body: JSON.stringify({ auftrag: auftrag })
+      // Siehe den Block über `ladeGespraech`: „auto" ist die Vorgabe, weil der
+      // Server als Einziger rennfrei weiß, welches Gespräch das jüngste ist.
+      body: JSON.stringify({
+        auftrag: auftrag,
+        verlauf: agentVerlaufNeu ? "neu" : (agentVerlaufId || "auto")
+      })
     }).then(function (res) {
       return res.json().catch(function () { return null; }).then(function (body) {
         return { status: res.status, ok: res.ok, body: body };
@@ -2643,6 +2947,10 @@
         ladeAgentStatus(true);             // nur die Kontingentanzeige nachziehen
         return;
       }
+      // Ab jetzt ist das neu angelegte Gespräch das jüngste — „auto" trifft
+      // es. Ohne diese Zeile bekäme der zweite Satz des Kunden wieder einen
+      // Assistenten, der den ersten nicht kennt.
+      agentVerlaufNeu = false;
       verbindeStrom();
     }).catch(function () {
       agentNachricht("Der Auftrag konnte nicht abgeschickt werden.", "fehler");
@@ -2679,6 +2987,20 @@
     // Die darf NICHT als Fehler im Chatfenster landen: Wer die Leiste zum
     // ersten Mal öffnet, hat nichts falsch gemacht.
     var nachlese = !!(opts && opts.nachlese);
+    /**
+     * NUR DER AUSGANG, NICHT DER WORTLAUT.
+     *
+     * Gesetzt, wenn beim Öffnen schon ein gespeichertes Gespräch in der Leiste
+     * steht. Dann ist der letzte Lauf dort bereits nachzulesen — Text und
+     * Werkzeugzeilen ein zweites Mal aus dem Puffer zu ziehen, zeigte jeden
+     * Satz doppelt.
+     *
+     * Was der Verlauf NICHT enthalten kann, bleibt: ob die Website danach
+     * anders aussah. Der Agent kann ausführlich schildern, was er gebaut hat,
+     * und die Übernahme kann ihn danach abgelehnt haben — ohne diese Zeile
+     * läse der Kunde die Schilderung und hielte sie für das Ergebnis.
+     */
+    var nurAbschluss = !!(opts && opts.nurAbschluss);
     if (agentQuelle) agentQuelle.close();
     // Im Nachlese-Modus bleibt die Eingabe offen: Es läuft ja nichts, was ein
     // zweiter Auftrag stören könnte.
@@ -2696,11 +3018,17 @@
 
     quelle.addEventListener("text", function (ev) {
       var d = parseEreignis(ev);
-      if (d && typeof d.inhalt === "string") { etwasGesehen = true; agentText(d.inhalt); }
+      if (d && typeof d.inhalt === "string") {
+        etwasGesehen = true;
+        if (!nurAbschluss) agentText(d.inhalt);
+      }
     });
     quelle.addEventListener("werkzeug", function (ev) {
       var d = parseEreignis(ev);
-      if (d) { etwasGesehen = true; agentWerkzeug(d.kurz || d.name || "arbeitet…"); }
+      if (d) {
+        etwasGesehen = true;
+        if (!nurAbschluss) agentWerkzeug(d.kurz || d.name || "arbeitet…");
+      }
     });
     quelle.addEventListener("tokens", function (ev) {
       if (!agentPanel) return;
@@ -2718,7 +3046,7 @@
       var d = parseEreignis(ev) || {};
       etwasGesehen = true;
       schliessen();
-      zeigeFertig(d);      // räumt agentTextBlase selbst auf
+      zeigeFertig(d, nurAbschluss);      // räumt agentTextBlase selbst auf
     });
     quelle.addEventListener("fehler", function (ev) {
       var d = parseEreignis(ev) || {};
@@ -2755,9 +3083,41 @@
     }
   }
 
-  function zeigeFertig(d) {
+  /**
+   * Der Ausgang des letzten Laufs, wenn sein Wortlaut schon oben steht.
+   *
+   * Bewusst OHNE „Seite neu laden": Wer das hier zu sehen bekommt, hat die
+   * Seite gerade geladen — sonst stünde kein gespeichertes Gespräch in der
+   * Leiste. Ein Knopf, der nichts bewirkt, sähe aus wie ein nötiger Schritt.
+   */
+  function zeigeAusgang(dateien) {
+    agentTextBlase = null;
+    var nichtsGeaendert = dateien.length === 0;
+    var node = agentNachricht(
+      nichtsGeaendert
+        ? "Der letzte Auftrag hat an der Website nichts geändert."
+        : "Der letzte Auftrag hat diese Dateien geändert:",
+      nichtsGeaendert ? "agent" : "fertig",
+    );
+    if (node && !nichtsGeaendert) {
+      var liste = el("ul", { class: "__regoro-adateien" });
+      dateien.forEach(function (name) { liste.appendChild(el("li", { text: String(name) })); });
+      node.appendChild(liste);
+    }
+    if (nichtsGeaendert) {
+      setAgentHinweis("Der letzte Auftrag hat nichts geändert. Versuch es noch einmal, " +
+        "gern mit einem genaueren Auftrag.");
+    }
+    ladeAgentStatus(true);
+  }
+
+  function zeigeFertig(d, nurAbschluss) {
     var zus = String(d.zusammenfassung || "Fertig.").trim();
     var dateien = Array.isArray(d.dateien) ? d.dateien : [];
+    if (nurAbschluss) {
+      zeigeAusgang(dateien);
+      return;
+    }
     // KEINE geänderte Datei heißt: Es ist nichts passiert. Das darf nicht wie
     // ein Erfolg aussehen.
     //

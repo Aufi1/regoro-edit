@@ -32,6 +32,8 @@ import { meldeAn } from "./anmeldung.testhelfer.ts";
 import { bwrapPfad } from "./sandbox.ts";
 import { brichAb, laufAktiv, starteLauf } from "./agent.ts";
 import { TOKEN_KONTINGENT, verbucheTokens } from "./kontingent.ts";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { verlaufDir } from "./verlauf.ts";
 
 /**
  * NOTBREMSE — bitte nicht entfernen.
@@ -70,14 +72,44 @@ const KI: KiConfig = {
   model: "z-ai/glm-5.3-flash",
 };
 
-/** Alle vier Routen, mit der Methode, unter der sie gemeint sind. */
+/**
+ * ALLE Routen der Seitenleiste, mit der Methode, unter der sie gemeint sind.
+ *
+ * Diese Liste war einmal „die vier Routen" und hinkte hinterher: Als
+ * `/edit/agent/verlaeufe` dazukam, wurde sie nicht ergänzt — und weil die Route
+ * gleichzeitig in der Auth-Wand von `host.ts` fehlte, gab sie AUCH ANGEMELDET
+ * 404. Kein Test schlug an, denn geprüft wurde nur „unangemeldet → 404", und
+ * das stimmte aus dem falschen Grund.
+ *
+ * Deshalb hängt an dieser Liste unten die Gegenprobe „angemeldet erreichbar":
+ * Sie ist der Messapparat, der die Abwesenheits-Prüfungen darüber erst gültig
+ * macht. Wer eine Route ergänzt, ergänzt sie hier — und beide Prüfungen fahren
+ * mit.
+ */
 const ROUTEN: [string, string][] = [
   ["POST", "/edit/agent"],
   ["GET", "/edit/agent/status"],
   ["GET", "/edit/agent/events"],
   ["POST", "/edit/agent/abort"],
-  ["GET", "/edit/agent/verlauf"],
   ["GET", "/edit/agent/verlaeufe"],
+  ["GET", "/edit/agent/verlauf"],
+];
+
+/**
+ * Was eine Route liefert, wenn alles stimmt — angemeldet, mit `ki.json`.
+ *
+ * `POST /edit/agent` und `GET /edit/agent/events` fehlen mit Absicht: Der eine
+ * startet einen echten Lauf (siehe die Notbremse oben), der andere ist ein
+ * Strom und wird weiter unten gegen einen echten Server gefahren. Für alles
+ * andere gilt: 404 hier heißt „Route nicht verdrahtet".
+ */
+const ERREICHBAR: [string, string, number][] = [
+  ["GET", "/edit/agent/status", 200],
+  ["POST", "/edit/agent/abort", 200],
+  ["GET", "/edit/agent/verlaeufe", 200],
+  // Ohne `id` ist 400 die richtige Antwort — entscheidend ist, dass es NICHT
+  // 404 ist: Die Route existiert und wird erreicht.
+  ["GET", "/edit/agent/verlauf", 400],
 ];
 
 const dirs: string[] = [];
@@ -145,6 +177,20 @@ function ruf(methode: string, pfad: string, opts: { cookie?: string; body?: unkn
   );
 }
 
+/**
+ * Legt einen echten Verlauf im Kundenordner an — über pi, nicht von Hand.
+ *
+ * Von Hand geschriebene JSONL hielte unsere Erwartung an pi's Format fest statt
+ * pi's Format. Und die zweite Zeile ist nicht schmückend: pi schreibt die Datei
+ * erst, wenn eine ANTWORT DES MODELLS vorliegt — ohne sie entstünde gar keine.
+ */
+function legeVerlaufAn(site: string, auftrag: string): { id: string } {
+  const sm = SessionManager.create(tmp("regoro-routes-cwd-"), verlaufDir(site));
+  sm.appendMessage({ role: "user", content: auftrag } as never);
+  sm.appendMessage({ role: "assistant", content: "erledigt" } as never);
+  return { id: sm.getSessionId() };
+}
+
 /** Startet einen Lauf am HTTP-Weg vorbei — für Zustände, die eine Route nur vorfindet. */
 function laufImHintergrund(auftrag: string) {
   return starteLauf(ctx, auftrag, { workerBefehl: [process.execPath, "run", ATTRAPPE] });
@@ -181,6 +227,20 @@ describe("unangemeldet gibt es diese Routen nicht", () => {
     ctx = { ...ctx, auth: null };
     for (const [methode, pfad] of ROUTEN) {
       expect((await ruf(methode, pfad, { cookie: gemerkt, body: { auftrag: "x" } })).status).toBe(404);
+    }
+  });
+});
+
+describe("angemeldet sind sie erreichbar — die Gegenprobe zur Auth-Wand", () => {
+  test("keine Route antwortet 404, obwohl sie verdrahtet ist", async () => {
+    // OHNE DIESEN TEST BEWEISEN DIE 404-TESTS DARÜBER NICHTS. Eine Route, die
+    // gar nicht existiert, antwortet unangemeldet ebenfalls 404 — die
+    // Abwesenheits-Prüfung wäre auch dann grün, wenn die Route tot ist. Genau
+    // dieser Fall ist eingetreten und blieb unbemerkt.
+    const c = cookie();
+    for (const [methode, pfad, erwartet] of ERREICHBAR) {
+      const r = await ruf(methode, pfad, { cookie: c });
+      expect(`${methode} ${pfad} → ${r.status}`).toBe(`${methode} ${pfad} → ${erwartet}`);
     }
   });
 });
@@ -238,16 +298,33 @@ describe("angemeldet MÜSSEN diese Routen erreichbar sein", () => {
   });
 
   test("die Verlaufs-Routen liefern angemeldet echte Daten, nicht nur „nicht 404“", async () => {
-    // Gegenprobe zum Test darüber: „nicht 404" allein wäre auch bei einem 500
-    // erfüllt. Hier zählt, dass die Antwort die vereinbarte Form hat.
+    /**
+     * Gegenprobe zum Test darüber: „nicht 404" allein wäre auch bei einem 500
+     * erfüllt. Hier zählt, dass die Antwort die vereinbarte Form hat.
+     *
+     * Beim Zusammenführen zweier Zweige angepasst: Die Leseroute verlangt jetzt
+     * eine `id` (sie blättert seitenweise und braucht ein Ziel), statt ohne
+     * Angabe „den aktuellen" zu liefern. Welches Gespräch das ist, sagt
+     * `fortsetzbar` in der Liste — eine Quelle für die 24-Stunden-Regel statt
+     * zwei.
+     */
     const c = cookie();
     const liste = await ruf("GET", "/edit/agent/verlaeufe", { cookie: c });
     expect(liste.status).toBe(200);
-    expect(await liste.json()).toEqual({ ok: true, verlaeufe: [] });
+    expect(await liste.json()).toEqual({ ok: true, fortsetzbar: null, verlaeufe: [] });
 
-    const einzeln = await ruf("GET", "/edit/agent/verlauf", { cookie: c });
+    // Ohne `id`: 400 mit Grund — eine Antwort, kein Durchfallen.
+    const ohneId = await ruf("GET", "/edit/agent/verlauf", { cookie: c });
+    expect(ohneId.status).toBe(400);
+    expect(await ohneId.json()).toEqual({ ok: false, grund: "Kennung fehlt." });
+
+    // Und mit einer echten Kennung kommen echte Zeilen zurück.
+    const info = legeVerlaufAn(siteDir, "Leg eine Seite an.");
+    const einzeln = await ruf("GET", `/edit/agent/verlauf?id=${encodeURIComponent(info.id)}`, { cookie: c });
     expect(einzeln.status).toBe(200);
-    expect(await einzeln.json()).toEqual({ ok: true, id: null, nachrichten: [] });
+    const körper = (await einzeln.json()) as { id: string; nachrichten: { von: string }[] };
+    expect(körper.id).toBe(info.id);
+    expect(körper.nachrichten.map((n) => n.von)).toEqual(["kunde", "agent"]);
   });
 });
 
@@ -259,6 +336,19 @@ describe("POST /edit/agent", () => {
     const r = await ruf("POST", "/edit/agent", { cookie: cookie(), body: {} });
     expect(r.status).toBe(400);
     expect(await r.json()).toEqual({ ok: false, grund: "Auftrag fehlt." });
+  });
+
+  test("eine absurd lange Gesprächskennung wird abgewiesen", async () => {
+    // Kennungen sind UUIDs (36 Zeichen). Alles darüber ist keine und hat im
+    // Vergleich mit der Liste nichts zu suchen. Der Test hält zugleich fest,
+    // DASS der Rumpf das Feld überhaupt liest — es fehlte dort einmal ganz,
+    // während Option und Lauf schon damit rechneten.
+    const r = await ruf("POST", "/edit/agent", {
+      cookie: cookie(),
+      body: { auftrag: "mach was", verlauf: "x".repeat(500) },
+    });
+    expect(r.status).toBe(400);
+    expect(await r.json()).toEqual({ ok: false, grund: "Ungültige Gesprächskennung." });
   });
 
   test("ein Auftrag aus Leerzeichen zählt als keiner", async () => {
@@ -371,6 +461,82 @@ describe("GET /edit/agent/status", () => {
     expect(körper.laufId).toBe(s.laufId);
     brichAb(siteDir);
   }, 30_000);
+});
+
+// ===========================================================================
+// GET /edit/agent/verlaeufe und /edit/agent/verlauf
+// ===========================================================================
+describe("die Gesprächsliste", () => {
+  test("ohne einen einzigen Verlauf: leere Liste, nichts fortzusetzen", async () => {
+    const r = await ruf("GET", "/edit/agent/verlaeufe", { cookie: cookie() });
+    expect(r.status).toBe(200);
+    expect(await r.json()).toEqual({ ok: true, fortsetzbar: null, verlaeufe: [] });
+  });
+
+  test("ein frischer Verlauf steht drin und ist fortsetzbar", async () => {
+    const info = legeVerlaufAn(siteDir, "Leg eine Seite über Wärmepumpen an.");
+    const r = await ruf("GET", "/edit/agent/verlaeufe", { cookie: cookie() });
+    const körper = (await r.json()) as {
+      fortsetzbar: string | null;
+      verlaeufe: { id: string; titel: string; geaendert: number }[];
+    };
+    expect(körper.verlaeufe.length).toBe(1);
+    expect(körper.verlaeufe[0]!.titel).toBe("Leg eine Seite über Wärmepumpen an.");
+    // Die Kennung, die der Browser zurückschickt — hier entsteht die Kette.
+    expect(körper.fortsetzbar).toBe(körper.verlaeufe[0]!.id);
+    expect(körper.fortsetzbar).toBe(info.id);
+  });
+
+  test("die Liste enthält KEINEN Dateipfad", async () => {
+    // `VerlaufInfo.datei` ist ein absoluter Pfad im Kundenordner. Ginge er
+    // hinaus, verriete die Seitenleiste die Verzeichnisstruktur des Servers —
+    // und lüde jeden dazu ein, ihn als Parameter zurückzuschicken.
+    legeVerlaufAn(siteDir, "egal");
+    const roh = await (await ruf("GET", "/edit/agent/verlaeufe", { cookie: cookie() })).text();
+    expect(roh).not.toContain(siteDir);
+    expect(roh).not.toContain(".jsonl");
+  });
+});
+
+describe("ein Gespräch zum Nachlesen", () => {
+  test("ohne `id`: 400 mit der gemeinsamen Fehlerform", async () => {
+    const r = await ruf("GET", "/edit/agent/verlauf", { cookie: cookie() });
+    expect(r.status).toBe(400);
+    expect(await r.json()).toEqual({ ok: false, grund: "Kennung fehlt." });
+  });
+
+  test("eine unbekannte Kennung: 404, kein Fehler", async () => {
+    const r = await ruf("GET", "/edit/agent/verlauf?id=gibt-es-nicht", { cookie: cookie() });
+    expect(r.status).toBe(404);
+  });
+
+  test("Auftrag und Antwort kommen beim Kunden an", async () => {
+    const info = legeVerlaufAn(siteDir, "Leg eine Seite an.");
+    const r = await ruf("GET", `/edit/agent/verlauf?id=${encodeURIComponent(info.id)}`, {
+      cookie: cookie(),
+    });
+    expect(r.status).toBe(200);
+    const körper = (await r.json()) as {
+      id: string;
+      ab: number;
+      gesamt: number;
+      nachrichten: { von: string; text: string }[];
+    };
+    expect(körper.id).toBe(info.id);
+    expect(körper.ab).toBe(0);
+    expect(körper.nachrichten.map((n) => n.von)).toEqual(["kunde", "agent"]);
+    expect(körper.nachrichten[0]!.text).toBe("Leg eine Seite an.");
+  });
+
+  test("ein fremder Pfad als Kennung erreicht nichts", async () => {
+    legeVerlaufAn(siteDir, "egal");
+    for (const boese of ["../../../etc/passwd", "%2e%2e%2fetc%2fpasswd", "/etc/passwd"]) {
+      const r = await ruf("GET", `/edit/agent/verlauf?id=${encodeURIComponent(boese)}`, {
+        cookie: cookie(),
+      });
+      expect(`${boese} → ${r.status}`).toBe(`${boese} → 404`);
+    }
+  });
 });
 
 // ===========================================================================
