@@ -384,7 +384,7 @@ describe("extrahiereText() — der Notfallweg räumt dieselben Verstecke", () =>
     expect(extrahiereText(html)).not.toContain("KOEDER");
   });
 
-  test("ROT: display:none fällt im Notfallweg NICHT — und das ist die Hauptregel", () => {
+  test("display:none fällt auch im Notfallweg — das ist die Hauptregel", () => {
     // `rohText` räumt Kommentare, script/style/noscript/template und das
     // `hidden`-Attribut. `display:none` fehlt — ausgerechnet die Regel, die im
     // DOM-Durchgang die wichtigste ist und die ein Angreifer zuerst nimmt.
@@ -399,6 +399,27 @@ describe("extrahiereText() — der Notfallweg räumt dieselben Verstecke", () =>
     // ohne Verschachtelungswissen ist dort ausdrücklich in Ordnung.
     const text = extrahiereText('<<<>>><div style="display:none">KOEDER</div>');
     expect(text).not.toContain("KOEDER");
+  });
+
+  test.each([
+    ['einfache Anführungszeichen', "<<<>>><div style='display:none'>KOEDER</div>"],
+    ["Großschreibung", '<<<>>><div STYLE="DISPLAY:NONE">KOEDER</div>'],
+    ["Leerzeichen im Wert", '<<<>>><div style="display : none">KOEDER</div>'],
+    ["neben anderen Eigenschaften", '<<<>>><div style="color:red;display:none;margin:0">KOEDER</div>'],
+    ["visibility statt display", '<<<>>><div style="visibility:hidden">KOEDER</div>'],
+    ["gemischt geschrieben", '<<<>>><div Style="Visibility: Hidden">KOEDER</div>'],
+  ])("auch als %s", (_name, html) => {
+    // Dieselbe Lehre wie eine Ebene höher, nur konsequent zu Ende geführt: Eine
+    // Regel gilt erst, wenn sie in den Schreibweisen gilt, die jemand nimmt,
+    // der weiß, dass gefiltert wird.
+    expect(extrahiereText(html)).not.toContain("KOEDER");
+  });
+
+  test("harmlose Stile im Notfallweg reißen keinen sichtbaren Text mit", () => {
+    // Die Gegenprobe zur groben Regex: Sie darf nicht jedes style-Attribut
+    // erschlagen, sonst kostet der Notfallweg mehr Inhalt als er schützt.
+    const text = extrahiereText('<<<>>><div style="color:red">wichtiger Inhalt</div>');
+    expect(text).toContain("wichtiger Inhalt");
   });
 
   test("der Notfallweg liefert trotzdem eine gerahmte Antwort, keinen Wurf", () => {
