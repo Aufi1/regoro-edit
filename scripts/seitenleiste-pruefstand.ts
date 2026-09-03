@@ -693,9 +693,20 @@ try {
 const basis = `http://localhost:${PORT}`;
 console.log(`Prüfstand für die KI-Seitenleiste läuft auf ${basis}\n`);
 const BROWSE = "~/.claude/skills/gstack/browse/dist/browse";
+/**
+ * Leiste öffnen — IDEMPOTENT, und das ist nicht Kosmetik.
+ *
+ * Die Leiste merkt sich in `sessionStorage`, dass sie offen war, und geht beim
+ * nächsten Seitenaufruf von selbst wieder auf. Ein blinder Klick TOGGELT sie
+ * dann zu, und der Prüffall sieht ein leeres Fenster — was aussieht wie ein
+ * Fehler im Overlay und keiner ist. Genau darauf ist der Prüfstand nach dem
+ * Zusammenführen zweier Zweige hereingefallen: sechs Fälle rot, alle aus diesem
+ * einen Grund.
+ */
 const OEFFNEN =
-  "js \"var b=Array.from(document.querySelectorAll('#__regoro-bar button'))" +
-  ".find(x=>x.textContent==='KI-Assistent'); if(b)b.click()\"";
+  "js \"if(!document.querySelector('#__regoro-agent')){" +
+  "var b=Array.from(document.querySelectorAll('#__regoro-bar button'))" +
+  ".find(function(x){return x.textContent==='KI-Assistent'}); if(b)b.click()}\"";
 const ABSCHICKEN =
   "js \"document.querySelector('.__regoro-aeingabe').value='mach was';" +
   " document.querySelector('.__regoro-asenden').click()\"";
