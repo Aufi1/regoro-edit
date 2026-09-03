@@ -962,8 +962,7 @@ export function agentFehlerText(grund: string): string {
   if (trenner > 0 && UEBERNAHME_ABLEHNUNGEN.has(grund.slice(0, trenner))) {
     console.error(`[regoro] Übernahme abgelehnt: ${grund}`);
     return (
-      "Der Assistent hat etwas erzeugt, das die Sicherheitsprüfung nicht übernimmt. " +
-      "An der Website wurde nichts geändert."
+      "Die Sicherheitsprüfung hat die Änderung nicht übernommen — nichts geändert."
     );
   }
 
@@ -971,20 +970,30 @@ export function agentFehlerText(grund: string): string {
     case "kein-lauf":
       return "Kein Lauf aktiv.";
     case "kein-modellzugang":
-      return "Der KI-Assistent ist auf diesem Server nicht eingerichtet.";
+      return "Der KI-Assistent ist nicht eingerichtet.";
     case "lauf-gescheitert":
-      return "Der Auftrag konnte nicht ausgeführt werden. Es wurde nichts geändert.";
+      return "Auftrag fehlgeschlagen — nichts geändert.";
     case "worker-abgestuerzt":
       // Nachgemessen: Ohne diesen Fall stand wörtlich „worker-abgestuerzt" im
       // Chatfenster des Kunden. Was schiefging, gehört ins Log des Betreibers;
       // der Kunde braucht zu wissen, dass seine Website unberührt ist.
-      return "Der Assistent hat sich unerwartet beendet. An der Website wurde nichts geändert.";
+      return "Der Assistent hat sich unerwartet beendet — nichts geändert.";
     case "kontingent-erschoepft":
-      return "Das Monatskontingent ist mitten im Auftrag aufgebraucht. Es wurde nichts geändert; am Monatsersten geht es weiter.";
+      /**
+       * ZWEI WÖRTER, UND DAS IST ABSICHT. Die Kontingentleiste steht direkt
+       * über dem Verlauf und sagt dauerhaft „Das Monatskontingent ist
+       * aufgebraucht. Es setzt sich am Monatsersten zurück." Das Datum hier zu
+       * wiederholen hieße, dieselbe Aussage zweimal zu führen — und zwei
+       * Quellen für eine Aussage laufen früher oder später auseinander.
+       *
+       * Auch die Entwarnung („nichts geändert") fehlt bewusst, anders als bei
+       * den übrigen Meldungen: Dort ist der Chat die einzige Quelle, hier nicht.
+       */
+      return "Kontingent aufgebraucht.";
     case "abgebrochen":
       // Der meistbenutzte Weg überhaupt — der Abbrechen-Knopf. Ohne diesen Fall
       // stand dort ein rotes Feld mit dem Wort „abgebrochen".
-      return "Der Auftrag wurde abgebrochen. An der Website wurde nichts geändert.";
+      return "Abgebrochen — nichts geändert.";
     case "abgeschaltet":
       return "Der Zugang wurde vom Betreiber beendet.";
     default:
@@ -1007,7 +1016,7 @@ export function agentFehlerText(grund: string): string {
        */
       if (istEigenerKlartext(grund)) return grund;
       console.error(`[regoro] Agentenlauf gescheitert: ${grund}`);
-      return "Der Assistent ist gerade nicht verfügbar. An der Website wurde nichts geändert.";
+      return "Der Assistent ist gerade nicht verfügbar — an der Website wurde nichts geändert.";
   }
 }
 
