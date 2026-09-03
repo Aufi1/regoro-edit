@@ -38,6 +38,25 @@ jobs:
           sudo install -m 0755 caddy /usr/local/bin/caddy
           caddy version
 
+      # Baut der Commit auch OHNE das Arbeitsverzeichnis, in dem er entstand?
+      #
+      # Gemessen an dieser Branch: `src/host.ts` war committet und importierte
+      # `./betreiber-config.ts`, `./agent.ts` und `./kontingent.ts` — die waren
+      # ungetrackt. Lokal fällt das niemandem auf, weil die Dateien im
+      # Arbeitsbaum liegen; ein Klon, ein `git bisect` oder dieser Job sehen sie
+      # nicht. Ohne diesen Schritt schlägt das erst beim Tag zu, also dann, wenn
+      # es am teuersten ist.
+      #
+      # `git archive HEAD` packt ausschließlich, was wirklich im Commit steht —
+      # keine ungetrackten und keine ignorierten Dateien.
+      - name: Der Commit baut auch ohne Arbeitsverzeichnis
+        run: |
+          rein="$(mktemp -d)"
+          git archive HEAD | tar -x -C "$rein"
+          cd "$rein"
+          bun install --frozen-lockfile
+          bun x tsc --noEmit
+
       # Lizenzhinweise MÜSSEN zum Abhängigkeitsbaum passen, bevor gebaut wird.
       # Ein --compile-Binary trägt keine einzige der Lizenzdateien aus
       # node_modules; THIRD-PARTY-NOTICES.txt ist die Erfüllung der
