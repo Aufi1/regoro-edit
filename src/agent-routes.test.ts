@@ -494,6 +494,31 @@ describe("GET /edit/agent/events (echter Server)", () => {
     expect(fertig.commit).toBeNull();
   }, 40_000);
 
+  test.skipIf(!haveBwrap())("Kontingent reißt mitten im Lauf: erst Arbeit, dann Abbruch", async () => {
+    // Der Übergang, den die Seitenleiste zeigen muss: Sie hat gerade noch
+    // „schreibt leistungen.html" angezeigt und muss daraus eine Fehlerblase UND
+    // eine Kontingentzeile auf „aufgebraucht" machen. Beides hängt daran, dass
+    // der Strom die Arbeit VOR dem Abbruch ausliefert — käme nur der Fehler,
+    // stünde die Leiste ohne Zusammenhang da.
+    const { site, base, cookie: c } = await bootMitKi(KI);
+    starteLauf(ctxFuer(site), "kontingent-sprengen", { workerBefehl: [process.execPath, "run", ATTRAPPE] });
+
+    const rahmen = await liesSse(`${base}/edit/agent/events`, { cookie: c });
+    const namen = rahmen.map((r) => r.event);
+    expect(namen).toContain("werkzeug");
+    expect(namen).toContain("tokens");
+    expect(namen.at(-1)).toBe("fehler");
+
+    // `frei` wird nie negativ. Sonst stünde in der Leiste „noch −1.799.999.999
+    // Token" — der Deckel ist überschritten, nicht ins Gegenteil verkehrt.
+    for (const r of rahmen.filter((x) => x.event === "tokens")) {
+      expect(JSON.parse(r.data).frei).toBeGreaterThanOrEqual(0);
+    }
+    expect(JSON.parse(rahmen.at(-1)!.data).grund).toMatch(/[a-zäöüß]{4,}/i);
+    // Und nichts davon ist in der Website gelandet.
+    expect(existsSync(join(site, "leistungen.html"))).toBe(false);
+  }, 60_000);
+
   test.skipIf(!haveBwrap())("ein abgelehnter Lauf endet mit fehler, nicht mit fertig", async () => {
     const { site, base, cookie: c } = await bootMitKi(KI);
     starteLauf(ctxFuer(site), "inline-skript", { workerBefehl: [process.execPath, "run", ATTRAPPE] });

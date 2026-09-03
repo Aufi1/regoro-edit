@@ -226,6 +226,10 @@ async function lauf(): Promise<void> {
     // Token-Meldung weit über dem Limit, dann weiterarbeiten als wäre nichts.
     // Der Elternprozess muss abbrechen; übernommen werden darf nichts.
     case "kontingent-sprengen": {
+      // Das Werkzeug-Ereignis gehört dazu, auch wenn der Lauf gleich scheitert:
+      // Die Seitenleiste zeigt den Übergang von „arbeitet" zu „aufgebraucht",
+      // und der ist ohne vorangegangene Arbeit nicht zu sehen.
+      sende({ t: "werkzeug", name: "write_file", kurz: "schreibt leistungen.html" });
       log(`schreibe leistungen.html: ${schreibe("leistungen.html", HARMLOS)}`);
       sende({ t: "tokens", gesamt: 999_999_999 });
       await Bun.sleep(50);
