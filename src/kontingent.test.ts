@@ -55,9 +55,34 @@ afterAll(() => {
   }
 });
 
+/**
+ * Der teuerste gemessene Einzellauf: „neue Unterseite" auf einer echten
+ * Fabrik-Seite (205.120 Token). Die Messreihe steht am Typ in `kontingent.ts`.
+ */
+const TEUERSTER_GEMESSENER_LAUF = 205_120;
+
+/**
+ * Ein gescheiterter Lauf kostet dieselben Token wie ein gelungener. Ein Monat
+ * muss deshalb mindestens einen Fehlversuch, den zweiten Anlauf und einen
+ * weiteren Auftrag tragen — sonst ist der Kunde nach einem Missgriff bis zum
+ * Monatsersten ausgesperrt.
+ */
+const MINDESTENS_LAEUFE = 3;
+
 describe("kontingent.ts — die Konstante", () => {
-  test("TOKEN_KONTINGENT steht bewusst niedrig bei 200.000", () => {
-    expect(TOKEN_KONTINGENT).toBe(200_000);
+  test("TOKEN_KONTINGENT liegt bei 1.000.000 — vorläufig, Messwerte stehen am Typ", () => {
+    // Die Zahl ist eine Messfolge, keine Haltung: Der Verbrauch hängt an der
+    // SEITENGRÖSSE, nicht an der Aufgabe. Dieselbe Aufgabe kostete 8.403 Token
+    // auf der Beispielseite und 205.120 auf einer echten Fabrik-Seite.
+    expect(TOKEN_KONTINGENT).toBe(1_000_000);
+  });
+
+  test("das Kontingent trägt mehr als einen echten Lauf — daran ist die alte Grenze gescheitert", () => {
+    // Genau hier lag der Fehler der 200.000: Sie erlaubte einem echten Kunden
+    // EINEN Auftrag im Monat, und der wäre knapp durchgegangen. Wer die Konstante
+    // das nächste Mal senkt, muss an dieser Zusicherung vorbei — und damit an der
+    // Messung statt am Bauchgefühl.
+    expect(TOKEN_KONTINGENT).toBeGreaterThan(TEUERSTER_GEMESSENER_LAUF * MINDESTENS_LAEUFE);
   });
 });
 
