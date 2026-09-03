@@ -20,6 +20,10 @@
  */
 import { existsSync, readFileSync, statSync, rmSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
+// Bun-"file"-Import: liefert einen Pfad, den `bun build --compile` mit einbettet.
+// Exakt das Muster von overlay.client.js in host.ts — NICHT auf import.meta.url
+// zurückbauen, das zeigt im Binary ins Leere und `regoro licenses` liefe leer.
+import noticesAsset from "../THIRD-PARTY-NOTICES.txt" with { type: "file" };
 import {
   AUTH_DIR_NAME,
   alleKennungen,
@@ -72,6 +76,7 @@ Verwendung:
                                   systemd-Unit + Caddy-Block ausgeben
   regoro service <sitesRoot> --multi [--port n] [--systemd|--caddy]
                                   dasselbe für den Sammelbetrieb
+  regoro licenses                 Lizenzhinweise der Abhängigkeiten ausgeben
   regoro --version                Version ausgeben
 
 siteDir ist optional und meint ohne Angabe das aktuelle Verzeichnis.
@@ -444,6 +449,31 @@ function cmdDisable(args: string[]): void {
 }
 
 /**
+ * `regoro licenses` — gibt THIRD-PARTY-NOTICES.txt aus.
+ *
+ * Rechtspflicht: Das ausgelieferte Binary enthält den gesamten
+ * Abhängigkeitsbaum, aber keine seiner Lizenzdateien. Alle Lizenzen im Baum
+ * sind permissiv, verlangen aber die Weitergabe ihrer Copyright-Hinweise.
+ */
+function cmdLicenses(args: string[]): void {
+  checkFlags("licenses", args, []);
+  // 600 KB Text lesen sich niemand am Stück durch — `regoro licenses | less`
+  // oder `| grep … | head` ist der Normalfall. Schließt der Leser die Pipe
+  // früh, schlägt der Schreibvorgang mit EPIPE fehl; ungefangen druckt Bun
+  // dafür einen Stacktrace, der wie ein Programmfehler aussieht. Ist er nicht.
+  const stillLegen = (err: unknown): void => {
+    if ((err as NodeJS.ErrnoException | undefined)?.code === "EPIPE") process.exit(0);
+    throw err;
+  };
+  process.stdout.on("error", stillLegen);
+  try {
+    process.stdout.write(readFileSync(noticesAsset, "utf8"));
+  } catch (err) {
+    stillLegen(err);
+  }
+}
+
+/**
  * `regoro service [siteDir] [--domain d] [--port n] [--user u] [--systemd|--caddy]`
  *
  * Druckt die Betriebs-Dateien. Schreibt nichts — der Mensch leitet um, wohin er will.
@@ -721,6 +751,10 @@ async function main(): Promise<void> {
   }
   if (cmd === "service") {
     cmdService(rest);
+    return;
+  }
+  if (cmd === "licenses") {
+    cmdLicenses(rest);
     return;
   }
   // Bare-Form: `regoro <siteDir>` (kein bekannter Sub-Befehl).

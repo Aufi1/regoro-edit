@@ -13,3 +13,13 @@ declare module "*.client.js" {
   const path: string;
   export default path;
 }
+
+/**
+ * Dasselbe für THIRD-PARTY-NOTICES.txt (`regoro licenses`). Ebenso eng gefasst:
+ * ein `*.txt`-Wildcard erklärte jede künftige Textdatei stillschweigend zu einem
+ * Pfad-String — auch dort, wo jemand den INHALT erwartet.
+ */
+declare module "*-NOTICES.txt" {
+  const path: string;
+  export default path;
+}

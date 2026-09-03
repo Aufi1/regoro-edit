@@ -38,6 +38,15 @@ jobs:
           sudo install -m 0755 caddy /usr/local/bin/caddy
           caddy version
 
+      # Lizenzhinweise MÜSSEN zum Abhängigkeitsbaum passen, bevor gebaut wird.
+      # Ein --compile-Binary trägt keine einzige der Lizenzdateien aus
+      # node_modules; THIRD-PARTY-NOTICES.txt ist die Erfüllung der
+      # Weitergabepflicht, und `regoro licenses` gibt genau diese Datei aus.
+      # Eine veraltete Datei ist deshalb ein roter Build, kein Schönheitsfehler:
+      # Sonst liefe ein Release aus, das Pakete verschweigt, die es enthält.
+      - name: Lizenzhinweise sind aktuell
+        run: bun scripts/gen-notices.ts --check
+
       # Die Checks aus CLAUDE.md. Ein Release, das die Suite nicht besteht,
       # soll gar nicht erst entstehen.
       - name: Checks
