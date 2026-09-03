@@ -102,6 +102,26 @@ describe("die CSP sitzt ausschließlich im statischen Zweig", () => {
         expect(block.match(/Content-Security-Policy/g)).toHaveLength(1);
       });
 
+      test("der file_server-Zweig setzt nosniff", () => {
+        // Caddy liefert die statische Site DIREKT aus; der Bun-Host ist dort
+        // nicht im Pfad, seine SECURITY_HEADERS greifen also nicht. Ohne diese
+        // Zeile fehlt nosniff genau auf den Dateien, die der Agent schreibt.
+        //
+        // Wogegen es steht: ein Polyglot — eine Datei mit gültiger Bild-Signatur
+        // und eingebettetem HTML. Der Validator lässt sie als Bild durch, der
+        // Browser interpretiert sie ohne nosniff als HTML, und das eingebettete
+        // Skript läuft im Ursprung der Kundenwebsite.
+        expect(handleBlock(block, "@allowed")).toContain('header X-Content-Type-Options "nosniff"');
+      });
+
+      test("der Editor-Zweig braucht ihn nicht — der Bun-Host setzt ihn selbst", () => {
+        // Gegenprobe zur Vollständigkeit: Hier ist die Abwesenheit richtig, und
+        // zwar aus einem Grund, nicht aus Vergesslichkeit. Wer sie „der
+        // Einheitlichkeit halber" nachträgt, verdoppelt eine Zusicherung an
+        // einen Ort, der sie nicht kontrolliert.
+        expect(handleBlock(block, "@editor")).toContain("reverse_proxy");
+      });
+
       test("der Editor-Zweig schaltet die Pufferung ab", () => {
         // ACHTUNG, die naheliegende Begründung ist FALSCH und wurde gemessen
         // (caddy 2.11.4): `flush_interval -1` ändert an der Zeit bis zum ersten
@@ -220,6 +240,16 @@ describe("die Caddyfile-Vorlagen spiegeln die CSP des Generators", () => {
     }
   });
 
+  test("beide Vorlagen setzen nosniff im statischen Zweig", () => {
+    // Dieselbe Begründung wie bei der CSP: Der dokumentierte Weg ist „Block aus
+    // der Vorlage kopieren". Eine Vorlage ohne die Zeile heißt eine
+    // Kundenwebsite ohne den Riegel, und niemand sieht es.
+    for (const datei of ["Caddyfile.example", "Caddyfile.multi.example"]) {
+      const statisch = handleBlock(readFileSync(join(REPO_ROOT, datei), "utf8"), "@allowed");
+      expect(`${datei}: ${statisch.includes('header X-Content-Type-Options "nosniff"')}`).toBe(`${datei}: true`);
+    }
+  });
+
   test("beide Vorlagen schalten die Pufferung im Editor-Zweig ab", () => {
     for (const datei of ["Caddyfile.example", "Caddyfile.multi.example"]) {
       const text = readFileSync(join(REPO_ROOT, datei), "utf8");
@@ -315,6 +345,9 @@ describe.skipIf(!haveCaddy())("der erzeugte Block auf der Leitung", () => {
         const r = await fetch(basis + pfad);
         expect(`${pfad} → ${r.status}`).toBe(`${pfad} → 200`);
         expect(`${pfad}: ${r.headers.get("content-security-policy")}`).toBe(`${pfad}: ${CSP_OHNE_INTEGRATIONEN}`);
+        // Auf der Leitung, nicht nur im Text: Ein `header`, das im Block steht
+        // und nicht ankommt, wäre derselbe Ausfall wie eine fehlende Zeile.
+        expect(`${pfad}: ${r.headers.get("x-content-type-options")}`).toBe(`${pfad}: nosniff`);
         await r.text();
       }
 
