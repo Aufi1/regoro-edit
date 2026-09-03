@@ -167,6 +167,45 @@ export function schreibeKiConfig(cfg: KiConfig, pfad: string = betreiberConfigPf
   writeFileSync(pfad, JSON.stringify(payload, null, 2), { mode: 0o600 });
 }
 
+/**
+ * Ändert einzelne Felder des Modellzugangs und lässt alle übrigen stehen.
+ *
+ * Das Gegenstück zu `schreibeKiConfig`, und die Aufteilung hat ein direktes
+ * Vorbild in `auth.ts`: Dort überschreibt `createAuthFile` alles (weshalb
+ * `cmdInit` mit `--force` dagegen guardet), während `schreibeKennungen` das
+ * Secret **nicht** anrührt — eine hinzugefügte Nummer soll keine laufende
+ * Sitzung beenden. Dieselbe Unterscheidung, dieselbe Datei-Ebene.
+ *
+ * Ohne sie heißt „nicht genannt" faktisch „löschen". Gemessen an `regoro ki
+ * --stdin`: Wer nur den Modellschlüssel rotiert, verlor `braveKey` und
+ * `firecrawlKey` und bekam `baseUrl` und `model` auf die Vorgabewerte
+ * zurückgesetzt. Der letzte Fall ist der gefährliche — wer Cortecs eingerichtet
+ * hatte, um in der EU zu verarbeiten, war danach wortlos wieder bei OpenRouter.
+ * Kein Fehler, keine Warnung; es scheitert nicht, es wirkt nur nicht.
+ *
+ * Wirft, wenn es nichts zu ändern gibt — für die Ersteinrichtung ist
+ * `schreibeKiConfig` zuständig.
+ */
+export function aktualisiereKiConfig(teil: Partial<KiConfig>, pfad: string = betreiberConfigPfad()): void {
+  const vorhanden = loadKiConfig(pfad);
+  if (vorhanden === null) {
+    throw new Error(
+      `kein gültiger Modellzugang unter ${pfad} — es gibt nichts zu ändern.\n` +
+        "  Zuerst einrichten:\n" +
+        `    printf '%s\\n' "modell=$SCHLUESSEL" | regoro ki --stdin`,
+    );
+  }
+  const naechste: KiConfig = { ...vorhanden };
+  // Nur ausdrücklich genannte Felder übernehmen. Ein `undefined` im Teil-Objekt
+  // heißt „nicht genannt", nicht „auf undefined setzen" — ein blanker Spread
+  // schriebe daraus ein Feld, das dem eigenen Typ nicht mehr entspricht.
+  // `null` ist dagegen ein echter Wert und geht durch: „Funktion aus".
+  for (const [name, wert] of Object.entries(teil)) {
+    if (wert !== undefined) (naechste as Record<string, unknown>)[name] = wert;
+  }
+  schreibeKiConfig(naechste, pfad);
+}
+
 /** Entfernt den Modellzugang — danach ist die KI aus. Wirft nicht, wenn nichts da ist. */
 export function entferneKiConfig(pfad: string = betreiberConfigPfad()): void {
   rmSync(pfad, { force: true });
