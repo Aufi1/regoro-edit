@@ -66,6 +66,7 @@ const GELADEN: KiConfig = {
   apiKey: GUELTIG.apiKey,
   keyFromProxy: false,
   braveKey: GUELTIG.braveKey,
+  firecrawlKey: null,
   baseUrl: GUELTIG.baseUrl,
   model: GUELTIG.model,
 };
@@ -199,9 +200,47 @@ describe("betreiber-config.ts — loadKiConfig() liest die Felder", () => {
     expect(cfg?.braveKey).toBeNull();
   });
 
-  test("braveKey leer oder mit falschem Typ → null (keine Websuche)", () => {
+  test("braveKey mit falschem Typ → null (keine Websuche)", () => {
     expect(loadKiConfig(schreibeRoh(JSON.stringify({ ...GUELTIG, braveKey: 42 })))?.braveKey).toBeNull();
-    expect(loadKiConfig(schreibeRoh(JSON.stringify({ ...GUELTIG, braveKey: "" })))?.braveKey).toBeNull();
+    expect(loadKiConfig(schreibeRoh(JSON.stringify({ ...GUELTIG, braveKey: true })))?.braveKey).toBeNull();
+  });
+
+  test("braveKey leer heißt „Schlüssel kommt von außen\", NICHT „keine Websuche\" (§16)", () => {
+    // Die drei Zustände jedes Schlüsselfeldes: fehlt/falscher Typ → null
+    // (Funktion aus, fail-closed); "" → Funktion an, ein ausgehender Proxy hängt
+    // die Anmeldung an; Zeichenkette → Schlüssel steht in der Datei.
+    //
+    // Diese Zeile stand hier vorher mit `toBeNull()` — und war grün, weil der
+    // Lader "" wegnormalisierte. Genau das ist der teure Fall: Die Websuche wäre
+    // stumm ausgefallen. Kein Fehler, keine Logzeile, nichts wird rot; es
+    // scheitert nicht, es wirkt nur nicht.
+    expect(loadKiConfig(schreibeRoh(JSON.stringify({ ...GUELTIG, braveKey: "" })))?.braveKey).toBe("");
+  });
+
+  test("fehlender firecrawlKey → null (kein Seitenabruf)", () => {
+    // Eigener Schlüssel neben braveKey: Ohne ihn kann der Agent weiter suchen,
+    // nur keine gefundene Seite mehr öffnen — statt dass die Recherche ganz ausfällt.
+    const { firecrawlKey: _weg, ...ohne } = { ...GUELTIG, firecrawlKey: "fc-x" };
+    expect(loadKiConfig(schreibeRoh(JSON.stringify(ohne)))?.firecrawlKey).toBeNull();
+    expect(loadKiConfig(schreibeRoh(JSON.stringify({ ...GUELTIG, firecrawlKey: 42 })))?.firecrawlKey).toBeNull();
+  });
+
+  test("firecrawlKey leer heißt ebenfalls „Schlüssel kommt von außen\" (§16)", () => {
+    expect(loadKiConfig(schreibeRoh(JSON.stringify({ ...GUELTIG, firecrawlKey: "" })))?.firecrawlKey).toBe("");
+  });
+
+  test("ein gesetzter firecrawlKey kommt unverändert an", () => {
+    expect(loadKiConfig(schreibeRoh(JSON.stringify({ ...GUELTIG, firecrawlKey: "fc-abc123" })))?.firecrawlKey).toBe(
+      "fc-abc123",
+    );
+  });
+
+  test("die drei Zustände sind für beide Schlüssel dieselben — eine Semantik, keine zwei", () => {
+    for (const feld of ["braveKey", "firecrawlKey"] as const) {
+      expect(loadKiConfig(schreibeRoh(JSON.stringify({ ...GUELTIG, [feld]: 99 })))?.[feld]).toBeNull();
+      expect(loadKiConfig(schreibeRoh(JSON.stringify({ ...GUELTIG, [feld]: "" })))?.[feld]).toBe("");
+      expect(loadKiConfig(schreibeRoh(JSON.stringify({ ...GUELTIG, [feld]: "echt" })))?.[feld]).toBe("echt");
+    }
   });
 
   test("fehlende oder leere baseUrl/model → die Vorgabewerte", () => {
@@ -266,6 +305,15 @@ describe("betreiber-config.ts — schreibeKiConfig() / entferneKiConfig()", () =
   test("braveKey null überlebt den Umlauf als null", () => {
     schreibeKiConfig({ ...cfg, braveKey: null }, pfad);
     expect(loadKiConfig(pfad)?.braveKey).toBeNull();
+  });
+
+  test("ein leerer Schlüssel überlebt den Umlauf als leer, nicht als null", () => {
+    // Sonst schaltete das bloße Neuschreiben der Datei die Funktion ab, die der
+    // Betreiber gerade eingerichtet hat.
+    schreibeKiConfig({ ...cfg, braveKey: "", firecrawlKey: "" }, pfad);
+    const wieder = loadKiConfig(pfad);
+    expect(wieder?.braveKey).toBe("");
+    expect(wieder?.firecrawlKey).toBe("");
   });
 
   test("keyFromProxy überlebt den Umlauf — sonst wäre die KI direkt nach dem Einrichten aus", () => {

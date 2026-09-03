@@ -59,6 +59,7 @@ function ki(basis: string, over: Partial<KiConfig> = {}): KiConfig {
     apiKey: MODELL_SCHLUESSEL,
     keyFromProxy: false,
     braveKey: null,
+    firecrawlKey: null,
     baseUrl: `${basis}/api/v1`,
     model: "z-ai/glm-5.3-flash",
     ...over,
