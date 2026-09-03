@@ -442,9 +442,35 @@ describe("holeSeite() ist fail-closed und verbrennt kein Guthaben", () => {
   });
 
   test("eine 3xx-Zielseite ist kein Fehler — die Weiterleitung hat Firecrawl schon aufgelöst", async () => {
+    // Deshalb steht die Prüfung auf `>= 400` und nicht auf `!== 200`: Firecrawl
+    // löst Weiterleitungen selbst auf, `metadata.url` trägt die Zieladresse.
+    // Wer auf `!== 200` prüft, wirft eine erreichbare Seite weg.
     const s = attrappe(() => ({ body: scrapeAntwort("<body><p>Zielinhalt</p></body>", 301) }));
     try {
       expect(await holeSeite("https://example.de/x", "fc-x", s.basis)).toContain("Zielinhalt");
+    } finally {
+      s.stop();
+    }
+  });
+
+  test("ein Weiterleitungs-Stummel kommt derzeit durch — bekannt und bewusst offen", async () => {
+    // Ein gemeldeter 3xx heißt: Firecrawl ist der Weiterleitung NICHT gefolgt.
+    // Dann kann `rawHtml` ein Stummel sein — nicht leer, aber inhaltsleer. Die
+    // Statusprüfung fängt ihn nicht, die Leer-Prüfung eine Zeile weiter auch
+    // nicht, weil ein `<a href>` darin schon Text ist.
+    //
+    // Dieser Test hält den IST-Zustand fest, nicht einen Wunsch: Es gibt keinen
+    // gemessenen Fall dafür, und eine Schwelle „mindestens N Wörter" wäre
+    // geraten — sie würde echte kurze Seiten (Kontakt, Öffnungszeiten)
+    // mitreißen. Wird er rot, hat jemand so eine Schwelle eingebaut: Dann bitte
+    // diesen Kommentar lesen und die Schwelle an gemessenen Seiten belegen,
+    // statt sie zu schätzen.
+    const stummel = '<html><body><a href="https://example.de/neu">Moved Permanently</a></body></html>';
+    const s = attrappe(() => ({ body: scrapeAntwort(stummel, 301) }));
+    try {
+      const text = await holeSeite("https://example.de/alt", "fc-x", s.basis);
+      expect(text).toContain(KLAMMER);
+      expect(text).toContain("Moved Permanently");
     } finally {
       s.stop();
     }
