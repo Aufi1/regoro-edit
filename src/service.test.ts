@@ -5,7 +5,7 @@
  * Vorlage, die nicht parst, ist schlimmer als keine.
  */
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -16,6 +16,8 @@ import {
   activationSteps,
   siteIsUnderHome,
   DOMAIN_RE,
+  caddyGlobalBlock,
+  CADDY_HOST_RE,
 } from "./service.ts";
 
 const base = {
@@ -216,5 +218,159 @@ describe("der erzeugte Caddy-Block ist gültiges Caddyfile", () => {
   test.skipIf(!haveCaddy())("auch mit einem Site-Pfad voller Leerzeichen", () => {
     const block = caddyBlock({ ...base, domain: ":8099", siteDir: "/srv/Meine Firma/site" });
     expect(validate(block)).toContain("Valid configuration");
+  });
+});
+
+// ===========================================================================
+// Sammelbetrieb (`--multi`): ein Dienst, ein Caddy-Block, alle Kundendomains
+// ===========================================================================
+const baseMulti = {
+  siteDir: "/srv/sites", // im Sammelbetrieb ist das das Sammelverzeichnis
+  execPath: "/home/aufi/.local/bin/regoro",
+  slug: "sites",
+  port: 8788,
+  user: "www-data",
+  multi: true,
+};
+
+describe("systemdUnit --multi", () => {
+  test("ExecStart ruft `serve` auf das Sammelverzeichnis", () => {
+    const unit = systemdUnit(baseMulti);
+    expect(unit).toContain('ExecStart="/home/aufi/.local/bin/regoro" serve "/srv/sites"');
+    expect(unit).toContain('WorkingDirectory="/srv/sites"');
+    expect(unit).toContain('ReadWritePaths="/srv/sites"');
+    expect(unit).not.toContain(" run ");
+  });
+
+  test("ProtectHome-Regel gilt auch für das Sammelverzeichnis", () => {
+    expect(systemdUnit({ ...baseMulti, siteDir: "/home/aufi/sites" })).not.toContain("ProtectHome=yes");
+    expect(systemdUnit(baseMulti)).toContain("ProtectHome=yes");
+  });
+});
+
+describe("caddyBlock --multi", () => {
+  const block = caddyBlock(baseMulti);
+
+  test("ein Block für alle Domains, Zertifikate on demand", () => {
+    expect(block).toContain("https://");
+    expect(block).toContain("on_demand");
+    // Keine Domainliste, die bei jedem Neukunden gepflegt werden müsste.
+    expect(block).not.toContain("example.com");
+  });
+
+  test("der Site-Root wird aus dem Host-Header gebildet", () => {
+    expect(block).toContain('root * "/srv/sites/{host}"');
+  });
+
+  test("Host-Schranke VOR dem root-Platzhalter", () => {
+    // Ohne sie ergibt `Host: ..` den root /srv — gemessen: Caddy liefert dann
+    // Dateien eine Ebene über dem Sammelverzeichnis mit 200 aus.
+    expect(block).toContain("@badhost");
+    expect(block.indexOf("@badhost")).toBeLessThan(block.indexOf("root *"));
+  });
+
+  test("CADDY_HOST_RE lässt Hostnamen durch und Traversal-Formen nicht", () => {
+    const re = new RegExp(CADDY_HOST_RE);
+    for (const ok of ["kunde.de", "www.kunde.de", "kunde.de:8443", "a", "127.0.0.1"]) {
+      expect(re.test(ok)).toBe(true);
+    }
+    for (const bad of [
+      "..", "...", "../geheim", "/etc", ".kunde.de", "kunde.de-", "-kunde.de", "kunde de", "",
+      // Gemessen: beide lieferte Caddy sonst als Ordnername aus, obwohl der
+      // Editor sie ablehnt.
+      "a..b", "KUNDE.DE", "kunde.de.",
+    ]) {
+      expect(re.test(bad)).toBe(false);
+    }
+  });
+
+  test("CADDY_HOST_RE und normalizeHost ziehen dieselbe Grenze", async () => {
+    // Beide Ebenen müssen sich einig sein, welcher Hostname ein Ordnername sein
+    // darf — sonst liefert der Proxy etwas aus, das der Editor für inexistent hält.
+    // www. und Port sind bewusst ausgenommen: die behandelt der Block separat
+    // (Redirect bzw. Portgruppe), normalizeHost schneidet sie ab.
+    const { normalizeHost } = await import("./sites.ts");
+    const re = new RegExp(CADDY_HOST_RE);
+    const kandidaten = [
+      "kunde.de", "a", "a-b.c-d.example", "127.0.0.1", "localhost", "xn--knde-0ra.de",
+      "a..b", "KUNDE.DE", "kunde.de.", ".kunde.de", "-kunde.de", "kunde.de-",
+      "kunde de", "kunde_de", "..", "../etc", "kunde.de/../x", "",
+    ];
+    for (const h of kandidaten) {
+      expect({ host: h, caddy: re.test(h) }).toEqual({ host: h, caddy: normalizeHost(h) === h });
+    }
+  });
+
+  test("www. wird auf die Hauptdomain umgeleitet (der Ordner heißt ohne www.)", () => {
+    expect(block).toContain("redir");
+    expect(block).toContain("www");
+  });
+
+  test("Dotfile-Block und Extension-Allowlist bleiben (Invariante 3)", () => {
+    expect(block).toContain("path_regexp (^|/)\\.");
+    expect(block).toContain("*.html *.css");
+    expect(block).not.toContain("*.json");
+    expect(block).not.toContain("*.svg");
+  });
+
+  test("Editor-Matcher spiegelt weiterhin isEditorPath()", () => {
+    expect(block).toContain("path /edit /edit/* /edit-assets/* */edit");
+    expect(block).toContain("reverse_proxy 127.0.0.1:8788");
+  });
+
+  test("der ask-Endpunkt wird NICHT veröffentlicht", () => {
+    expect(block).not.toContain("_regoro");
+  });
+});
+
+describe("caddyGlobalBlock", () => {
+  test("nennt den ask-Endpunkt exakt so, wie der Server ihn bedient", async () => {
+    const { TLS_ASK_PATH } = await import("./server.ts");
+    expect(caddyGlobalBlock(baseMulti)).toContain(`ask http://127.0.0.1:8788${TLS_ASK_PATH}`);
+  });
+
+  test("nur im Sammelbetrieb nötig — der Einzelbetrieb kennt seine Domain", () => {
+    expect(caddyGlobalBlock({ ...baseMulti, multi: false })).toBe("");
+  });
+});
+
+describe("der erzeugte Sammelbetrieb-Block ist gültiges Caddyfile", () => {
+  test.skipIf(!haveCaddy())("caddy validate akzeptiert global + Block", () => {
+    const dir = mkdtempSync(join(tmpdir(), "regoro-caddy-multi-"));
+    const file = join(dir, "Caddyfile");
+    // auto_https off + admin off in denselben globalen Block, sonst versucht
+    // caddy beim Validieren ACME.
+    const global = caddyGlobalBlock(baseMulti).replace("{\n", "{\n    auto_https off\n    admin off\n");
+    writeFileSync(file, global + caddyBlock(baseMulti).replace("https://", ":8099"));
+    const res = Bun.spawnSync(["caddy", "validate", "--config", file, "--adapter", "caddyfile"]);
+    rmSync(dir, { recursive: true, force: true });
+    const out = new TextDecoder().decode(res.stderr) + new TextDecoder().decode(res.stdout);
+    expect(out).toContain("Valid configuration");
+  });
+});
+
+describe("Caddyfile-Vorlagen spiegeln den Generator", () => {
+  // Der historische Fehler: ein blankes file_server im Proxy unterlief die
+  // Extension-Allowlist des Editors komplett (CLAUDE.md, Invariante 3). Diese
+  // eine Zeile ist die Stelle, an der die beiden Pfade auseinanderlaufen.
+  const ALLOWED = /^\s*@allowed path .*$/m;
+  const line = (text: string) => text.match(ALLOWED)![0].trim();
+
+  test("Einzel- und Sammelbetrieb führen dieselbe Extension-Allowlist", () => {
+    expect(line(caddyBlock(baseMulti))).toBe(line(caddyBlock(base)));
+  });
+
+  test("beide Vorlagen stimmen mit dem Generator überein", () => {
+    const expected = line(caddyBlock(base));
+    for (const file of ["Caddyfile.example", "Caddyfile.multi.example"]) {
+      const text = readFileSync(join(import.meta.dir, "..", file), "utf8");
+      expect(line(text)).toBe(expected);
+    }
+  });
+
+  test("die Vorlage des Sammelbetriebs enthält die Host-Schranke", () => {
+    const text = readFileSync(join(import.meta.dir, "..", "Caddyfile.multi.example"), "utf8");
+    expect(text).toContain(CADDY_HOST_RE);
+    expect(text).toContain("on_demand_tls");
   });
 });

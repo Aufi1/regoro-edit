@@ -478,3 +478,109 @@ describe("regoro init", () => {
     expect(existsSync(join(dir, ".regoro"))).toBe(false);
   });
 });
+
+// ===========================================================================
+// `regoro serve <sitesRoot>` — Sammelbetrieb
+// ===========================================================================
+describe("regoro serve", () => {
+  /** Startet `serve`, liest die Startausgabe und beendet den Prozess wieder. */
+  async function runServeBriefly(args: string[], cwd: string): Promise<string> {
+    const proc = Bun.spawn(["bun", CLI, "serve", ...args], {
+      cwd,
+      env: { ...process.env, PORT: "0" },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const dec = new TextDecoder();
+    const reader = proc.stdout.getReader();
+    let out = "";
+    const collect = (async () => {
+      while (!out.includes("läuft auf")) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        out += dec.decode(value);
+      }
+    })();
+    await Promise.race([collect, Bun.sleep(8000)]);
+    proc.kill();
+    await proc.exited;
+    return out;
+  }
+
+  test("ohne Sammelverzeichnis: Fehler statt cwd zu raten", () => {
+    const r = runCli(["serve"]);
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("Sammelverzeichnis");
+  });
+
+  test("nicht existierendes Verzeichnis → Fehler", () => {
+    const r = runCli(["serve", join(dir, "gibt-es-nicht")]);
+    expect(r.code).toBe(1);
+  });
+
+  test("leeres Sammelverzeichnis → Startfehler, kein Server der alles 404t", () => {
+    const r = runCli(["serve", dir]);
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("keine Website-Ordner");
+  });
+
+  test("ungültiger Port → Fehler", () => {
+    mkdirSync(join(dir, "kunde-a.test"));
+    makeSite(join(dir, "kunde-a.test"));
+    const r = runCli(["serve", dir, "--port", "abc"]);
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("Port");
+  });
+
+  test("Übersicht nennt Seitenzahl, Editor-Zustand und unerreichbare Ordner", async () => {
+    mkdirSync(join(dir, "kunde-a.test"));
+    makeSite(join(dir, "kunde-a.test"));
+    writeFileSync(join(dir, "kunde-a.test", "impressum.html"), "<html><body><p>x</p></body></html>");
+    mkdirSync(join(dir, "kunde-b.test"));
+    makeSite(join(dir, "kunde-b.test"));
+    mkdirSync(join(dir, "backup_alt"));
+
+    const out = await runServeBriefly([dir], dir);
+    expect(out).toContain("kunde-a.test");
+    expect(out).toContain("2 Seiten");
+    expect(out).toContain("kunde-b.test");
+    // Ohne init: Editor aus, aber kein Fehler.
+    expect(out).toContain("Editor aus");
+    // Unerreichbarer Ordnername wird genannt, nicht verschwiegen.
+    expect(out).toContain("backup_alt");
+    expect(out).toContain("läuft auf");
+  }, 20000);
+});
+
+describe("regoro serve — Argument-Zerlegung", () => {
+  test("ein Verzeichnis, das wie der Portwert heißt, wird nicht verschluckt", () => {
+    // `--port` paarweise herausschneiden, nicht nach Textgleichheit filtern:
+    // sonst fielen hier BEIDE "8080" weg und das Verzeichnis wäre verloren.
+    mkdirSync(join(dir, "8080"));
+    const r = runCli(["serve", "8080", "--port", "8080"]);
+    expect(r.code).toBe(1);
+    // Der Fehler muss der INHALTLICHE sein (leeres Sammelverzeichnis),
+    // nicht "serve braucht das Sammelverzeichnis".
+    expect(r.stderr).toContain("keine Website-Ordner");
+  });
+
+  test("doppeltes --port wird abgelehnt statt still verworfen", () => {
+    const r = runCli(["serve", ".", "--port", "8811", "--port", "8822"]);
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("--port");
+  });
+
+  test("--port ohne Wert wird abgelehnt", () => {
+    const r = runCli(["serve", ".", "--port"]);
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("--port");
+  });
+
+  test("zwei Verzeichnisse sind ein Fehler, kein stilles Ignorieren", () => {
+    mkdirSync(join(dir, "a"));
+    mkdirSync(join(dir, "b"));
+    const r = runCli(["serve", "a", "b"]);
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("zu viele");
+  });
+});

@@ -20,6 +20,8 @@ import {
   type AuthConfig,
 } from "./auth.ts";
 import { renderEditView, renderVersionPreview } from "./serve.ts";
+// PAGE_RE wohnt in sites.ts, damit Whitelist-Erzeugung und Auflösung nicht driften.
+import { PAGE_RE } from "./sites.ts";
 import { applyEdits, setImageSrc, fileSha256, type Edit } from "./apply.ts";
 import { enumerateImages } from "./contract.ts";
 import {
@@ -73,7 +75,6 @@ function hasDotSegment(rel: string): boolean {
   return false;
 }
 
-const PAGE_RE = /^[a-z0-9-]+\.html$/;
 // Nur abgekürzte/volle SHA-Hex-Hashes als git-Ref. Schließt führende "-"
 // (Argument-Injection wie `-f`), symbolische Refs (HEAD/main/Tags → Lesen
 // fremder Branches) und `..`/`@` aus.
@@ -157,7 +158,12 @@ function json(data: unknown, status = 200, extra: Record<string, string> = {}): 
   });
 }
 
-function notFound(): Response {
+/**
+ * 404 mit den Sicherheits-Headern. Exportiert, weil server.ts denselben
+ * Abschluss braucht (Kill-Switch, unbekannter Host) und die Header-Menge nicht
+ * an zwei Stellen auseinanderlaufen darf.
+ */
+export function notFound(): Response {
   return new Response("Not Found", { status: 404, headers: withHeaders() });
 }
 
