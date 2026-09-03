@@ -268,6 +268,20 @@ const STRUKTUR_TAGS = new Set(["HTML", "BODY", "HEAD"]);
 const UNSICHTBAR_STIL = /(?:^|;)\s*(?:display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0(?:\.0*)?)\s*(?:;|$)/i;
 
 /**
+ * Liest ein Attribut ohne Rücksicht auf die Schreibweise. `getAttribute` und die
+ * CSS-Selektoren von linkedom tun das NICHT — siehe die Schleife in
+ * `extrahiereText`. Rückgabe `null` heißt „nicht vorhanden"; ein wertloses
+ * Attribut (`<p hidden>`) liefert den leeren String, nicht `null`.
+ */
+function leseAttribut(el: unknown, name: string): string | null {
+  const attrs = (el as { attributes?: ArrayLike<{ name?: string; value?: string }> }).attributes;
+  for (const a of Array.from(attrs ?? [])) {
+    if ((a.name ?? "").toLowerCase() === name) return a.value ?? "";
+  }
+  return null;
+}
+
+/**
  * Macht aus roher HTML den Text, den der Agent zu sehen bekommt — und entfernt
  * vorher alles, was ein Besucher **nicht** sieht.
  *
@@ -294,35 +308,47 @@ export function extrahiereText(html: string): string {
     // sonst zieht ihn irgendein späterer Schritt doch wieder hervor.
     entferneKommentare(dokument as unknown as Knoten);
 
-    for (const el of dokument.querySelectorAll("[hidden], [aria-hidden]")) {
-      // aria-hidden="false" ist sichtbar; nur die Zusage „für niemanden da" zählt.
-      const versteckt = el.hasAttribute("hidden") || el.getAttribute("aria-hidden") === "true";
-      if (versteckt) el.remove();
-    }
-    for (const el of dokument.querySelectorAll("[style]")) {
-      if (UNSICHTBAR_STIL.test(el.getAttribute("style") ?? "")) el.remove();
-    }
-
-    // Einwilligungsbanner raus. An sechs echten Handwerker-Seiten gemessen: Auf
-    // zweien waren die DREI LÄNGSTEN Textzeilen reiner Cookie-Text — also genau
-    // das, woran ein Modell sich beim Zusammenfassen festhält. Der Agent
-    // recherchierte dann die Einwilligungserklärung eines Mitbewerbers statt
-    // seines Leistungsangebots, und bezahlte die Token dafür.
-    //
-    // Bewusst nur an der Kennung (id/class) und nur an eindeutigen Wörtern und
-    // CMP-Namen: „Datenschutz" steht auch in jeder zweiten Fußzeile und bliebe
-    // deshalb draußen. Zu viel zu entfernen kostet hier nichts an Sicherheit —
-    // die Richtung ist dieselbe wie beim Entfernen unsichtbarer Elemente.
-    for (const el of dokument.querySelectorAll("[id], [class]")) {
-      // <html>, <body> und <head> NIE entfernen, egal was in der Klasse steht.
-      // An 40 echten Seiten gemessen: zwei verloren so die GANZE Seite, weil das
-      // Theme den Einwilligungszustand an die Wurzel schreibt — Enfold setzt
-      // `av-cookies-…` auf <html>, Complianz `cmplz-…` auf <body>. Ein Banner ist
-      // nie das Wurzelelement; ohne diesen Riegel schlägt die Regel vom Aufräumen
-      // in Totalverlust um, und zwar lautlos.
+    // EIN Durchgang über alle Elemente, und die Attribute werden
+    // case-insensitiv gelesen. Grund: linkedom BEWAHRT die Schreibweise des
+    // Quelltexts — `<div HIDDEN>` kommt als Attribut "HIDDEN" an, und ein
+    // CSS-Selektor `[hidden]` trifft es dann NICHT. Gemessen sind so alle fünf
+    // Attribute durchgerutscht, auf denen dieser Filter steht: HIDDEN,
+    // ARIA-HIDDEN, STYLE (und damit die Hauptregel display:none!), CLASS und ID.
+    // Der Browser liest sie case-insensitiv; wer das hier nicht tut, filtert nur
+    // die höfliche Hälfte — und ausgerechnet die Großschreibung nimmt, wer weiß,
+    // dass gefiltert wird.
+    for (const el of dokument.querySelectorAll("*")) {
+      // <html>, <body> und <head> NIE entfernen, egal was in ihren Attributen
+      // steht. An 40 echten Seiten gemessen: zwei verloren so die GANZE Seite,
+      // weil das Theme den Einwilligungszustand an die Wurzel schreibt — Enfold
+      // setzt `av-cookies-…` auf <html>, Complianz `cmplz-…` auf <body>.
       if (STRUKTUR_TAGS.has(el.tagName ?? "")) continue;
-      const kennung = `${el.getAttribute("id") ?? ""} ${el.getAttribute("class") ?? ""}`;
-      if (BANNER_KENNUNG.test(kennung)) el.remove();
+      const attr = (name: string): string | null => leseAttribut(el, name);
+
+      // `hidden` ist ein Attribut OHNE Wert (`<p hidden>`); geprüft wird die
+      // Anwesenheit, nicht der Inhalt.
+      if (attr("hidden") !== null) {
+        el.remove();
+        continue;
+      }
+      // aria-hidden="false" ist sichtbar; nur die Zusage „für niemanden da" zählt.
+      if (attr("aria-hidden") === "true") {
+        el.remove();
+        continue;
+      }
+      if (UNSICHTBAR_STIL.test(attr("style") ?? "")) {
+        el.remove();
+        continue;
+      }
+      // Einwilligungsbanner. An sechs echten Handwerker-Seiten gemessen: Auf
+      // zweien waren die DREI LÄNGSTEN Textzeilen reiner Cookie-Text — also
+      // genau das, woran ein Modell sich beim Zusammenfassen festhält.
+      // Bewusst nur eindeutige Wörter und CMP-Namen, ohne „datenschutz": das
+      // steht in jeder zweiten Fußzeile und risse echten Inhalt mit.
+      if (BANNER_KENNUNG.test(`${attr("id") ?? ""} ${attr("class") ?? ""}`)) {
+        el.remove();
+        continue;
+      }
     }
 
     const titel = (dokument.title ?? "").replace(/\s+/g, " ").trim();
@@ -350,6 +376,12 @@ function rohText(html: string): string {
   return html
     .replace(/<!--[\s\S]*?-->/g, " ")
     .replace(/<(script|style|noscript|template)\b[\s\S]*?<\/\1\s*>/gi, " ")
+    // Auch hier muss `hidden` fallen, sonst ist eine unparsbare Seite der Umweg,
+    // auf dem ein Köder doch beim Modell landet — gemessen an "<<<>>><div
+    // hidden>…". Grob und ohne Verschachtelungswissen: Dieser Weg läuft nur,
+    // wenn der Parser schon aufgegeben hat, und dort ist zu viel zu entfernen
+    // das kleinere Übel.
+    .replace(/<(\w+)\b[^>]*\shidden(?=[\s>=])[^>]*>[\s\S]*?<\/\1\s*>/gi, " ")
     .replace(/<[^>]*>/g, " ")
     .replace(/\s+/g, " ")
     .trim();
