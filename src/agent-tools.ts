@@ -298,3 +298,35 @@ export function erstelleWerkzeuge(u: WerkzeugUmgebung): ToolDefinition[] {
 
 /** Nur für den Systemhinweis: wie viele Dateien ein Lauf höchstens ändern darf. */
 export const DATEI_OBERGRENZE = MAX_DATEIEN_JE_LAUF;
+
+/**
+ * Eine Zeile für die Seitenleiste: „schreibt leistungen.html".
+ *
+ * Steht HIER und nicht im Worker, obwohl nur der Worker sie beim Laufen ruft:
+ * Der gespeicherte Verlauf enthält dieselben Werkzeugaufrufe und muss sie mit
+ * denselben Worten anzeigen. Zwei Fassungen wären zwei Wahrheiten — der Kunde
+ * läse für denselben Vorgang live etwas anderes als beim Nachlesen. Und die
+ * Namen, die hier abgefragt werden, sind genau die, die diese Datei vergibt.
+ */
+export function kurzfassung(name: string, args: unknown): string {
+  const a = (args ?? {}) as Record<string, unknown>;
+  const pfad = typeof a.path === "string" ? a.path : "";
+  switch (name) {
+    case "write_file":
+      return `schreibt ${pfad}`;
+    case "edit_file":
+      return `ändert ${pfad}`;
+    case "read_file":
+      return `liest ${pfad}`;
+    case "list_files":
+      return `sieht sich ${pfad || "die Website"} an`;
+    case "web_search":
+      return `sucht nach „${typeof a.query === "string" ? a.query : ""}“`;
+    case "fetch_page":
+      return `liest ${typeof a.url === "string" ? a.url : "eine Seite"}`;
+    case "call_api":
+      return `ruft ${typeof a.integration === "string" ? a.integration : "einen Dienst"} auf`;
+    default:
+      return name;
+  }
+}

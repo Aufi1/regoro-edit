@@ -322,9 +322,54 @@ Zwei Fallstricke rund um das Profil:
 sind — **niemals den Schlüssel selbst**, auch nicht gekürzt. `regoro ki --off`
 entfernt den Zugang und schaltet die Seitenleiste bei **allen** Kunden ab.
 
+### Gespräche
+
+Der Agent erinnert sich. Jeder Auftrag landet in einem Gesprächsverlauf, und ein
+Folgeauftrag („lieber als eigene Seite, mit mehr Inhalt") trifft einen Agenten,
+der die Vorseite und den vorigen Wunsch kennt.
+
+- **Beim Öffnen** steht das laufende Gespräch wieder da — ein Neuladen der Seite
+  löscht es nicht mehr. Ältere Beiträge lädt die Leiste beim Hochscrollen nach.
+- **Nach 24 Stunden Ruhe** beginnt ein neues Gespräch. Der alte Verlauf bleibt
+  erhalten und lässt sich über **„Gespräche"** oben rechts wieder aufnehmen;
+  automatisch fortgesetzt wird er nicht.
+- **„Neues Gespräch"** in derselben Liste beginnt bewusst von vorn — nützlich,
+  wenn das nächste Thema mit dem bisherigen nichts zu tun hat.
+- **Nach 30 Tagen ohne Änderung** wird ein Verlauf gelöscht.
+
+Die Verläufe liegen pro Website in `.regoro/verlauf/` — gitignored, nie
+ausgeliefert, und sie enthalten wörtlich, was der Kunde geschrieben hat. Beim
+Sichern eines Kundenordners gehören sie zu den Kundendaten.
+
+> **`regoro disable` löscht sie mit** — schon ohne `--purge`, denn es entfernt
+> das ganze `.regoro/`. Die Website und die Versionshistorie bleiben unberührt,
+> die Gespräche nicht. Der Befehl sagt es beim Abschalten dazu und nennt die
+> Anzahl; wer sie behalten will, sichert `.regoro/verlauf/` vorher weg.
+
+### Kontextfenster und Verdichtung
+
+Wie viel Gespräch der Agent gleichzeitig im Kopf behält, bestimmt das
+Kontextfenster des Modells. Regoro **fragt es beim Anbieter ab** (`GET
+<baseUrl>/models`) statt es zu raten — einmal je Modell, danach für Stunden
+gemerkt. Antwortet der Anbieter nicht oder kennt er die Route nicht, gelten
+128.000 Token und der Lauf startet trotzdem.
+
+Dieselbe Abfrage liefert, wie lang **eine einzelne Antwort** sein darf. Regoro
+verlangt bis zu 150.000 Token, gedeckelt durch das, was der Anbieter zulässt
+(bei `glm-5.3-flash` sind das 131.072). Das ist bewusst reichlich: Der Deckel
+soll das Modell nicht formen, sondern nur einen Ausreißer begrenzen — die
+Argumente eines Werkzeugaufrufs zählen mit, eine neu geschriebene Seite geht also
+vollständig durch diese Grenze.
+
+Ist das Fenster voll, verdichtet der Agent das Gespräch selbst: Er fasst den
+älteren Teil zusammen und arbeitet damit weiter. Das kostet einen zusätzlichen
+Modellaufruf, wird aber **nicht** ins Monatskontingent gebucht — der Deckel ist
+gegen einen Agenten gedacht, der sich verrennt, nicht gegen einen Kunden, der
+lange redet.
+
 ### Kontingent
 
-Jede Website hat ein Monatskontingent von 200.000 Token; es setzt sich am
+Jede Website hat ein Monatskontingent von 1.000.000 Token; es setzt sich am
 Monatsersten zurück. Ist es aufgebraucht, sagt die Seitenleiste das und nimmt
 keine Aufträge mehr an. Das Kontingent liegt pro Site in
 `.regoro/kontingent.json` und begrenzt vor allem einen Agenten, der sich
@@ -333,8 +378,9 @@ verrennt.
 ### Modellwahl
 
 `baseUrl`, `model` und Schlüssel stehen betreiberweit in `/etc/regoro/ki.json`.
-Voreinstellung ist OpenRouter mit `z-ai/glm-5.3-flash` — bei 200.000 Token im
-Monat rund **zwei Cent je Website**. Jeder OpenAI-kompatible Anbieter tut es;
+Voreinstellung ist OpenRouter mit `z-ai/glm-5.3-flash` — bei 1.000.000 Token im
+Monat grob **8 bis 25 Cent je Website**, je nachdem, wie sich Ein- und Ausgabe
+verteilen (0,075 / 0,250 $ je Million). Jeder OpenAI-kompatible Anbieter tut es;
 ein Wechsel ist ein Konfigurationseintrag, kein Umbau:
 
 ```bash

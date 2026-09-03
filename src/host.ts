@@ -22,7 +22,7 @@ import {
 import { maskiereKennung, normalisiereKennung, type Kanal } from "./kennung.ts";
 import { erzeugeCode, merkeCode, pruefeCode } from "./codes.ts";
 import { entsperreKennung, pruefeBremse, wartezeitText } from "./bremse.ts";
-import { leseVerlauf, listeVerlaeufe } from "./verlauf.ts";
+import { leseNachrichten, listeVerlaeufe, waehleFortsetzung, NACHRICHTEN_JE_SEITE } from "./verlauf.ts";
 import type { Versand } from "./versand.ts";
 import type { KiConfig } from "./betreiber-config.ts";
 import { renderEditView, renderVersionPreview } from "./serve.ts";
@@ -659,14 +659,21 @@ async function route(
     // hin und nicht zu den View-Routen: Ohne den Auth-Gate könnte ein Fremder
     // einen Agentenlauf auslösen — der kostet Token und schreibt in die Website.
     // Unangemeldet also 404 (nicht 401), wie bei jeder anderen API-Route.
-    // WER HIER EINE ROUTE ERGÄNZT, MUSS SIE AUCH IN DIESE AUFZÄHLUNG SCHREIBEN.
-    // `verlauf`/`verlaeufe` fehlten: Sie waren damit nie API-Route, fielen bis
-    // zum statischen Zweig durch und gaben IMMER 404 — auch angemeldet. Der
-    // Gesprächsverlauf war dadurch wirkungslos, ohne dass etwas rot wurde.
+    // ACHTUNG beim Ergänzen: Diese Liste ist die Auth-Wand. Eine Route, die
+    // unten in `handleEditorRequest` steht, hier aber fehlt, wird NIE erreicht —
+    // sie fällt durch bis zum statischen Ausliefern und antwortet 404, auch
+    // angemeldet. Genau so lagen `/edit/agent/verlaeufe` und `/edit/agent/verlauf`
+    // tot da, der Gesprächsverlauf war wirkungslos, und nichts wurde rot.
     //
-    // Die Handprüfung bestätigte den Fehler sogar: unangemeldet geben diese
-    // Routen ohnehin 404, das erwartete Ergebnis kam also aus dem falschen
-    // Grund. Deshalb prüft `agent-routes.test.ts` sie jetzt ANGEMELDET.
+    // Kein Test schlug an, weil nur „unangemeldet → 404" geprüft wurde: Das
+    // stimmte, aber aus dem falschen Grund — eine Route, die es gar nicht gibt,
+    // antwortet genauso. Auch die Handprüfung bestätigte den Fehler aus
+    // demselben falschen Grund. Jede Route hier gehört deshalb AUCH in eine
+    // Prüfung, die sie ANGEMELDET mit ihrem echten Statuscode sieht
+    // (`ERREICHBAR` in `agent-routes.test.ts`).
+    //
+    // Zwei Zweige haben diesen Fehler unabhängig gefunden und gleich behoben;
+    // hier stehen beide Begründungen zusammengeführt.
     /^\/edit\/agent(\/(events|abort|status|verlauf|verlaeufe))?$/.test(path) ||
     /^\/edit\/version\/[^/]+$/.test(path);
   if (isApiRoute) {
@@ -685,7 +692,7 @@ async function route(
       if (path === "/edit/agent" && method === "POST") return handleAgentStart(req, ctx);
       if (path === "/edit/agent/status" && method === "GET") return handleAgentStatus(ctx);
       if (path === "/edit/agent/verlaeufe" && method === "GET") return handleAgentVerlaeufe(ctx);
-      if (path === "/edit/agent/verlauf" && method === "GET") return handleAgentVerlauf(req, ctx);
+      if (path === "/edit/agent/verlauf" && method === "GET") return handleAgentVerlauf(url, ctx);
       if (path === "/edit/agent/abort" && method === "POST") return handleAgentAbort(ctx);
       if (path === "/edit/agent/events" && method === "GET") return handleAgentEvents(req, ctx, srv);
       return notFound();
@@ -934,6 +941,9 @@ async function handleRestore(req: Request, ctx: HostCtx): Promise<Response> {
  */
 const MAX_AUFTRAG_ZEICHEN = 4000;
 
+/** Obergrenze für die Gesprächskennung im Auftrag. Eine UUID ist 36 Zeichen. */
+const MAX_VERLAUF_KENNUNG = 200;
+
 /**
  * Die technischen Ablehnungen beim Übernehmen. `agent.ts` baut sie als
  * `<grund>:<pfad>`; der Pfad ist für den Betreiber gedacht, nicht für den Kunden.
@@ -1085,8 +1095,14 @@ function istEigenerKlartext(s: string): boolean {
  */
 async function handleAgentVerlaeufe(ctx: HostCtx): Promise<Response> {
   const alle = await listeVerlaeufe(ctx.siteDir);
+  // Welches Gespräch ein Auftrag OHNE Angabe fortsetzen würde. Der Browser
+  // rechnet die 24-Stunden-Regel nicht nach — täte er es, gäbe es sie zweimal,
+  // und die Leiste zeigte irgendwann ein anderes Gespräch an als das, in das
+  // der nächste Auftrag liefe.
+  const fortsetzung = await waehleFortsetzung(ctx.siteDir);
   return Response.json({
     ok: true,
+    fortsetzbar: fortsetzung ? fortsetzung.id : null,
     verlaeufe: alle.map((v) => ({
       id: v.id,
       titel: v.titel,
@@ -1097,23 +1113,38 @@ async function handleAgentVerlaeufe(ctx: HostCtx): Promise<Response> {
 }
 
 /**
- * Ein einzelner Verlauf mit seinen Nachrichten.
+ * Ein Gespräch zum Nachlesen, seitenweise von hinten.
  *
- * Damit überlebt das Gespräch den SEITENWECHSEL: Der Editor läuft auf jeder
- * Seite der Website neu an, das Panel-DOM ist dann leer — der Lauf und der
- * Verlauf hängen aber am Site-Ordner, nicht an der Seite. Ohne diese Route sah
- * der Kunde beim Wechsel ein leeres Fenster und die Meldung „Es läuft bereits
- * ein Auftrag", als wäre er bei etwas Fremdem gelandet.
+ * `id` ist eine Kennung aus der Liste, KEIN Pfad — `leseNachrichten` sucht sie
+ * im Verzeichnis dieser Website und kommt nie auf eine Datei, die nicht ohnehin
+ * dazugehört. Eine unbekannte Kennung ist 404, nicht 400: Nach dem Aufräumen
+ * (30 Tage) ist genau das der Normalfall, und für den Browser ist beides
+ * dasselbe — er beginnt ein neues Gespräch.
  *
- * Ohne `id` kommt der aktuelle (jüngster innerhalb der 24-Stunden-Frist). Ein
- * fremder Bezeichner liefert eine leere Antwort, nie den Verlauf einer anderen
- * Website — gesucht wird ausschließlich im Ordner dieser Site.
+ * Der Text ist wörtlich, was der Kunde geschrieben und das Modell geantwortet
+ * hat. Er geht als JSON hinaus und wird im Overlay per `textContent` gesetzt,
+ * nie als HTML — wie die Titel in der Liste.
  */
-async function handleAgentVerlauf(req: Request, ctx: HostCtx): Promise<Response> {
-  const id = new URL(req.url).searchParams.get("id");
-  const v = await leseVerlauf(ctx.siteDir, id);
-  if (!v) return Response.json({ ok: true, id: null, nachrichten: [] });
-  return Response.json({ ok: true, id: v.id, nachrichten: v.nachrichten });
+async function handleAgentVerlauf(url: URL, ctx: HostCtx): Promise<Response> {
+  const id = url.searchParams.get("id") ?? "";
+  if (id === "") return json({ ok: false, grund: "Kennung fehlt." }, 400);
+  // Dieselbe Grenze wie beim Auftrag. Nicht ausnutzbar (es folgt nur ein
+  // Zeichenkettenvergleich), aber zwei Wege in dieselbe Funktion sollen nicht
+  // verschieden streng sein — sonst rät beim nächsten Mal jemand, welcher gilt.
+  if (id.length > MAX_VERLAUF_KENNUNG) {
+    return json({ ok: false, grund: "Ungültige Gesprächskennung." }, 400);
+  }
+
+  const vorRoh = url.searchParams.get("vor");
+  const anzahlRoh = url.searchParams.get("anzahl");
+  const seite = await leseNachrichten(ctx.siteDir, id, {
+    // `Number("")` ist 0 und wäre eine leere Seite — deshalb erst prüfen, dann
+    // umwandeln. Unsinnige Werte klammert `leseNachrichten` selbst.
+    vor: vorRoh === null || vorRoh === "" ? null : Number(vorRoh),
+    anzahl: anzahlRoh === null || anzahlRoh === "" ? NACHRICHTEN_JE_SEITE : Number(anzahlRoh),
+  });
+  if (!seite) return json({ ok: false, grund: "Dieses Gespräch gibt es nicht mehr." }, 404);
+  return Response.json({ ok: true, ...seite });
 }
 
 async function handleAgentStart(req: Request, ctx: HostCtx): Promise<Response> {
@@ -1134,7 +1165,23 @@ async function handleAgentStart(req: Request, ctx: HostCtx): Promise<Response> {
     );
   }
 
-  const start = starteLauf(ctx, auftrag);
+  /**
+   * Welches Gespräch fortgesetzt wird. Drei Werte: `"auto"` (Vorgabe, der
+   * Server wendet die 24-Stunden-Regel an), `"neu"`, oder eine Kennung aus
+   * `GET /edit/agent/verlaeufe`.
+   *
+   * Eine unbekannte Kennung ist KEIN Fehler — sie beginnt ein neues Gespräch
+   * (Begründung in `verlauf.ts`). Geprüft wird nur die Länge: Kennungen sind
+   * UUIDs, alles darüber ist niemals eine und hat im Vergleich nichts zu
+   * suchen.
+   */
+  const verlaufRoh = typeof body.verlauf === "string" ? body.verlauf.trim() : "auto";
+  if (verlaufRoh.length > MAX_VERLAUF_KENNUNG) {
+    return json({ ok: false, grund: "Ungültige Gesprächskennung." }, 400);
+  }
+  const verlauf = verlaufRoh === "" ? "auto" : verlaufRoh;
+
+  const start = starteLauf(ctx, auftrag, { verlauf });
   if (start.ok) return json({ ok: true, laufId: start.laufId });
 
   switch (start.grund) {

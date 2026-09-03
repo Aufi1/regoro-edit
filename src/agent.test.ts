@@ -25,6 +25,9 @@ import { brichAb, ereignisse, laufAktiv, starteLauf, type AgentEreignis } from "
 import { pruefeKontingent, verbucheTokens, TOKEN_KONTINGENT } from "./kontingent.ts";
 import { startServer } from "./server.ts";
 import { attrappenVersand } from "./versand.ts";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { verlaufDir } from "./verlauf.ts";
+import { STANDARD_CONTEXT_WINDOW, leereModellCache } from "./modell-info.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
 const REAL_SITE = join(REPO_ROOT, "examples", "site");
@@ -508,5 +511,141 @@ describe("Serverneustart während eines Laufs", () => {
     expect(existsSync(verwaist)).toBe(false);
     // Nur `lauf-*` — RUNTIME_DIRECTORY kann in Produktion noch anderes tragen.
     expect(existsSync(fremd)).toBe(true);
+  });
+});
+
+
+// ===========================================================================
+// Welches Gespräch fortgesetzt wird — bis zum Arbeiter durchgereicht
+//
+// GEPRÜFT WIRD DIE KETTE, NICHT DIE REGEL. Dass `waehleFortsetzung` richtig
+// wählt, steht in `verlauf.test.ts`. Hier geht es um die Verdrahtung dahinter:
+// `StartOptionen.verlauf` → `bereiteSitzungVor` → `REGORO_SITZUNG_DATEI` in der
+// Umgebung des Arbeiters. Genau dieses Stück fehlte einmal ganz — die Option
+// war angelegt und im Lauf benutzt, aber `handleAgentStart` las das Feld nie
+// aus dem Rumpf. Alle Einzelteile waren grün.
+//
+// Die Attrappe `umgebung-melden` schickt ihre volle Umgebung als Text zurück;
+// daran lässt sich die Kette am Ende ablesen, statt sie zu vermuten.
+// ===========================================================================
+describe("die Gesprächswahl erreicht den Arbeiter", () => {
+  /** Legt einen echten Verlauf im Kundenordner an und liefert Kennung + Datei. */
+  function legeVerlaufAn(auftrag: string): { id: string; datei: string } {
+    const sm = SessionManager.create(tmp("regoro-agent-cwd-"), verlaufDir(siteDir));
+    sm.appendMessage({ role: "user", content: auftrag } as never);
+    sm.appendMessage({ role: "assistant", content: "erledigt" } as never);
+    return { id: sm.getSessionId(), datei: sm.getSessionFile() ?? "" };
+  }
+
+  /** Fährt einen Lauf mit `umgebung-melden` und liefert die gemeldete Umgebung. */
+  async function umgebungAus(verlauf?: string): Promise<Record<string, string>> {
+    starteLauf(ctx, "umgebung-melden", {
+      workerBefehl: [process.execPath, "run", ATTRAPPE],
+      ...(verlauf === undefined ? {} : { verlauf }),
+    });
+    const alle = await sammle();
+    const text = alle
+      .filter((e): e is Extract<AgentEreignis, { t: "text" }> => e.t === "text")
+      .map((e) => e.inhalt)
+      .join("");
+    return (JSON.parse(text) as { env: Record<string, string> }).env;
+  }
+
+  test.skipIf(!haveBwrap())("eine gewählte Kennung landet als Sitzungsdatei beim Arbeiter", async () => {
+    const alt = legeVerlaufAn("das alte Gespräch");
+    await Bun.sleep(5);
+    legeVerlaufAn("das jüngere Gespräch");
+
+    const env = await umgebungAus(alt.id);
+    const datei = env.REGORO_SITZUNG_DATEI ?? "";
+    // Der Name der Sitzungsdatei trägt die Kennung — sie ist der Beweis, dass
+    // der ALTE Verlauf mitgegeben wurde und nicht der jüngere.
+    expect(datei).toContain(alt.id);
+    // Und sie liegt in der Arbeitskopie, nicht im Kundenordner: Die Sandbox hat
+    // genau EINEN beschreibbaren Pfad (Invariante 11).
+    expect(datei.startsWith(siteDir)).toBe(false);
+  }, 30_000);
+
+  test.skipIf(!haveBwrap())('"neu" gibt dem Arbeiter KEINE Sitzungsdatei mit', async () => {
+    legeVerlaufAn("ein frisches Gespräch");
+    const env = await umgebungAus("neu");
+    expect(env.REGORO_SITZUNG_DATEI ?? "").toBe("");
+  }, 30_000);
+
+  test.skipIf(!haveBwrap())("Gegenprobe: ohne Angabe wird der frische Verlauf fortgesetzt", async () => {
+    // OHNE DIESE GEGENPROBE beweist der Test darüber nichts: Eine Verdrahtung,
+    // die NIE eine Sitzungsdatei mitgibt, wäre dort ebenfalls grün — und das
+    // Gedächtnis des Agenten still verloren.
+    const frisch = legeVerlaufAn("ein frisches Gespräch");
+    const env = await umgebungAus();
+    expect(env.REGORO_SITZUNG_DATEI ?? "").toContain(frisch.id);
+  }, 30_000);
+});
+
+
+// ===========================================================================
+// Das Kontextfenster erreicht den Arbeiter
+//
+// Dass `modell-info.ts` die richtige Zahl aus einer Anbieterantwort fischt,
+// steht in `modell-info.test.ts`. Hier geht es um das Stück dahinter: dass sie
+// bis in die Umgebung des Arbeiters durchkommt. Genau dieses Stück fehlte bei
+// der Gesprächswahl schon einmal ganz, während alle Einzelteile grün waren.
+// ===========================================================================
+describe("das Kontextfenster erreicht den Arbeiter", () => {
+  /** Ein Anbieter, der für `modell` ein Kontextfenster meldet. */
+  function anbieter(modell: string, fenster: number): string {
+    const s = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(req) {
+        if (!new URL(req.url).pathname.endsWith("/models")) return new Response("nein", { status: 404 });
+        return Response.json({
+          data: [{ id: modell, top_provider: { context_length: fenster, max_completion_tokens: 131_072 } }],
+        });
+      },
+    });
+    anbieterServer.push(s);
+    return `http://127.0.0.1:${s.port}/v1`;
+  }
+  const anbieterServer: { stop(): void }[] = [];
+
+  afterAll(() => {
+    for (const s of anbieterServer) s.stop();
+  });
+
+  async function umgebungMit(kiConfig: HostCtx["ki"]): Promise<Record<string, string>> {
+    leereModellCache();
+    const eigenerCtx = { ...ctx, ki: kiConfig };
+    starteLauf(eigenerCtx as HostCtx, "umgebung-melden", {
+      workerBefehl: [process.execPath, "run", ATTRAPPE],
+    });
+    const alle = await sammle();
+    const text = alle
+      .filter((e): e is Extract<AgentEreignis, { t: "text" }> => e.t === "text")
+      .map((e) => e.inhalt)
+      .join("");
+    return (JSON.parse(text) as { env: Record<string, string> }).env;
+  }
+
+  test.skipIf(!haveBwrap())("die gemeldeten Zahlen landen in der Umgebung", async () => {
+    const modell = "test/grosses-modell";
+    const env = await umgebungMit({ ...KI, baseUrl: anbieter(modell, 1_048_576), model: modell });
+    expect(env.REGORO_CONTEXT_WINDOW).toBe("1048576");
+    // Der Anbieter meldet 131.072 als Ausgabemaximum — weniger als unser
+    // Wunsch, also gewinnt er.
+    expect(env.REGORO_MAX_TOKENS).toBe("131072");
+  }, 30_000);
+
+  test.skipIf(!haveBwrap())("ein toter Anbieter gibt den Vorgabewert — der Lauf startet trotzdem", async () => {
+    // Die Abfrage ist eine Stellschraube, keine Voraussetzung. Ein Anbieter
+    // ohne `/models` darf keinen Auftrag verhindern.
+    const env = await umgebungMit({ ...KI, baseUrl: "http://127.0.0.1:1/v1" });
+    expect(env.REGORO_CONTEXT_WINDOW).toBe(String(STANDARD_CONTEXT_WINDOW));
+  }, 30_000);
+
+  test.skipIf(!haveBwrap())("Gegenprobe: die beiden Werte sind wirklich verschieden", () => {
+    // Ohne sie wären beide Prüfungen oben auch dann grün, wenn die Umgebung
+    // IMMER denselben Wert trüge und die Abfrage gar nichts bewirkte.
+    expect(String(STANDARD_CONTEXT_WINDOW)).not.toBe("1048576");
   });
 });

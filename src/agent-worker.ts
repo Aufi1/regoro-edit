@@ -24,7 +24,7 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
-import { erstelleWerkzeuge, WERKZEUG_NAMEN, type IntegrationHinweis } from "./agent-tools.ts";
+import { erstelleWerkzeuge, kurzfassung, WERKZEUG_NAMEN, type IntegrationHinweis } from "./agent-tools.ts";
 
 /**
  * Die eingebauten Werkzeuge von pi, vollständig. `noTools: "builtin"` nimmt sie
@@ -220,8 +220,33 @@ export async function runWorker(): Promise<void> {
         reasoning: true,
         input: ["text"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 128_000,
-        maxTokens: 16_384,
+        /**
+         * Vom ELTERNPROZESS erfragt, nicht hier geraten.
+         *
+         * `allowModelNetwork: false` oben ist richtig — der Arbeiter hat kein
+         * Netz (Invariante 11) und darf pi nicht beim Anbieter nachfragen
+         * lassen. Also stand hier jahrelang eine feste 128.000, während das
+         * eingestellte Modell zehnmal so viel konnte: pi verdichtete ab 111.616
+         * Token mitten in großen Aufträgen, jede Verdichtung ein zusätzlicher
+         * abrechenbarer Modellaufruf, und `keepRecentTokens` warf dabei fast
+         * das ganze Gespräch weg. Begründung und Messung: `modell-info.ts`.
+         *
+         * Fehlt die Variable (älterer Elternprozess, Test ohne sie), gilt
+         * wieder der alte Wert — nie 0, denn das hieße „verdichte sofort und
+         * immer".
+         */
+        contextWindow: Number(process.env.REGORO_CONTEXT_WINDOW) || 128_000,
+        /**
+         * Wie lang EINE Antwort sein darf — ebenfalls vom Elternprozess.
+         *
+         * Auf der Leitung nachgemessen: Dieser Wert geht als
+         * `max_completion_tokens` wirklich an den Anbieter. 16.384 standen hier
+         * fest und waren an zwei Stellen zugleich zu knapp — Werkzeug-Argumente
+         * sind Ausgabe (`write_file` übergibt die ganze Datei, 16.384 Token
+         * sind grob 55–60 KB HTML), und pi stutzt das Denk-Budget auf denselben
+         * Deckel zurecht. Begründung und Messung: `modell-info.ts`.
+         */
+        maxTokens: Number(process.env.REGORO_MAX_TOKENS) || 16_384,
       },
     ],
   });
@@ -411,30 +436,6 @@ function modellFehlerAus(session: { state: { messages: unknown[] } }): string | 
     return m.errorMessage ?? "Der Modellzugang antwortete nicht.";
   }
   return null;
-}
-
-/** Eine Zeile für die Seitenleiste: „schreibt leistungen.html". */
-function kurzfassung(name: string, args: unknown): string {
-  const a = (args ?? {}) as Record<string, unknown>;
-  const pfad = typeof a.path === "string" ? a.path : "";
-  switch (name) {
-    case "write_file":
-      return `schreibt ${pfad}`;
-    case "edit_file":
-      return `ändert ${pfad}`;
-    case "read_file":
-      return `liest ${pfad}`;
-    case "list_files":
-      return `sieht sich ${pfad || "die Website"} an`;
-    case "web_search":
-      return `sucht nach „${typeof a.query === "string" ? a.query : ""}“`;
-    case "fetch_page":
-      return `liest ${typeof a.url === "string" ? a.url : "eine Seite"}`;
-    case "call_api":
-      return `ruft ${typeof a.integration === "string" ? a.integration : "einen Dienst"} auf`;
-    default:
-      return name;
-  }
 }
 
 /** Die letzte Textantwort des Modells — sie ist die Zusammenfassung für den Kunden. */

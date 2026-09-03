@@ -40,8 +40,9 @@ import {
   raeumeAlteVerlaeufe,
   sitzungDirInKopie,
   uebernimmSitzung,
-  waehleFortsetzung,
+  waehleAus,
 } from "./verlauf.ts";
+import { ermittleModellGrenzen, type ModellGrenzen } from "./modell-info.ts";
 import { pruefeKontingent, verbucheTokens } from "./kontingent.ts";
 import { validateAgentOutput } from "./validate.ts";
 import { alleBrowserHerkuenfte, loadIntegrationen } from "./integrationen.ts";
@@ -69,6 +70,15 @@ export type StartOptionen = {
   workerBefehl?: string[];
   /** Sammelverzeichnis, damit die Sandbox die anderen Kunden zudecken kann. */
   sitesRoot?: string | null;
+  /**
+   * Welches Gespräch fortgesetzt wird: `"auto"` (24-Stunden-Regel), `"neu"`
+   * oder die Kennung eines Verlaufs aus `GET /edit/agent/verlaeufe`.
+   *
+   * Fehlt das Feld, gilt `"auto"` — das ist das Verhalten von vor der
+   * Gesprächsliste und bleibt der Vorgabefall für jeden Aufrufer, der von ihr
+   * nichts weiß.
+   */
+  verlauf?: string | null;
 };
 
 /** Höchstens so viele Ereignisse werden für einen Neuverbinder aufgehoben (§13.14). */
@@ -299,15 +309,33 @@ async function fuehreAus(ctx: HostCtx, auftrag: string, opts: StartOptionen, lau
      * einen Auftrag nicht verhindern, er beginnt dann eben neu.
      */
     try {
-      raeumeAlteVerlaeufe(ctx.siteDir);
-      sitzungDatei = bereiteSitzungVor(kopie, await waehleFortsetzung(ctx.siteDir));
+      // EINMAL lesen, beides damit erledigen: `listeVerlaeufe` liest jede
+      // Sitzungsdatei ganz ein, und Aufräumen und Auswahl brauchen dieselbe
+      // Liste. Zweimal zu holen hieße, bei einem Kunden mit vielen Gesprächen
+      // alles doppelt zu lesen, bevor der Lauf überhaupt beginnt.
+      const { uebrig } = await raeumeAlteVerlaeufe(ctx.siteDir);
+      sitzungDatei = bereiteSitzungVor(
+        kopie,
+        waehleAus(uebrig, Date.now(), opts.verlauf ?? "auto"),
+      );
     } catch (err) {
       process.stderr.write(`[agent] Verlauf nicht vorbereitet: ${String(err)}\n`);
     }
 
+    /**
+     * Erfragen, was das Modell darf — Kontextfenster und Ausgabedeckel.
+     *
+     * Vor dem Relay und vor dem Arbeiter: Der Elternprozess darf ins Netz, der
+     * Arbeiter nicht (Invariante 11). Scheitert die Abfrage, gelten die
+     * Vorgabewerte — sie ist eine Stellschraube, keine Voraussetzung, und darf
+     * einen Auftrag nie verhindern. Das Ergebnis wird je Modell für Stunden
+     * gemerkt, ein Lauf wartet also im Regelfall auf gar nichts.
+     */
+    const grenzen = await ermittleModellGrenzen(ki);
+
     relay = starteRelay(ki, integrationen);
 
-    const ergebnis = await begleiteWorker(ctx, auftrag, opts, lauf, kopie, relay.port, ki, integrationen, kontingent.frei, sitzungDatei);
+    const ergebnis = await begleiteWorker(ctx, auftrag, opts, lauf, kopie, relay.port, ki, integrationen, kontingent.frei, sitzungDatei, grenzen);
     geseheneTokens = ergebnis.tokens;
 
     if (!ergebnis.sauberFertig) {
@@ -396,6 +424,7 @@ async function begleiteWorker(
   integrationen: ReturnType<typeof loadIntegrationen>,
   freiesKontingent: number,
   sitzungDatei: string | null,
+  grenzen: ModellGrenzen,
 ): Promise<WorkerErgebnis> {
   const skills = process.env.REGORO_SKILLS || null;
   const befehl = opts.workerBefehl ?? standardWorkerBefehl();
@@ -419,7 +448,7 @@ async function begleiteWorker(
     // OpenRouter-Schlüssel ein: Erbte der Worker HTTP_PROXY, gelänge ein
     // Modellaufruf AM RELAY VORBEI — und ein kaputtes Relay fiele niemandem auf,
     // weil weiterhin alles funktionierte.
-    env: workerUmgebung(auftrag, kopie, skills, relayPort, ki, integrationen, freiesKontingent, sitzungDatei),
+    env: workerUmgebung(auftrag, kopie, skills, relayPort, ki, integrationen, freiesKontingent, sitzungDatei, grenzen),
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
@@ -682,6 +711,7 @@ function workerUmgebung(
   integrationen: ReturnType<typeof loadIntegrationen>,
   freiesKontingent: number,
   sitzungDatei: string | null,
+  grenzen: ModellGrenzen,
 ): Record<string, string> {
   // pi schriebe sonst nach ~/.pi/agent/: Sitzungen samt vollem Kundenauftrag
   // und einen Auth-Speicher. Beides zeigt in die Arbeitskopie, die mit dem Lauf
@@ -714,6 +744,9 @@ function workerUmgebung(
     // Begründung in `verlauf.ts`). Leerer Dateiname heißt „neuer Verlauf".
     REGORO_SITZUNG_DIR: sitzungDirInKopie(kopie),
     REGORO_SITZUNG_DATEI: sitzungDatei ?? "",
+    // Beim Anbieter erfragt, nicht geraten — siehe `modell-info.ts`.
+    REGORO_CONTEXT_WINDOW: String(grenzen.contextWindow),
+    REGORO_MAX_TOKENS: String(grenzen.maxTokens),
   };
 }
 
