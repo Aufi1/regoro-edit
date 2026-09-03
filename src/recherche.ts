@@ -425,8 +425,19 @@ interface BraveTreffer {
  * Netzwerkzeug geworden und Invariante 11 gebrochen. Der Agent liefert `frage`,
  * sonst nichts. Vorbild: `sevenioVersand(konfig, basis)` in `versand.ts`.
  */
-export async function sucheImNetz(frage: string, braveKey: string, basis = BRAVE_BASIS): Promise<string> {
-  if (typeof braveKey !== "string" || braveKey.trim() === "") {
+export async function sucheImNetz(
+  frage: string,
+  braveKey: string | null,
+  basis = BRAVE_BASIS,
+): Promise<string> {
+  // NUR `null` schaltet die Funktion ab. Der leere String ist ein gültiger Wert
+  // und heißt „der Schlüssel kommt von außen" — ein ausgehender Proxy hängt die
+  // Anmeldung an. Ihn hier mit abzuweisen machte den Lader-Fix, der `""` heil
+  // durchlässt, end-to-end wirkungslos: Der Wert käme an und stürbe hier.
+  // Dieselbe Regel wie in `holeSeite` hundert Zeilen weiter oben — zwei
+  // benachbarte Stellen dürfen für denselben leeren String nicht verschiedene
+  // Bedeutungen führen.
+  if (typeof braveKey !== "string") {
     throw new Error("Für diesen Server ist keine Websuche eingerichtet.");
   }
   const gekuerzt = frage.trim().slice(0, MAX_FRAGE_ZEICHEN);
@@ -450,7 +461,11 @@ export async function sucheImNetz(frage: string, braveKey: string, basis = BRAVE
     antwort = await fetch(`${basis.replace(/\/+$/, "")}/res/v1/web/search?${abfrage}`, {
       headers: {
         // Brave nennt den Kopf genau so; ein Bearer-Header wird ignoriert.
-        "X-Subscription-Token": braveKey,
+        // Nur wenn ein Schlüssel da ist. Ein leerer Token-Kopf wäre schlimmer als
+        // keiner — Brave lehnte damit ab, statt den vom Proxy eingesetzten
+        // Schlüssel gelten zu lassen. Gleiche Bauart wie beim Modellschlüssel im
+        // Relay und beim Firecrawl-Schlüssel oben.
+        ...(braveKey === "" ? {} : { "X-Subscription-Token": braveKey }),
         Accept: "application/json",
         "User-Agent": RECHERCHE_UA,
       },
