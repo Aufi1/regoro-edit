@@ -185,7 +185,10 @@ describe.skipIf(!haveBwrap())("das Worker-Protokoll", () => {
      * deshalb sauber — „nicht eingerichtet" gegen „private Adresse gesperrt" —,
      * ohne dass je eine Anfrage hinausgeht.
      */
-    async function frage(art: "frage-abruf" | "frage-suche", kiTeil: Partial<KiConfig>): Promise<string> {
+    async function frage(
+      art: "frage-abruf" | "frage-suche" | "frage-suche-leer",
+      kiTeil: Partial<KiConfig>,
+    ): Promise<string> {
       ctx = { ...ctx, ki: { ...KI, ...kiTeil } };
       expect(start(art).ok).toBe(true);
       const e = await sammle();
@@ -225,8 +228,48 @@ describe.skipIf(!haveBwrap())("das Worker-Protokoll", () => {
     test("ohne Brave-Schlüssel wird gar nicht erst gesucht", async () => {
       // Derselbe Schnitt für den anderen Weg. Fail-closed heißt hier: nicht
       // suchen, statt ersatzweise irgendetwas anderes zu tun.
+      //
+      // NUR AUF „eingerichtet" GEPRÜFT, nicht auf den ganzen Satz: Dieser Test
+      // stand vorher auf „nicht eingerichtet" und nagelte damit den Wortlaut
+      // aus `agent.ts` fest — also genau die Prüfung, die dort nie hingehörte.
+      // Als sie fiel, wurde er rot, obwohl das Verhalten richtig blieb: Jetzt
+      // antwortet `recherche.ts`, und das sagt „keine Websuche eingerichtet".
+      // Ein Test, der beim Entfernen eines Fehlers rot wird, hat den Fehler
+      // festgehalten und nicht die Absicht.
       const antwort = await frage("frage-suche", { braveKey: null });
-      expect(antwort).toContain("nicht eingerichtet");
+      expect(antwort).toMatch(/eingerichtet/i);
+    }, 30_000);
+
+    test("ein LEERER Brave-Schlüssel ist eingerichtet, nicht abwesend", async () => {
+      /**
+       * DER FALL, DER IN DIESER LISTE FEHLTE — und genau deshalb fehlte er:
+       * Für Firecrawl standen drei Fälle da (`null`, Schlüssel, `""`), für
+       * Brave einer. Die Lücke war in der Datei sichtbar und ist trotzdem
+       * niemandem aufgefallen, bis ein Durchlauf mit echtem Modell die
+       * Websuche stumm fand. `agent.ts` hatte `if (!ki.braveKey) throw` —
+       * und `!""` ist wahr. Damit war die Websuche für JEDEN Proxy-Betrieb
+       * tot, während `sucheImNetz("…", "")` von Hand aufgerufen einwandfrei
+       * Treffer lieferte. Zwei Zeilen unter der kaputten Prüfung stand der
+       * Kommentar, der erklärt, warum man hier nicht prüfen darf.
+       *
+       * Ohne Netz geprüft: `sucheImNetz` weist die LEERE Suchanfrage ab,
+       * bevor es Brave anspricht. Diese Meldung beweist, dass der Aufruf
+       * ankam. Käme statt dessen „nicht eingerichtet", hätte der Aufrufer
+       * ihn wieder abgefangen.
+       */
+      const antwort = await frage("frage-suche-leer", { braveKey: "" });
+      expect(antwort).not.toMatch(/eingerichtet/i);
+      // Nur die RICHTUNG: Der Wortlaut gehört `recherche.ts`.
+      expect(antwort).toMatch(/leer/i);
+    }, 30_000);
+
+    test("Gegenprobe: die Leer-Anfrage trennt wirklich, statt immer zu passen", async () => {
+      // Ohne diesen Fall wäre der Test darüber auch dann grün, wenn die
+      // Leer-Meldung IMMER käme — also auch bei `null`, wo „nicht
+      // eingerichtet" kommen muss. Er prüft den Messapparat, nicht den Code.
+      const antwort = await frage("frage-suche-leer", { braveKey: null });
+      expect(antwort).toMatch(/eingerichtet/i);
+      expect(antwort).not.toMatch(/leer/i);
     }, 30_000);
   });
 

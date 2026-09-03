@@ -319,6 +319,19 @@ async function lauf(): Promise<void> {
       return;
     }
 
+    // Wie `frage-suche`, aber mit LEERER Suchanfrage. Der einzige Weg, die
+    // Schlüsselweitergabe der Websuche ohne Netzanfrage zu prüfen:
+    // `sucheImNetz` weist die leere Anfrage ab, BEVOR es Brave anspricht.
+    // Kommt diese Meldung zurück, ist der Aufruf angekommen; kommt „nicht
+    // eingerichtet", hat der Aufrufer ihn abgefangen.
+    case "frage-suche-leer": {
+      sende({ t: "frage", id: 1, art: "web_search", q: "" });
+      const antwort = await ersteAntwort();
+      sende({ t: "text", inhalt: `antwort:${JSON.stringify(antwort)}` });
+      sende({ t: "fertig", zusammenfassung: "Recherche verwertet." });
+      return;
+    }
+
     // Fragt einen SEITENABRUF an und meldet die Antwort wörtlich zurück.
     // Gegenstück zu `frage-suche`, für den zweiten Recherche-Weg.
     case "frage-abruf": {

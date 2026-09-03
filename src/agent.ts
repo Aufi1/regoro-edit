@@ -543,16 +543,20 @@ async function begleiteWorker(
 
 /** Fragen des Workers — beantwortet im Elternprozess, nie im Worker. */
 async function beantworte(n: Record<string, unknown>, ki: NonNullable<HostCtx["ki"]>): Promise<string> {
-  if (n.art === "web_search") {
-    // Fail-closed: ohne eingerichtete Websuche wird nicht gesucht, statt
-    // ersatzweise irgendetwas anderes zu tun.
-    if (!ki.braveKey) throw new Error("Die Websuche ist für diesen Server nicht eingerichtet.");
-    return await sucheImNetz(String(n.q ?? ""), ki.braveKey);
-  }
-  // `firecrawlKey` wird durchgereicht, nicht hier geprüft: `null` heißt „nicht
-  // eingerichtet" und `""` heißt „ein ausgehender Proxy hängt die Anmeldung an".
-  // Diesen Unterschied kennt `holeSeite`; eine zweite Prüfung hier würde ihn
-  // früher oder später anders auslegen.
+  // WEDER `braveKey` NOCH `firecrawlKey` werden hier geprüft, sondern
+  // durchgereicht: `null` heißt „nicht eingerichtet", `""` heißt „ein
+  // ausgehender Proxy hängt die Anmeldung an". Diesen Unterschied kennen
+  // `sucheImNetz` und `holeSeite`; eine zweite Prüfung hier legt ihn früher
+  // oder später anders aus.
+  //
+  // GENAU DAS WAR HIER DER FALL: `if (!ki.braveKey) throw` warf für den leeren
+  // String, also für die Einrichtung, die `regoro ki --key-from-proxy` selbst
+  // anlegt und die `regoro ki --list` als „eingerichtet" anzeigt. Der
+  // Seitenabruf daneben machte es richtig; die Websuche war für jeden
+  // Proxy-Betrieb tot, während die Suchfunktion selbst nachweislich lief.
+  // Nicht wieder einführen — fail-closed entsteht in `recherche.ts` aus
+  // `typeof key !== "string"`, nicht aus Wahrheitswert-Prüfungen beim Aufrufer.
+  if (n.art === "web_search") return await sucheImNetz(String(n.q ?? ""), ki.braveKey);
   if (n.art === "fetch_page") return await holeSeite(String(n.url ?? ""), ki.firecrawlKey);
   throw new Error("Diese Anfrage kennt der Server nicht.");
 }
