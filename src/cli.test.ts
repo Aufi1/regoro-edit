@@ -715,15 +715,22 @@ describe("regoro ki", () => {
    * über $CREDENTIALS_DIRECTORY umgelenkt — genau der Weg, den systemd im
    * Betrieb nimmt. Ein Test, der nach /etc schreiben müsste, wäre entweder rot
    * oder gefährlich.
+   *
+   * `zeilen` sind die Schlüssel-Zeilen für die Standardeingabe, je eine mit
+   * Präfix (`modell=…`, `brave=…`, `firecrawl=…`). Nie über argv: Auf diesem
+   * Host ist `/proc/<pid>/cmdline` für jeden Prozess lesbar, und die Shell
+   * schreibt das Kommando zusätzlich in ihre History.
    */
-  function runKi(args: string[], opts: { key?: string; creds?: string } = {}) {
+  function runKi(args: string[], opts: { zeilen?: string[]; creds?: string } = {}) {
     const proc = Bun.spawnSync(["bun", CLI, "ki", ...args], {
       cwd: dir,
       env: { ...process.env, CREDENTIALS_DIRECTORY: opts.creds ?? dir },
-      stdin: opts.key === undefined ? undefined : new TextEncoder().encode(`${opts.key}\n`),
+      stdin: opts.zeilen === undefined ? undefined : new TextEncoder().encode(`${opts.zeilen.join("\n")}\n`),
     });
     return { code: proc.exitCode, stdout: proc.stdout.toString(), stderr: proc.stderr.toString() };
   }
+
+  const gelesen = () => JSON.parse(readFileSync(join(dir, "ki"), "utf8"));
 
   test("nimmt KEIN Site-Argument — der Modellzugang gilt für alle Kunden", () => {
     // Der Plan widerspricht sich hier; verbindlich ist „betreiberweit". Ein
@@ -732,7 +739,7 @@ describe("regoro ki", () => {
     const site = join(dir, "site");
     mkdirSync(site);
     makeSite(site);
-    const r = runKi([site, "--key-stdin"], { key: "sk-test" });
+    const r = runKi([site, "--stdin"], { zeilen: ["modell=sk-test-0000000000000000"] });
     expect(r.code).toBe(1);
     expect(r.stderr).toMatch(/betreiberweit/i);
     // Und vor allem: kein Schlüssel landet im Kundenordner.
@@ -740,12 +747,12 @@ describe("regoro ki", () => {
   });
 
   test("schreibt die Datei mit 0600 und dem Schlüssel aus stdin", () => {
-    const r = runKi(["--key-stdin"], { key: "sk-geheim-123" });
+    const r = runKi(["--stdin"], { zeilen: ["modell=sk-geheim-1234567890123456"] });
     expect(r.code).toBe(0);
     const datei = join(dir, "ki");
     expect(existsSync(datei)).toBe(true);
     expect(statSync(datei).mode & 0o777).toBe(0o600);
-    expect(JSON.parse(readFileSync(datei, "utf8")).apiKey).toBe("sk-geheim-123");
+    expect(gelesen().apiKey).toBe("sk-geheim-1234567890123456");
   });
 
   test("der Schlüssel steht nie in argv — nur auf stdin", () => {
@@ -753,23 +760,107 @@ describe("regoro ki", () => {
     // schreibt ihn auf die Platte.
     const r = runKi(["--key", "sk-in-argv"]);
     expect(r.code).toBe(1);
-    expect(r.stderr).toMatch(/--key-stdin|Verwendung/);
+    expect(r.stderr).toMatch(/--stdin|Verwendung/);
+  });
+
+  test("alle drei Schlüssel in einem Zug", () => {
+    const r = runKi(["--stdin"], {
+      zeilen: ["modell=sk-modell-000000000000000", "brave=brv-000000", "firecrawl=fc-000000"],
+    });
+    expect(r.code).toBe(0);
+    const cfg = gelesen();
+    expect(cfg.apiKey).toBe("sk-modell-000000000000000");
+    expect(cfg.braveKey).toBe("brv-000000");
+    expect(cfg.firecrawlKey).toBe("fc-000000");
+  });
+
+  test("die Reihenfolge ist egal — dafür sind die Präfixe da", () => {
+    // DER ZWECK DER PRÄFIXE. Bei fester Reihenfolge trägt, wer zwei Zeilen
+    // vertauscht, den Brave-Schlüssel als Modellschlüssel ein — und merkt es
+    // nie: Die Datei entsteht, der Dienst startet, und erst der erste
+    // Kundenlauf scheitert mit einem 401, das niemand zuordnet.
+    runKi(["--stdin"], { zeilen: ["modell=sk-modell-000000000000000", "brave=brv-1", "firecrawl=fc-1"] });
+    const vorwaerts = gelesen();
+    runKi(["--stdin"], { zeilen: ["firecrawl=fc-1", "brave=brv-1", "modell=sk-modell-000000000000000"] });
+    expect(gelesen()).toEqual(vorwaerts);
+  });
+
+  test("ein Tippfehler im Namen ist ein Fehler, kein stiller fehlender Schlüssel", () => {
+    // `model=` statt `modell=`. Würde die Zeile überlesen, entstünde eine Datei
+    // ohne Modellschlüssel — und die KI wäre nach dem Einrichten wortlos aus.
+    const r = runKi(["--stdin"], { zeilen: ["model=sk-vertippt-00000000000000"] });
+    expect(r.code).toBe(1);
+    // Die gültigen Namen müssen in der Meldung stehen, sonst rät der Betreiber.
+    for (const name of ["modell", "brave", "firecrawl"]) expect(r.stderr).toContain(name);
+    expect(existsSync(join(dir, "ki"))).toBe(false);
+  });
+
+  test("ein doppeltes Präfix ist ein Fehler — nicht „der letzte gewinnt“", () => {
+    // Den letzten gewinnen zu lassen wäre genau die Falle, gegen die die
+    // Präfixe angetreten sind: Wer zwei Schlüssel einfügt und einen davon
+    // vergisst zu ändern, bekäme lautlos den falschen.
+    const r = runKi(["--stdin"], {
+      zeilen: ["modell=sk-erster-0000000000000", "modell=sk-zweiter-000000000000"],
+    });
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("mehrfach");
+    expect(existsSync(join(dir, "ki"))).toBe(false);
+  });
+
+  test("`brave=` ohne Wert heißt „kommt von außen“, nicht „nicht eingerichtet“", () => {
+    // DIE UNTERSCHEIDUNG, DIE EINMAL VERLOREN GING: Ein leerer Wert wurde zu
+    // null, und die Websuche war in der Entwicklung tot — ohne Fehler, ohne
+    // Logzeile. Fehlendes Präfix heißt „nicht eingerichtet"; ein leerer Wert
+    // heißt „eingerichtet, Schlüssel hängt ein Proxy an".
+    const r = runKi(["--stdin"], { zeilen: ["modell=sk-modell-000000000000000", "brave="] });
+    expect(r.code).toBe(0);
+    expect(gelesen().braveKey).toBe("");
+    expect(gelesen().firecrawlKey).toBeNull(); // Präfix fehlte ganz
+    // Und der Betreiber sieht den Unterschied auch in der Ausgabe.
+    expect(r.stdout).toMatch(/Websuche:.*von außen/);
+    expect(r.stdout).toMatch(/Seitenabruf:.*nicht eingerichtet/);
+  });
+
+  test("`modell=` ohne Wert wird abgewiesen — dafür gibt es --key-from-proxy", () => {
+    // Anders als bei brave/firecrawl: Eine Datei mit leerem apiKey verwirft
+    // loadKiConfig wegen zu kurzem Schlüssel, und die KI wäre nach dem
+    // Einrichten wortlos aus.
+    const r = runKi(["--stdin"], { zeilen: ["modell="] });
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("--key-from-proxy");
+    expect(existsSync(join(dir, "ki"))).toBe(false);
+  });
+
+  test("kein Fehlerlauf hinterlässt eine halbe Datei", () => {
+    // Alle Prüfungen müssen zuschlagen, BEVOR geschrieben wird. Eine Datei aus
+    // einem abgebrochenen Lauf wäre schlimmer als keine: Sie sieht eingerichtet
+    // aus und ist es nicht.
+    const fehlerlaeufe: string[][] = [
+      ["ohne-praefix"],
+      ["model=sk-vertippt-00000000000000"],
+      ["modell=a", "modell=b"],
+      ["modell="],
+    ];
+    for (const zeilen of fehlerlaeufe) {
+      expect(runKi(["--stdin"], { zeilen }).code).toBe(1);
+      expect(`${zeilen.join("|")}: ${existsSync(join(dir, "ki"))}`).toBe(`${zeilen.join("|")}: false`);
+    }
   });
 
   test("Vorgaben für Modell und baseUrl, überschreibbar", () => {
-    runKi(["--key-stdin"], { key: "sk-a" });
-    const vorgabe = JSON.parse(readFileSync(join(dir, "ki"), "utf8"));
-    expect(vorgabe.baseUrl).toBe("https://openrouter.ai/api/v1");
-    expect(vorgabe.model).toBe("z-ai/glm-5.3-flash");
+    runKi(["--stdin"], { zeilen: ["modell=sk-a-00000000000000000000"] });
+    expect(gelesen().baseUrl).toBe("https://openrouter.ai/api/v1");
+    expect(gelesen().model).toBe("z-ai/glm-5.3-flash");
 
-    runKi(["--key-stdin", "--model", "z-ai/glm-4.6", "--base-url", "https://cortecs.ai/v1"], { key: "sk-b" });
-    const eigen = JSON.parse(readFileSync(join(dir, "ki"), "utf8"));
-    expect(eigen.model).toBe("z-ai/glm-4.6");
-    expect(eigen.baseUrl).toBe("https://cortecs.ai/v1");
+    runKi(["--stdin", "--model", "z-ai/glm-4.6", "--base-url", "https://cortecs.ai/v1"], {
+      zeilen: ["modell=sk-b-00000000000000000000"],
+    });
+    expect(gelesen().model).toBe("z-ai/glm-4.6");
+    expect(gelesen().baseUrl).toBe("https://cortecs.ai/v1");
   });
 
   test("--off entfernt die Datei — und damit die Seitenleiste bei allen Kunden", () => {
-    runKi(["--key-stdin"], { key: "sk-a" });
+    runKi(["--stdin"], { zeilen: ["modell=sk-a-00000000000000000000"] });
     expect(runKi(["--off"]).code).toBe(0);
     expect(existsSync(join(dir, "ki"))).toBe(false);
   });
@@ -778,7 +869,7 @@ describe("regoro ki", () => {
     // Sonst schaltete das Abschalten eines einzelnen Kunden die KI für alle ab.
     makeSite(dir);
     runInit([], { cwd: dir });
-    runKi(["--key-stdin"], { key: "sk-a" });
+    runKi(["--stdin"], { zeilen: ["modell=sk-a-00000000000000000000"] });
     const proc = Bun.spawnSync(["bun", CLI, "disable", dir], {
       cwd: dir,
       env: { ...process.env, CREDENTIALS_DIRECTORY: dir },

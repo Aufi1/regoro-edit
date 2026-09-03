@@ -60,6 +60,9 @@ const KI: KiConfig = {
   apiKey: "sk-attrappe-nie-benutzt-000000",
   keyFromProxy: false,
   braveKey: null,
+  // Wie braveKey: Ohne Schlüssel keine Netzfähigkeit. Suchen und Abrufen sind
+  // zwei Dienste — kein Test dieser Datei braucht eines von beiden.
+  firecrawlKey: null,
   baseUrl: "http://127.0.0.1:1/v1",
   model: "z-ai/glm-5.3-flash",
 };
