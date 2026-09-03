@@ -48,6 +48,7 @@ import {
   apparmorProfil,
 } from "./service.ts";
 import {
+  aktualisiereKiConfig,
   betreiberConfigPfad,
   entferneKiConfig,
   loadKiConfig,
@@ -96,6 +97,7 @@ Verwendung:
   regoro service --apparmor       AppArmor-Profil für bwrap ausgeben (nötig für
                                   die KI-Seitenleiste, siehe README)
   regoro ki --stdin | --key-from-proxy [--model m] [--base-url u]
+            [--ohne brave|firecrawl]
   regoro ki --list | --off
                                   Modellzugang der KI-Seitenleiste. Gilt
                                   BETREIBERWEIT für alle Kundenwebsites —
@@ -104,6 +106,11 @@ Verwendung:
                                   eine Zeile je Schlüssel, mit Präfix aus
                                   modell, brave, firecrawl. Beispiel:
                                     printf '%s\\n' "modell=$K" | regoro ki --stdin
+                                  Gibt es den Zugang schon, ändert sich NUR,
+                                  was genannt wird — eine Schlüssel-Rotation
+                                  lässt Endpunkt, Modell und die übrigen
+                                  Schlüssel unangetastet. --ohne <name>
+                                  schaltet einen Nebendienst ab.
   regoro integration <siteDir> <name> --base-url u --key-stdin
                      [--pfade "POST /v1/x"] [--browser-herkunft https://…]
   regoro integration <siteDir> --list | <name> --off
@@ -509,6 +516,18 @@ function lesGeheimnisse(bezeichnungen: string[]): string[] {
   return werte;
 }
 
+/** Zeigt den Zugang nach dem Schreiben — niemals einen Schlüsselwert. */
+function zeigeKiZugang(cfg: {
+  model: string; baseUrl: string; keyFromProxy: boolean;
+  braveKey: string | null; firecrawlKey: string | null;
+}): void {
+  console.log(`  Modell:      ${cfg.model}`);
+  console.log(`  baseUrl:     ${cfg.baseUrl}`);
+  console.log(`  Schlüssel:   ${cfg.keyFromProxy ? "kommt vom ausgehenden Proxy" : "gesetzt"}`);
+  console.log(`  Websuche:    ${schluesselZustand(cfg.braveKey)}`);
+  console.log(`  Seitenabruf: ${schluesselZustand(cfg.firecrawlKey)}`);
+}
+
 /**
  * Zustand eines Neben-Schlüssels für `--list`. Zeigt NIE den Wert.
  *
@@ -614,6 +633,7 @@ function cmdKi(args: string[]): void {
   checkFlags("ki", args, [
     "--stdin",
     "--key-from-proxy",
+    "--ohne",
     "--model",
     "--base-url",
     "--list",
@@ -624,7 +644,8 @@ function cmdKi(args: string[]): void {
   // macht ihn an einer Stelle). Laut scheitern statt still ignorieren: sonst
   // glaubt der Betreiber, er habe einen Zugang je Kunde eingerichtet.
   const werte = new Set(
-    ["--model", "--base-url"].map((f) => flagWert(args, f)).filter((v): v is string => !!v),
+    [...["--model", "--base-url"].map((f) => flagWert(args, f)), ...flagWerte(args, "--ohne")]
+      .filter((v): v is string => !!v),
   );
   const positional = args.filter((a) => !a.startsWith("-") && !werte.has(a));
   if (positional.length > 0) {
@@ -675,32 +696,33 @@ function cmdKi(args: string[]): void {
 
   const ausStdin = args.includes("--stdin");
   const vomProxy = args.includes("--key-from-proxy");
-  if (!ausStdin && !vomProxy) {
-    fail(
-      "kein Schlüssel angegeben.\n" +
-        "  Über die Standardeingabe, eine Zeile je Schlüssel:\n" +
-        `    printf '%s\\n' "modell=$SCHLUESSEL" "brave=$BRAVE" | regoro ki --stdin\n` +
-        `    (mögliche Namen: ${KI_SCHLUESSEL.join(", ")})\n` +
-        "  Hängt ein ausgehender Proxy die Anmeldung an: regoro ki --key-from-proxy\n" +
-        "  Ein Schlüssel als Kommandozeilen-Argument wird bewusst nicht angeboten —\n" +
-        "  argv liest jeder Prozess dieses Hosts, und die Shell-History speichert ihn.",
-    );
-  }
-
   const gelesen = ausStdin ? lesKiSchluessel() : new Map<KiSchluessel, string>();
   const modell = gelesen.get("modell");
+
+  // `--ohne <name>` schaltet einen Nebendienst ab. Ohne diesen Weg gäbe es
+  // keinen: Ein fehlendes Präfix heißt beim Ändern „unverändert lassen", und
+  // ein leerer Wert heißt „Schlüssel kommt von außen" — beides ist NICHT „aus".
+  const ohne = flagWerte(args, "--ohne").map((n) => n.trim().toLowerCase());
+  for (const n of ohne) {
+    if (n === "modell") {
+      fail(
+        "`--ohne modell` gibt es nicht — ohne Modellzugang gibt es keine KI.\n" +
+          "  Ganz abschalten: regoro ki --off\n" +
+          "  Schlüssel kommt von außen: regoro ki --key-from-proxy",
+      );
+    }
+    if (!(KI_SCHLUESSEL as readonly string[]).includes(n)) {
+      fail(`unbekannter Name für --ohne: ${n}\n  Erlaubt sind: brave, firecrawl`);
+    }
+    if (gelesen.has(n as KiSchluessel)) {
+      fail(`"${n}" steht auf der Standardeingabe UND in --ohne — was denn nun?`);
+    }
+  }
 
   if (vomProxy && modell !== undefined) {
     fail(
       "--key-from-proxy und ein `modell=`-Schlüssel schließen sich aus.\n" +
         "  Entweder liegt der Modellschlüssel hier, oder ein ausgehender Proxy hängt ihn an.",
-    );
-  }
-  if (!vomProxy && modell === undefined) {
-    fail(
-      "der Modellschlüssel fehlt auf der Standardeingabe.\n" +
-        `    printf '%s\\n' "modell=$SCHLUESSEL" | regoro ki --stdin\n` +
-        "  Ohne eigenen Schlüssel: regoro ki --key-from-proxy",
     );
   }
   if (modell === "") {
@@ -714,25 +736,83 @@ function cmdKi(args: string[]): void {
     );
   }
 
-  const cfg = {
-    apiKey: modell ?? "",
-    keyFromProxy: vomProxy,
-    // Fehlt das Präfix, ist die Funktion nicht eingerichtet (null). Ein LEERER
-    // Wert ist etwas anderes und bleibt erhalten: „Funktion an, Schlüssel kommt
-    // von außen" — dieselbe Bedeutung, die loadKiConfig ihm gibt.
-    braveKey: gelesen.get("brave") ?? null,
-    firecrawlKey: gelesen.get("firecrawl") ?? null,
-    baseUrl: flagWert(args, "--base-url") ?? STANDARD_BASE_URL,
-    model: flagWert(args, "--model") ?? STANDARD_MODELL,
-  };
-  schreibeKiConfig(cfg, pfad);
+  const baseUrl = flagWert(args, "--base-url");
+  const model = flagWert(args, "--model");
+  const vorhanden = loadKiConfig(pfad);
 
-  console.log(`Modellzugang geschrieben: ${pfad} (Mode 0600)`);
-  console.log(`  Modell:      ${cfg.model}`);
-  console.log(`  baseUrl:     ${cfg.baseUrl}`);
-  console.log(`  Schlüssel:   ${vomProxy ? "kommt vom ausgehenden Proxy" : "gesetzt"}`);
-  console.log(`  Websuche:    ${schluesselZustand(cfg.braveKey)}`);
-  console.log(`  Seitenabruf: ${schluesselZustand(cfg.firecrawlKey)}`);
+  // ZWEI WEGE, und der Unterschied ist wichtig genug für den Betreiber, dass
+  // die Ausgabe ihn benennt:
+  //
+  //   Ersteinrichtung  — es gibt noch keinen (gültigen) Zugang: alles wird
+  //                      geschrieben, Vorgaben füllen die Lücken.
+  //   Änderung         — es gibt einen: NUR was genannt wurde, ändert sich.
+  //
+  // Vorher ersetzte jeder Aufruf die ganze Datei. Nachgemessen hieß das: Eine
+  // Routine-Rotation des Modellschlüssels löschte Brave- und Firecrawl-Schlüssel
+  // UND setzte baseUrl und model auf die Vorgaben zurück. Wer Cortecs für die
+  // Verarbeitung in der EU eingerichtet hatte, war danach wortlos wieder bei
+  // OpenRouter — sichtbar nur in `--list`, wo nach einer Rotation niemand
+  // hinsieht. Dasselbe Muster wie auth.ts: createAuthFile ersetzt alles,
+  // schreibeKennungen rührt das Secret nicht an.
+  if (vorhanden === null) {
+    if (!vomProxy && modell === undefined) {
+      // Hier — und NICHT früher: Beim Ändern eines bestehenden Zugangs ist ein
+      // Aufruf ohne Modellschlüssel völlig in Ordnung (nur den Endpunkt
+      // wechseln, nur die Websuche abschalten). Stünde der Guard oben, wäre
+      // genau das unmöglich, und die Meldung wäre auch noch irreführend.
+      fail(
+        "der Modellschlüssel fehlt — es gibt noch keinen Zugang, der zu ändern wäre.\n" +
+          "  Über die Standardeingabe, eine Zeile je Schlüssel:\n" +
+          `    printf '%s\\n' "modell=$SCHLUESSEL" "brave=$BRAVE" | regoro ki --stdin\n` +
+          `    (mögliche Namen: ${KI_SCHLUESSEL.join(", ")})\n` +
+          "  Hängt ein ausgehender Proxy die Anmeldung an: regoro ki --key-from-proxy\n" +
+          "  Ein Schlüssel als Kommandozeilen-Argument wird bewusst nicht angeboten —\n" +
+          "  argv liest jeder Prozess dieses Hosts, und die Shell-History speichert ihn.",
+      );
+    }
+    const cfg = {
+      apiKey: modell ?? "",
+      keyFromProxy: vomProxy,
+      // Bei der Ersteinrichtung heißt „Präfix fehlt": nicht eingerichtet (null).
+      // Ein LEERER Wert ist etwas anderes und bleibt erhalten: „Funktion an,
+      // Schlüssel kommt von außen" — dieselbe Bedeutung, die loadKiConfig gibt.
+      braveKey: ohne.includes("brave") ? null : (gelesen.get("brave") ?? null),
+      firecrawlKey: ohne.includes("firecrawl") ? null : (gelesen.get("firecrawl") ?? null),
+      baseUrl: baseUrl ?? STANDARD_BASE_URL,
+      model: model ?? STANDARD_MODELL,
+    };
+    schreibeKiConfig(cfg, pfad);
+    console.log(`Modellzugang eingerichtet: ${pfad} (Mode 0600)`);
+    zeigeKiZugang(cfg);
+  } else {
+    // `undefined` heißt für aktualisiereKiConfig „nicht genannt, nicht anfassen".
+    const teil = {
+      apiKey: modell,
+      keyFromProxy: vomProxy ? true : undefined,
+      braveKey: ohne.includes("brave") ? null : gelesen.get("brave"),
+      firecrawlKey: ohne.includes("firecrawl") ? null : gelesen.get("firecrawl"),
+      baseUrl,
+      model,
+    };
+    if (vomProxy) teil.apiKey = "";
+    if (Object.values(teil).every((v) => v === undefined)) {
+      fail(
+        "nichts zu ändern — es wurde kein Schlüssel und keine Einstellung genannt.\n" +
+          "  Anzeigen: regoro ki --list",
+      );
+    }
+    aktualisiereKiConfig(teil, pfad);
+    const jetzt = loadKiConfig(pfad)!;
+    const geaendert = Object.entries(teil)
+      .filter(([, v]) => v !== undefined)
+      .map(([k]) => k);
+    console.log(`Modellzugang geändert: ${pfad}`);
+    console.log(`  Geändert: ${geaendert.join(", ")}`);
+    // Der wichtige Satz: Was nicht genannt wurde, steht noch so da wie vorher.
+    console.log("  Alles Übrige bleibt unverändert.");
+    zeigeKiZugang(jetzt);
+  }
+
   console.log("");
   console.log("Gilt betreiberweit — die Seitenleiste erscheint bei jeder Website mit Editor.");
   // Ohne diesen Satz sucht jemand den Fehler in der Konfiguration, während in
