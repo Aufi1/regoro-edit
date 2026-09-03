@@ -528,7 +528,7 @@
       // höherer z-index (2147483603 > 2147483601): Beide schließen sich zwar
       // gegenseitig aus, aber wenn doch einmal beide offen sind, soll das
       // Chatfenster oben liegen — dort tippt der Kunde.
-      "#__regoro-agent{width:var(--regoro-apanel);max-width:96vw;height:100%;",
+      "#__regoro-agent{width:var(--regoro-apanel);max-width:96vw;height:100%;min-height:0;",
       "z-index:2147483603;background:#fff;color:#16222e;box-shadow:-4px 0 18px rgba(0,0,0,.28);",
       "display:flex;flex-direction:column;",
       "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;}",
@@ -541,7 +541,18 @@
       "#__regoro-agent .__regoro-aquota{flex:0 0 auto;padding:8px 16px;background:#f5f8fa;",
       "border-bottom:1px solid #e2e8ec;font-size:12.5px;color:#5a6b78;}",
       "#__regoro-agent .__regoro-aquota.__regoro-aleer{background:#fff4e5;color:#663c00;}",
-      "#__regoro-agent .__regoro-averlauf{flex:1 1 auto;overflow:auto;padding:12px 16px;",
+      /**
+       * `min-height:0` IST HIER DER GANZE TRICK, und sein Fehlen war der Grund,
+       * warum sich der Verlauf nicht scrollen ließ.
+       *
+       * Ein Flex-Kind hat `min-height:auto` und kann damit nicht unter seine
+       * Inhaltshöhe schrumpfen. `overflow:auto` greift deshalb nie — der Block
+       * wächst stattdessen, schiebt das Eingabefeld aus dem Bild und die alten
+       * Nachrichten sind unerreichbar. Man sieht dem CSS nicht an, dass die
+       * Zeile fehlt; man sieht nur, dass Scrollen „nicht geht".
+       */
+      "#__regoro-agent .__regoro-averlauf{flex:1 1 auto;min-height:0;overflow:auto;",
+      "overscroll-behavior:contain;padding:12px 16px;",
       "display:flex;flex-direction:column;gap:10px;}",
       "#__regoro-agent .__regoro-anachricht{font-size:14px;line-height:1.5;white-space:pre-wrap;",
       "overflow-wrap:anywhere;border-radius:10px;padding:9px 12px;}",
@@ -597,8 +608,21 @@
       "#__regoro-agent .__regoro-atut i:nth-child(3){animation-delay:.36s;}",
       "#__regoro-agent .__regoro-ahinweis.__regoro-awarn{color:#a83c12;font-weight:600;}",
       // Punkt-Animation, solange der Agent arbeitet.
+      /**
+       * Der Punkt vor einem Arbeitsschritt hat ZWEI Zustände, und der
+       * Unterschied ist der Punkt der Sache: gefüllt und pulsend, solange der
+       * Schritt läuft — hohler Ring, sobald er fertig ist.
+       *
+       * Vorher pulste jeder Schritt weiter, auch der von vor zwei Minuten. Ein
+       * pulsender Punkt heißt „hier arbeitet etwas"; sieben davon
+       * untereinander heißen nichts mehr. Das Bild soll die Frage beantworten
+       * „was passiert GERADE", und das kann es nur, wenn genau eine Zeile lebt.
+       */
       "#__regoro-agent .__regoro-apuls{display:inline-block;width:8px;height:8px;border-radius:50%;",
       "background:#e2571e;animation:__regoro-apuls 1.1s ease-in-out infinite;}",
+      "#__regoro-agent .__regoro-aschritt-fertig .__regoro-apuls{animation:none;",
+      "background:transparent;border:2px solid #9db3c0;width:8px;height:8px;}",
+      "#__regoro-agent .__regoro-aschritt-fertig{color:#5a6b78;}",
       "@keyframes __regoro-apuls{0%,100%{opacity:.25}50%{opacity:1}}",
       // Body-Offset, damit der fixe Balken nichts verdeckt
       "body.__regoro-offset{padding-top:var(--regoro-barh,52px);}",
@@ -2483,6 +2507,7 @@
     else if (art === "fehler") klasse += "__regoro-avon-agent __regoro-afehler";
     else if (art === "fertig") klasse += "__regoro-avon-agent __regoro-afertig";
     else klasse += "__regoro-avon-agent";
+    schritteAbschliessen();
     var node = el("div", { class: klasse, text: text });
     ui.agent.verlauf.appendChild(node);
     // Der Kringel gehört ans Ende — sonst steht er nach einer neuen Zeile
@@ -2493,10 +2518,26 @@
     return node;
   }
 
+  /**
+   * Schließt alle bisherigen Arbeitsschritte ab.
+   *
+   * Ein Schritt gilt als fertig, sobald IRGENDETWAS danach passiert — der
+   * nächste Werkzeugaufruf, ein Satz des Modells, das Ende des Laufs. Der
+   * Server meldet kein eigenes „Werkzeug fertig"-Ereignis, und er müsste es
+   * auch nicht: Dass etwas Neues kommt, IST der Beweis, dass das Alte durch
+   * ist. Genau deshalb wird hier nichts geraten und nichts geschätzt.
+   */
+  function schritteAbschliessen() {
+    if (!agentPanel) return;
+    var offen = ui.agent.verlauf.querySelectorAll(".__regoro-awerkzeug:not(.__regoro-aschritt-fertig)");
+    for (var i = 0; i < offen.length; i++) offen[i].classList.add("__regoro-aschritt-fertig");
+  }
+
   function agentWerkzeug(kurz) {
     if (!agentPanel) return;
     // Ein Werkzeug beendet den laufenden Satz — der nächste Text ist ein neuer.
     agentTextBlase = null;
+    schritteAbschliessen();
     var node = el("div", { class: "__regoro-awerkzeug" }, [
       el("span", { class: "__regoro-apuls" }),
       el("span", { text: kurz })
@@ -2516,6 +2557,8 @@
     ui.agent.abbrechen.disabled = !laeuft;
     // Zeigt den Stopp-Knopf und lässt ihn pulsen — er IST die Laufanzeige.
     agentPanel.classList.toggle("__regoro-alaeuft", !!laeuft);
+    // Ist der Lauf vorbei, kann kein Schritt mehr laufen.
+    if (!laeuft) schritteAbschliessen();
     zeigeTut(laeuft);
     /**
      * DER HINWEIS GEHÖRT ZUM LAUF UND STIRBT MIT IHM.
