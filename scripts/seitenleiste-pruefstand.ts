@@ -89,6 +89,14 @@ interface Fall {
   /** Weitere Schritte im Browser, nach Öffnen/Abschicken. */
   schritte?: string[];
   /**
+   * Meldet `/edit/agent/status` einen bereits LAUFENDEN Auftrag?
+   *
+   * Der Zustand, den die Leiste beim Öffnen vorfindet, wenn der Kunde den
+   * Auftrag auf einem anderen Gerät gestartet hat — oder auf diesem, vor einem
+   * Seitenwechsel.
+   */
+  laeuftSchon?: boolean;
+  /**
    * Verzögert NUR `/edit/agent/verlauf`, nicht die Liste.
    *
    * Damit wird ein Wettlauf reproduzierbar, der sonst nur auf einer langsamen
@@ -449,6 +457,44 @@ const FAELLE: Record<string, Fall> = {
     ],
   },
 
+  "verlauf-neu-waehrend-lauf": {
+    tun:
+      "Leiste öffnen und SOFORT — während das Gespräch noch lädt — auf „Neu“ klicken. " +
+      "Für die Website läuft dabei bereits ein Auftrag.",
+    erwartung:
+      "Das Chatfenster bleibt LEER, und unter der Eingabe steht der Hinweis, dass ein " +
+      "Auftrag zu einem anderen Gespräch läuft. Den Strom hier anzuhängen schriebe die " +
+      "Ausgabe eines fremden Laufs in das gerade begonnene Gespräch; den Klick " +
+      "rückgängig zu machen nähme dem Kunden die Auswahl aus der Hand. Also keins von " +
+      "beidem — sagen, was ist.",
+    ki: true,
+    laeuftSchon: true,
+    // Der Strom liefert auch ohne Auftrag — sonst zeigte die Gegenprobe nur
+    // „Kein Lauf aktiv." statt der Ausgabe des fremden Laufs.
+    nachlese: true,
+    verlaufVerzoegerungMs: 1500,
+    sofort: true,
+    gespraeche: [
+      {
+        id: "g-laeuft",
+        titel: "Das Gespräch, zu dem der Lauf gehört",
+        vorMs: 60_000,
+        zeilen: [{ von: "kunde", text: "ALT: Auftrag" }, { von: "agent", text: "ALT: Antwort" }],
+      },
+    ],
+    schritte: [NEU_KLICK, "sleep 5"],
+    pruefung:
+      `JSON.stringify({zeilen:${Q.zeilen},hinweis:(document.querySelector('#__regoro-agent .__regoro-aform .__regoro-ahinweis')||{}).textContent})`,
+    sollwert:
+      '{"zeilen":[],"hinweis":"Für diese Website läuft gerade ein Auftrag. Er gehört zu ' +
+      'einem anderen Gespräch — öffne die Leiste neu, um ihm zuzusehen."}',
+    // Was der Strom liefern WÜRDE, wenn er fälschlich angehängt würde.
+    ereignisse: [
+      rahmen("text", { inhalt: "FREMDER LAUF schreibt hier." }),
+      rahmen("fertig", { zusammenfassung: "FREMDER LAUF schreibt hier.", dateien: ["fremd.html"], commit: "a1" }),
+    ],
+  },
+
   "verlauf-fehlt": {
     tun: "Leiste öffnen, irgendeinen Auftrag abschicken.",
     erwartung:
@@ -670,8 +716,8 @@ function starte(): void {
       const leer = erschoepft || (fallName === "kontingent-sprengen" && kontingentWeg);
       return Response.json({
         ok: true,
-        laeuft: false,
-        laufId: null,
+        laeuft: !!fall.laeuftSchon,
+        laufId: fall.laeuftSchon ? "00000000-0000-4000-8000-000000000000" : null,
         kontingent: leer
           ? { frei: 0, gesamt: 200_000, erschoepft: true, monat: "2026-09" }
           : { frei: 198_766, gesamt: 200_000, erschoepft: false, monat: "2026-09" },

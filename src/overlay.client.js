@@ -2792,6 +2792,31 @@
       if (!agentPanel) return;                       // zwischenzeitlich geschlossen
       zeigeKontingent(st && st.kontingent);
       if (nurKontingent) return;
+      /**
+       * Ist diese Antwort noch für das Gespräch gedacht, das gerade dasteht?
+       *
+       * Sie ist unterwegs, während der Kunde klickt. Beide Zweige darunter
+       * schreiben in den Verlauf — der eine den Ausgang des letzten Laufs, der
+       * andere den laufenden Strom —, und beides gehört nicht in ein Gespräch,
+       * das der Kunde inzwischen gewechselt hat.
+       */
+      var ueberholt = !!(opts && opts.generation !== undefined && opts.generation !== null &&
+        opts.generation !== agentLadeGeneration);
+      if (st && st.laeuft && ueberholt) {
+        /**
+         * DIESELBE REGEL WIE IN `waehleGespraech`, nur verspätet zugestellt.
+         *
+         * Dort lehnt ein Wechsel während eines Laufs schlicht ab. Beim Öffnen
+         * weiß die Leiste aber noch nicht, dass etwas läuft — sie erfährt es
+         * genau hier, nach dem Klick. Den Strom trotzdem anzuhängen hieße, die
+         * Ausgabe eines fremden Laufs in dieses Gespräch zu schreiben; den Klick
+         * rückgängig zu machen hieße, dem Kunden die Auswahl aus der Hand zu
+         * nehmen. Also keins von beidem: sagen, was ist.
+         */
+        setAgentHinweis("Für diese Website läuft gerade ein Auftrag. Er gehört zu einem " +
+          "anderen Gespräch — öffne die Leiste neu, um ihm zuzusehen.", true);
+        return;
+      }
       if (st && st.laeuft) {
         // Ein Lauf ist schon unterwegs (Reload, Seitenwechsel, zweiter Tab,
         // anderes Gerät). Anhängen statt einen zweiten zu starten — der zweite
@@ -2826,8 +2851,7 @@
          * tauscht einen Fehler gegen einen kleineren — eine Leiste ohne
          * Kontingent und ohne Anschluss an den laufenden Auftrag.
          */
-        var meine = opts && opts.generation;
-        if (meine === undefined || meine === null || meine === agentLadeGeneration) {
+        if (!ueberholt) {
           verbindeStrom({ nachlese: true, nurAbschluss: !!(opts && opts.nurAbschluss) });
         }
       }
