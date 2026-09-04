@@ -70,11 +70,17 @@ const TEUERSTER_GEMESSENER_LAUF = 205_120;
 const MINDESTENS_LAEUFE = 3;
 
 describe("kontingent.ts — die Konstante", () => {
-  test("TOKEN_KONTINGENT liegt bei 3.000.000 — vorläufig, Messwerte stehen am Typ", () => {
+  test("TOKEN_KONTINGENT liegt bei 10.000.000 — Zwischenlösung, Messwerte stehen am Typ", () => {
     // Die Zahl ist eine Messfolge, keine Haltung: Der Verbrauch hängt an der
     // SEITENGRÖSSE, nicht an der Aufgabe. Dieselbe Aufgabe kostete 8.403 Token
     // auf der Beispielseite und 205.120 auf einer echten Fabrik-Seite.
-    expect(TOKEN_KONTINGENT).toBe(3_000_000);
+    //
+    // ZWISCHENLÖSUNG: Die Einheit selbst steht zur Ablösung an — künftig wird
+    // nicht in Token, sondern in Credits abgerechnet (`usage.cost` des
+    // Anbieters statt einer vorab gerechneten Zahl). Wer diesen Test anfasst,
+    // sollte zuerst nachsehen, ob die Umstellung inzwischen da ist; dann fällt
+    // die Konstante ganz weg, statt eine neue Zahl zu bekommen.
+    expect(TOKEN_KONTINGENT).toBe(10_000_000);
   });
 
   test("das Kontingent trägt mehr als einen echten Lauf — daran ist die alte Grenze gescheitert", () => {
