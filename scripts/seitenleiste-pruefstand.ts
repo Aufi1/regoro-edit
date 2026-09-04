@@ -737,6 +737,48 @@ const FAELLE: Record<string, Fall> = {
     ereignisse: [],
   },
 
+    /**
+   * WAS DIE SEITE SELBST SCHREIBT, GEHÖRT IHR.
+   *
+   * Der Versatz nimmt sich vor jedem Durchlauf zurück, um den echten Sollwert
+   * zu lesen. Dabei darf er nicht den Stand von vorhin wiederherstellen: Ein
+   * Skript der Kundenseite kann `style.top` inzwischen selbst gesetzt haben —
+   * eine ausfahrende Kopfzeile, ein Dialog, der seine Lage nachführt. Erkannt
+   * wird das daran, dass der Inline-Wert nicht mehr der zuletzt von uns
+   * geschriebene ist.
+   *
+   * Der Fall setzt `top` per Skript auf 30 px und löst danach über einen
+   * Fensterwechsel eine neue Messung aus. Ohne den Vergleich stünde hinterher
+   * wieder der alte Wert dort, und die Kopfzeile bliebe an der Stelle von vor
+   * dem Skriptaufruf hängen.
+   */
+  "kopf-seite-schreibt-selbst": {
+    tun:
+      "Seite in 390×844 laden (Seitenleiste bleibt zu), per Skript " +
+      "`top:30px` auf den Kopf setzen, Fenster wechseln, scrollen.",
+    erwartung:
+      "Der Kopf sitzt 30 px plus eine Leistenhöhe tief — der vom Skript gesetzte " +
+      "Wert überlebt die nächste Leistenmessung und wird zur neuen Grundlage.",
+    ki: true,
+    leisteZu: true,
+    klebrigerKopf: true,
+    viewport: "390x844",
+    schritte: [
+      "js \"document.querySelector('.pruefstand-kopf').style.top='30px'\"",
+      "viewport 1440x900",
+      SCROLLEN,
+    ],
+    pruefung:
+      "JSON.stringify((function(){" +
+      "var k=document.querySelector('.pruefstand-kopf');" +
+      "var barh=parseFloat(getComputedStyle(document.documentElement)" +
+      ".getPropertyValue('--regoro-barh'));" +
+      "return {versatzUeberBarh:Math.round(parseFloat(getComputedStyle(k).top)-barh)," +
+      "barhPlausibel:barh>20};})())",
+    sollwert: '{"versatzUeberBarh":30,"barhPlausibel":true}',
+    ereignisse: [],
+  },
+
     "ohne-ki": {
     tun: "Seite laden, die obere Leiste ansehen.",
     erwartung:

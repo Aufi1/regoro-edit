@@ -906,6 +906,12 @@
    * wiederhergestellt, damit wir den echten aktuellen Sollwert sehen und nicht
    * unseren eigenen.
    *
+   * Dazu `unser` — der zuletzt von UNS geschriebene Wert. Steht er nicht mehr
+   * da, hat ein Skript der Kundenseite inzwischen selbst gesetzt; dann gilt
+   * dessen Wert und wird zur neuen Grundlage. Ohne diesen Vergleich schriebe
+   * jede Leistenmessung die Seite auf einen Zustand von vorhin zurück, und eine
+   * Kopfzeile, die ihre Lage selbst nachführt, bliebe stehen.
+   *
    * `WeakMap`, damit entfernte Elemente nicht am Leben gehalten werden.
    */
   var KLEBER = new WeakMap();
@@ -1063,10 +1069,22 @@
     // zuletzt gesetzten Wertes. Das ersetzt zugleich den früheren Schutz gegen
     // Aufaddieren: Es steht gar nichts mehr da, worauf sich addieren ließe.
     for (i = 0; i < GESETZT.length; i++) {
-      var merk = KLEBER.get(GESETZT[i]);
+      knoten = GESETZT[i];
+      var merk = KLEBER.get(knoten);
       if (!merk) continue;
-      if (merk.inline) GESETZT[i].style.setProperty("top", merk.inline, merk.prio);
-      else GESETZT[i].style.removeProperty("top");
+      // Steht überhaupt noch UNSER Wert da? Ein Skript der Kundenseite kann
+      // `style.top` inzwischen selbst gesetzt haben — eine ausfahrende
+      // Kopfzeile, ein Dialog, der seine Lage nachführt. Dann gehört der Wert
+      // ihr, nicht uns: Wir übernehmen ihn als neue Grundlage, statt unseren
+      // alten darüberzuschreiben. Andernfalls fiele die Seite bei der nächsten
+      // Leistenmessung auf einen Zustand von vorhin zurück.
+      if (knoten.style.getPropertyValue("top") !== merk.unser) {
+        merk.inline = knoten.style.getPropertyValue("top");
+        merk.prio = knoten.style.getPropertyPriority("top");
+        continue;
+      }
+      if (merk.inline) knoten.style.setProperty("top", merk.inline, merk.prio);
+      else knoten.style.removeProperty("top");
     }
     GESETZT.length = 0;
 
@@ -1097,6 +1115,7 @@
         KLEBER.set(knoten, {
           inline: knoten.style.getPropertyValue("top"),
           prio: knoten.style.getPropertyPriority("top"),
+          unser: "",
         });
       }
       treffer.push({ el: knoten, alt: alt });
@@ -1106,7 +1125,11 @@
     for (i = 0; i < treffer.length; i++) {
       // `important`, weil die Kundenseite ihr eigenes `top` per Stylesheet
       // setzt — ein Inline-Stil ohne Vorrang verlöre gegen `!important` dort.
-      treffer[i].el.style.setProperty("top", treffer[i].alt + barh + "px", "important");
+      var wert = treffer[i].alt + barh + "px";
+      treffer[i].el.style.setProperty("top", wert, "important");
+      // Merken, WAS wir gesetzt haben — daran erkennt der nächste Durchlauf,
+      // ob der Inline-Wert noch unserer ist oder inzwischen der Seite gehört.
+      KLEBER.get(treffer[i].el).unser = wert;
       GESETZT.push(treffer[i].el);
     }
   }
