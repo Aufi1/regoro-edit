@@ -35,11 +35,17 @@ import { AUTH_DIR_NAME } from "./auth.ts";
  * Die Kosten bleiben unkritisch: Bei `z-ai/glm-5.3-flash` (0,075 / 0,250 $ je
  * Million) sind eine Million Token grob 8 bis 25 Cent je Website und Monat.
  *
+ * STAND 2026-09-04: DREI MILLIONEN, ZUM AUSPROBIEREN ANGEHOBEN. Gemessen an
+ * einem echten Lauf auf einer Kundenseite (207.371 Token für 0,0157 $, also
+ * 7,6·10⁻⁸ $/Token) sind das rund 23 Cent je Website und Monat und etwa
+ * fünfzehn Aufträge. Der Vorgängerwert von 1.000.000 reichte gemessen für acht
+ * Läufe (1.193.186 Token verbraucht) und war beim Erproben zu knapp.
+ *
  * Die endgültige Festlegung kommt, wenn mehr Läufe gemessen sind — wer sie
  * ändert, sollte die Zahlen oben mit aktualisieren, damit die nächste Änderung
  * eine Grundlage hat statt eines Bauchgefühls.
  */
-export const TOKEN_KONTINGENT = 1_000_000;
+export const TOKEN_KONTINGENT = 3_000_000;
 
 export type Kontingent = {
   frei: number;

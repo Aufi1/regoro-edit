@@ -369,7 +369,7 @@ lange redet.
 
 ### Kontingent
 
-Jede Website hat ein Monatskontingent von 1.000.000 Token; es setzt sich am
+Jede Website hat ein Monatskontingent von 3.000.000 Token; es setzt sich am
 Monatsersten zurück. Ist es aufgebraucht, sagt die Seitenleiste das und nimmt
 keine Aufträge mehr an. Das Kontingent liegt pro Site in
 `.regoro/kontingent.json` und begrenzt vor allem einen Agenten, der sich
@@ -378,9 +378,11 @@ verrennt.
 ### Modellwahl
 
 `baseUrl`, `model` und Schlüssel stehen betreiberweit in `/etc/regoro/ki.json`.
-Voreinstellung ist OpenRouter mit `z-ai/glm-5.3-flash` — bei 1.000.000 Token im
-Monat grob **8 bis 25 Cent je Website**, je nachdem, wie sich Ein- und Ausgabe
-verteilen (0,075 / 0,250 $ je Million). Jeder OpenAI-kompatible Anbieter tut es;
+Voreinstellung ist OpenRouter mit `z-ai/glm-5.3-flash` — bei 3.000.000 Token im
+Monat grob **25 bis 75 Cent je Website**, je nachdem, wie sich Ein- und Ausgabe
+verteilen (0,075 / 0,250 $ je Million). An einem echten Lauf gemessen liegt es am
+unteren Rand: 207.371 Token kosteten 1,6 Cent, drei Millionen also rund 23 Cent
+und etwa fünfzehn Aufträge. Jeder OpenAI-kompatible Anbieter tut es;
 ein Wechsel ist ein Konfigurationseintrag, kein Umbau:
 
 ```bash
