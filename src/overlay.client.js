@@ -885,45 +885,122 @@
     // Der Wert gilt für zweierlei: den Abstand des Body (über die
     // CSS-Variable) und die klebenden Elemente, die dieser Abstand nicht
     // erreicht. Beides muss zusammen nachgeführt werden, sonst rutscht das eine
-    // ohne das andere.
-    versetzeKlebendeElemente(h);
+    // ohne das andere — der zweite Teil gesammelt, siehe `planeVersatz`.
+    planeVersatz(h);
   }
 
   /**
-   * Der ursprüngliche `top`-Wert jedes klebenden Elements der Kundenseite.
+   * Was die KUNDENSEITE selbst inline an `top` stehen hatte — nicht ihr
+   * Ausgangswert.
    *
-   * DAS IST DER KERN DER SACHE, nicht Buchhaltung: Ohne gemerkten Ausgangswert
-   * läse der nächste Durchlauf den bereits verschobenen Wert und addierte
-   * erneut. Die Kundenseite wanderte dann bei JEDER Fenster-Änderung weiter
-   * nach unten — ein Fehler, den eine einzelne Messung nicht zeigt, weil direkt
-   * nach dem Laden beide Fassungen dasselbe liefern. Der Prüfstand hat dafür
-   * einen eigenen Fall (`kopf-wandert-nicht`).
+   * Der Unterschied ist der Kern einer Korrektur: Zuerst stand hier der einmal
+   * gelesene Ausgangswert, und das war falsch, sobald die Seite ihn später
+   * ändert. Ein Kopf mit `top:0` und einer Media Query, die auf schmalen
+   * Fenstern `top:20px` setzt, bekam weiterhin `0 + Leistenhöhe` — der
+   * Media-Query-Wert war für immer verloren, weil unser eigenes `!important`
+   * jedes erneute Lesen verdeckte.
+   *
+   * Deshalb wird der Ausgangswert jetzt bei JEDEM Durchlauf frisch gelesen, und
+   * gemerkt wird nur, was wir vorgefunden haben: der Inline-Wert der Seite (fast
+   * immer leer) samt seiner Priorität. Er wird vor jedem Neu-Lesen
+   * wiederhergestellt, damit wir den echten aktuellen Sollwert sehen und nicht
+   * unseren eigenen.
    *
    * `WeakMap`, damit entfernte Elemente nicht am Leben gehalten werden.
    */
   var KLEBER = new WeakMap();
 
   /**
-   * Klebt dieses `sticky`-Element am FENSTER — oder an einem eigenen Rollbereich?
+   * Die Elemente, an denen gerade ein Versatz von uns steht.
    *
-   * `position:sticky` bezieht sich auf den nächsten rollbaren Vorfahren, nicht
-   * zwangsläufig auf das Fenster. Eine Tabellenkopfzeile in einem Kasten mit
-   * `overflow:auto` klebt an DIESEM Kasten; sie gerät nie hinter die Editor-
-   * leiste, und ein Versatz schöbe sie nur innerhalb ihres Kastens nach unten.
-   * Gemessen: ohne diese Prüfung bekam sie `top:128px` und rutschte genau so
-   * weit ab.
-   *
-   * Ein Vorfahr mit `overflow != visible` ist immer eine Rollbox — auch
-   * `hidden`, und auch das häufige `overflow-x:hidden` (CSS zwingt die andere
-   * Achse dann auf `auto`). Genau dann klebt das Element aber ohnehin nicht am
-   * Fenster, sondern scrollt mit seinem Kasten weg. Es auszulassen kostet also
-   * nichts: Was hier herausfällt, konnte die Leiste gar nicht stören.
+   * Ohne diese Liste müsste Schritt 1 wieder über das ganze Dokument laufen, um
+   * die eigenen Spuren zu finden — und ein Element, das kein Kandidat mehr ist,
+   * behielte seinen Versatz für immer.
    */
-  function klebtAmFenster(knoten) {
+  var GESETZT = [];
+
+  /**
+   * Höchstens ein Durchlauf je Bild.
+   *
+   * Der Versatz liest den Stil JEDES Knotens der Kundenseite. Der
+   * ResizeObserver feuert aber mehrfach hintereinander — beim Umbrechen der
+   * Leiste, beim Öffnen eines Panels, bei jedem Ziehen am Fensterrand. Ohne
+   * Sammelpunkt liefe dieser O(n)-Durchgang dutzende Male je Sekunde auf dem
+   * Hauptthread, und auf einer großen Kundenseite ruckelt der Editor sichtbar.
+   * Die CSS-Variable wird weiterhin SOFORT gesetzt — sie ist billig, und der
+   * Abstand des Body soll nicht ein Bild lang hinterherhinken.
+   */
+  var VERSATZ_GEPLANT = 0;
+  var LETZTE_BARH = 0;
+
+  function planeVersatz(barh) {
+    LETZTE_BARH = barh;
+    if (VERSATZ_GEPLANT) return;
+    if (typeof requestAnimationFrame !== "function") {
+      versetzeKlebendeElemente(barh);
+      return;
+    }
+    VERSATZ_GEPLANT = requestAnimationFrame(function () {
+      VERSATZ_GEPLANT = 0;
+      versetzeKlebendeElemente(LETZTE_BARH);
+    });
+  }
+
+  /**
+   * Erzeugt dieses Element einen eigenen Bezugsrahmen für `position:fixed`?
+   *
+   * `fixed` misst normalerweise am Fenster — aber nicht, wenn ein Vorfahr einen
+   * „containing block" aufspannt. `transform`, `perspective`, `filter`,
+   * `backdrop-filter`, ein entsprechendes `will-change`, `contain` mit
+   * Layout-/Paint-Wirkung oder ein Container-Query-Kontext tun genau das. Ein
+   * Dialog in einem solchen Kasten misst dann an dessen Kante, und unser
+   * Versatz verschöbe ihn INNERHALB des Kastens — sichtbar daneben, obwohl er
+   * mit der Leiste nie in Berührung kam.
+   */
+  function erzeugtBezugsrahmen(cs) {
+    return (
+      cs.transform !== "none" ||
+      cs.perspective !== "none" ||
+      (cs.filter && cs.filter !== "none") ||
+      (cs.backdropFilter && cs.backdropFilter !== "none") ||
+      /transform|perspective|filter/.test(cs.willChange || "") ||
+      /paint|layout|strict|content/.test(cs.contain || "") ||
+      (cs.containerType && cs.containerType !== "normal")
+    );
+  }
+
+  /**
+   * Misst dieses klebende Element am FENSTER — oder an einem eigenen Kasten?
+   *
+   * Beide Positionsarten können am Fenster vorbeizielen, aber aus verschiedenen
+   * Gründen, und deshalb prüft die Funktion sie verschieden:
+   *
+   * `sticky` bezieht sich auf den nächsten ROLLBAREN Vorfahren. Eine
+   * Tabellenkopfzeile in einem Kasten mit `overflow:auto` klebt an diesem
+   * Kasten; sie gerät nie hinter die Editorleiste, und ein Versatz schöbe sie
+   * nur innerhalb ihres Kastens nach unten. Gemessen: ohne diese Prüfung bekam
+   * sie `top:128px` und rutschte genau so weit ab. Ein Vorfahr mit
+   * `overflow != visible` ist immer eine Rollbox — auch `hidden`, und auch das
+   * häufige `overflow-x:hidden` (CSS zwingt die andere Achse dann auf `auto`).
+   * Genau dann klebt das Element aber ohnehin nicht am Fenster, sondern scrollt
+   * mit seinem Kasten weg. Es auszulassen kostet also nichts: Was hier
+   * herausfällt, konnte die Leiste gar nicht stören.
+   *
+   * `fixed` dagegen ficht `overflow` nicht an — dort zählt allein, ob ein
+   * Vorfahr einen Bezugsrahmen aufspannt (siehe `erzeugtBezugsrahmen`). Deshalb
+   * läuft die Schleife für `fixed` bis ganz nach oben durch, `body` und `html`
+   * eingeschlossen: Ein `transform` auf dem `body` ist ein verbreiteter
+   * Seiteneffekt von Animationsbibliotheken.
+   */
+  function klebtAmFenster(knoten, pos) {
     for (var p = knoten.parentElement; p; p = p.parentElement) {
-      if (p === document.body || p === document.documentElement) return true;
       var cs = getComputedStyle(p);
-      if (cs.overflowY !== "visible" || cs.overflowX !== "visible") return false;
+      if (pos === "fixed") {
+        if (erzeugtBezugsrahmen(cs)) return false;
+      } else {
+        if (p === document.body || p === document.documentElement) return true;
+        if (cs.overflowY !== "visible" || cs.overflowX !== "visible") return false;
+      }
     }
     return true;
   }
@@ -979,38 +1056,58 @@
    */
   function versetzeKlebendeElemente(barh) {
     var shell = document.getElementById("__regoro-shell");
+    var i, knoten, cs;
+
+    // SCHRITT 1 — SCHREIBEN: den eigenen Versatz zurücknehmen. Erst dadurch
+    // zeigt Schritt 2 den ECHTEN aktuellen Sollwert der Seite statt unseres
+    // zuletzt gesetzten Wertes. Das ersetzt zugleich den früheren Schutz gegen
+    // Aufaddieren: Es steht gar nichts mehr da, worauf sich addieren ließe.
+    for (i = 0; i < GESETZT.length; i++) {
+      var merk = KLEBER.get(GESETZT[i]);
+      if (!merk) continue;
+      if (merk.inline) GESETZT[i].style.setProperty("top", merk.inline, merk.prio);
+      else GESETZT[i].style.removeProperty("top");
+    }
+    GESETZT.length = 0;
+
+    // SCHRITT 2 — LESEN. Kein Schreiben in dieser Schleife: messen und setzen
+    // im Wechsel erzwingt pro Element ein neues Layout, und auf einer gebauten
+    // Kundenseite mit tausenden Knoten wird daraus eine Hängepartie.
     var alle = document.querySelectorAll("*");
-    // ERST LESEN, DANN SCHREIBEN. In einer Schleife zu messen und zu setzen
-    // erzwingt pro Element ein neues Layout; auf einer gebauten Kundenseite mit
-    // tausenden Knoten wird daraus eine sichtbare Hängepartie bei jedem
-    // Umbruch der Leiste. Zwei Durchgänge kosten nichts und vermeiden das.
     var treffer = [];
-    for (var i = 0; i < alle.length; i++) {
-      var knoten = alle[i];
+    for (i = 0; i < alle.length; i++) {
+      knoten = alle[i];
       // Die eigene Hülle ausnehmen — sie ist selbst `position:fixed;inset:0`
       // und schöbe sonst die Leiste vor sich her. `contains` schließt die Hülle
       // selbst mit ein; alle Panels sitzen darin.
       if (shell && shell.contains(knoten)) continue;
-      var cs = getComputedStyle(knoten);
-      if (cs.position !== "sticky" && cs.position !== "fixed") continue;
+      cs = getComputedStyle(knoten);
+      var pos = cs.position;
+      if (pos !== "sticky" && pos !== "fixed") continue;
+      if (cs.top === "auto") continue;
+      var alt = parseFloat(cs.top);
+      if (!isFinite(alt)) continue;
+      // Liegt es überhaupt in dem Streifen, den die Leiste verdeckt?
+      if (alt >= barh) continue;
+      // Füllt es den ganzen Bildschirm? Dann ist Verschieben nur Verlust.
+      if (knoten.getBoundingClientRect().height >= window.innerHeight) continue;
+      // Misst es überhaupt am Fenster — oder an einem eigenen Kasten?
+      if (!klebtAmFenster(knoten, pos)) continue;
       if (!KLEBER.has(knoten)) {
-        if (cs.top === "auto") continue;
-        var alt = parseFloat(cs.top);
-        if (!isFinite(alt)) continue;
-        // Liegt es überhaupt in dem Streifen, den die Leiste verdeckt?
-        if (alt >= barh) continue;
-        // Füllt es den ganzen Bildschirm? Dann ist Verschieben nur Verlust.
-        if (knoten.getBoundingClientRect().height >= window.innerHeight) continue;
-        // Klebt es an einem eigenen Rollbereich statt am Fenster?
-        if (cs.position === "sticky" && !klebtAmFenster(knoten)) continue;
-        KLEBER.set(knoten, alt);
+        KLEBER.set(knoten, {
+          inline: knoten.style.getPropertyValue("top"),
+          prio: knoten.style.getPropertyPriority("top"),
+        });
       }
-      treffer.push(knoten);
+      treffer.push({ el: knoten, alt: alt });
     }
-    for (var j = 0; j < treffer.length; j++) {
+
+    // SCHRITT 3 — SCHREIBEN.
+    for (i = 0; i < treffer.length; i++) {
       // `important`, weil die Kundenseite ihr eigenes `top` per Stylesheet
       // setzt — ein Inline-Stil ohne Vorrang verlöre gegen `!important` dort.
-      treffer[j].style.setProperty("top", KLEBER.get(treffer[j]) + barh + "px", "important");
+      treffer[i].el.style.setProperty("top", treffer[i].alt + barh + "px", "important");
+      GESETZT.push(treffer[i].el);
     }
   }
 

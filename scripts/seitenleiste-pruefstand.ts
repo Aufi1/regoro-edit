@@ -215,16 +215,19 @@ const KOPF_PRUEFUNG =
   "var ban=document.querySelector('.pruefstand-banner');" +
   "var voll=document.querySelector('.pruefstand-vollbild');" +
   "var tk=document.querySelector('.pruefstand-tabellenkopf');" +
+  "var rk=document.querySelector('.pruefstand-rahmen-kind');" +
   "return {ueberdeckung:Math.max(0,Math.round(bar.bottom-kopf.top))," +
   "kopfSichtbar:kopf.top>=0&&kopf.bottom<=innerHeight," +
   "bannerKlebtUnten:Math.round(ban.getBoundingClientRect().bottom)===innerHeight," +
   "vollbildUnberuehrt:Math.round(voll.getBoundingClientRect().top)===0," +
   "tabellenkopfUnberuehrt:getComputedStyle(tk).top==='0px'," +
+  "rahmenkindUnberuehrt:getComputedStyle(rk).top==='0px'," +
   "gescrollt:scrollY>0,panelZu:!document.querySelector('#__regoro-agent')};})())";
 
 const KOPF_SOLL =
   '{"ueberdeckung":0,"kopfSichtbar":true,"bannerKlebtUnten":true,' +
   '"vollbildUnberuehrt":true,"tabellenkopfUnberuehrt":true,' +
+  '"rahmenkindUnberuehrt":true,' +
   '"gescrollt":true,"panelZu":true}';
 
 const FAELLE: Record<string, Fall> = {
@@ -696,7 +699,45 @@ const FAELLE: Record<string, Fall> = {
     ereignisse: [],
   },
 
-  "ohne-ki": {
+  /**
+   * DER AUSGANGSWERT DARF NICHT EINFRIEREN — der zweite Fehler dieser Familie.
+   *
+   * Der Kopf `.pruefstand-mq` will unter 900 px Breite 20 px Abstand und
+   * darüber 0. Der Fall lädt deshalb SCHMAL (Sollwert 20) und misst BREIT
+   * (Sollwert 0). Wer den Ausgangswert beim ersten Erfassen einfriert, trägt
+   * die 20 ins breite Fenster mit — und weil das eigene `!important` jedes
+   * erneute Lesen verdeckt, bleibt der falsche Wert für immer stehen.
+   *
+   * Die Richtung ist wesentlich: Andersherum gemessen (breit laden, schmal
+   * messen) wäre der eingefrorene Wert zufällig richtig, und der Fall bliebe
+   * grün, obwohl der Fehler dasteht.
+   */
+  "kopf-mediaquery": {
+    tun:
+      "Seite in 390×844 laden (Seitenleiste bleibt zu), dann auf 1440×900 " +
+      "wechseln und scrollen.",
+    erwartung:
+      "Der Kopf sitzt GENAU eine Leistenhöhe unter der Oberkante — sein " +
+      "Media-Query-Abstand für schmale Fenster (20 px) darf im breiten Fenster " +
+      "nicht mehr mitgerechnet werden. Der Ausgangswert wird bei jedem Durchlauf " +
+      "neu gelesen, nicht einmal gemerkt.",
+    ki: true,
+    leisteZu: true,
+    klebrigerKopf: true,
+    viewport: "390x844",
+    schritte: ["viewport 1440x900", SCROLLEN],
+    pruefung:
+      "JSON.stringify((function(){" +
+      "var mq=document.querySelector('.pruefstand-mq');" +
+      "var barh=parseFloat(getComputedStyle(document.documentElement)" +
+      ".getPropertyValue('--regoro-barh'));" +
+      "return {mqVersatzUeberBarh:Math.round(parseFloat(getComputedStyle(mq).top)-barh)," +
+      "breit:innerWidth>900,barhPlausibel:barh>20};})())",
+    sollwert: '{"mqVersatzUeberBarh":0,"breit":true,"barhPlausibel":true}',
+    ereignisse: [],
+  },
+
+    "ohne-ki": {
     tun: "Seite laden, die obere Leiste ansehen.",
     erwartung:
       "KEIN Knopf „KI-Assistent“ und kein `#__regoro-agent` im DOM — die Seitenleiste " +
@@ -729,6 +770,8 @@ const ERSCHOEPFT = "erschoepft";
 const KLEBRIGER_KOPF = `<header class="pruefstand-kopf" data-edit-idx="90">Kopf der Kundenseite</header>
 <div class="pruefstand-banner">Cookie-Hinweis der Kundenseite</div>
 <div class="pruefstand-vollbild">Vollbild-Overlay der Kundenseite</div>
+<div class="pruefstand-rahmen"><div class="pruefstand-rahmen-kind">Dialog im transformierten Kasten</div></div>
+<div class="pruefstand-mq">Kopf mit Media-Query-Abstand</div>
 <div class="pruefstand-rollbereich">
   <div class="pruefstand-tabellenkopf">Tabellenkopf im eigenen Rollbereich</div>
   ${Array.from({ length: 20 }, (_, i) => `<p>Zeile ${i + 1}</p>`).join("\n")}
@@ -755,7 +798,19 @@ const KLEBRIGER_KOPF_CSS =
   // eigenen Rollbereich gerät nie hinter die Editor-Leiste — sie um deren Höhe
   // zu versetzen, schöbe sie nur innerhalb ihres Kastens nach unten.
   ".pruefstand-rollbereich{height:150px;overflow:auto;border:1px solid #999;margin:12px 0}" +
-  ".pruefstand-tabellenkopf{position:sticky;top:0;background:#eee;padding:4px}";
+  ".pruefstand-tabellenkopf{position:sticky;top:0;background:#eee;padding:4px}" +
+  // Vierter Grenzfall: `position:fixed` misst NICHT am Fenster, wenn ein
+  // Vorfahr einen Bezugsrahmen aufspannt (`transform` & Co.). Ein Dialog darin
+  // kam mit der Leiste nie in Berührung; ihn zu versetzen schöbe ihn nur
+  // innerhalb seines Kastens daneben.
+  ".pruefstand-rahmen{transform:translateZ(0);position:relative;height:60px}" +
+  ".pruefstand-rahmen-kind{position:fixed;top:0;left:0;pointer-events:none;" +
+  "background:#4a4;color:#fff;padding:4px}" +
+  // Fünfter Grenzfall: ein klebender Kopf, dessen Sollabstand von der
+  // FENSTERBREITE abhängt. Wer den Ausgangswert einmal einfriert, trägt den
+  // Wert der ersten gemessenen Breite für immer weiter.
+  ".pruefstand-mq{position:sticky;top:0;background:#556;color:#fff;padding:4px}" +
+  "@media (max-width:900px){.pruefstand-mq{top:20px}}";
 
 function seite(ki: boolean, klebrigerKopf = false): string {
   const cfg = {
