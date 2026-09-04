@@ -17,8 +17,10 @@
 import { dirname, resolve } from "node:path";
 import { readdirSync, realpathSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { loadAuthFile } from "./auth.ts";
+import { loadAuthFile, type AuthConfig } from "./auth.ts";
 import { loadKiConfig, type KiConfig } from "./betreiber-config.ts";
+import { schwebendPfad } from "./arbeitskopie.ts";
+import { entwurfPfad } from "./entwurf.ts";
 import type { HostCtx } from "./host.ts";
 import type { Versand } from "./versand.ts";
 
@@ -45,8 +47,16 @@ export const PAGE_RE = /^[a-z0-9-]+\.html$/;
  * host.ts hätte aber einen Zyklus gebaut (host → agent → validate → host), und
  * in einem Zyklus ist eine Konstante beim Import des Partners noch nicht
  * initialisiert: `Object.keys(ASSET_TYPES)` auf Modulebene wirft dann, je nach
- * Importreihenfolge. sites.ts ist zur Laufzeit ein Blatt (aus host.ts kommt nur
- * `type HostCtx`, und Typ-Importe werden wegkompiliert), deshalb wohnt sie hier.
+ * Importreihenfolge. sites.ts hat zur Laufzeit KEINE Kante zu host.ts (von dort
+ * kommt nur `type HostCtx`, und Typ-Importe werden wegkompiliert), deshalb
+ * wohnt sie hier.
+ *
+ * Ein vollständiges Blatt ist sites.ts seit dem Entwurfs-Umbau nicht mehr —
+ * `buildCtx` braucht `entwurfPfad`/`schwebendPfad` für die Pfade des Ctx. Beide
+ * Ketten (entwurf → arbeitskopie/git/veroeffentlichen → apply → contract) enden
+ * ohne Rückweg hierher; nachgesehen. **Die Bedingung ist nicht „Blatt", sondern
+ * „kein Weg zurück nach host.ts oder sites.ts".** Wer hier importiert, prüft
+ * das — sonst kehrt der Zyklus über die Hintertür zurück.
  *
  * **Daraus folgt eine Regel:** Neue Leser importieren `ASSET_TYPES` und
  * `PAGE_RE` aus DIESER Datei. host.ts re-exportiert beide nur der Bequemlichkeit
@@ -158,6 +168,171 @@ export function resolveSite(sitesRoot: string, host: string | null | undefined):
     return null;
   }
   return { host: normalized, siteDir: real };
+}
+
+/**
+ * Das Präfix des Staging-Betriebs. Eine Preview wohnt unter
+ * `https://intern.sites.aufi.de/p/<slug>/` — der Kundenname steht im PFAD und
+ * nicht im Hostnamen, damit er nicht in den öffentlichen
+ * Certificate-Transparency-Logs landet (dort steht nur `intern.sites.aufi.de`,
+ * einmal).
+ */
+export const STAGING_PREFIX = "/p/";
+
+/**
+ * Ein Preview-Slug: EIN Pfadsegment, kleingeschrieben, Ziffern und
+ * Bindestriche, weder vorn noch hinten ein Bindestrich.
+ *
+ * **Punkte sind vollständig verboten — strenger als `HOST_RE`.** Der Slug wird
+ * zum Verzeichnisnamen, genau wie der normalisierte Host; anders als dort gibt
+ * es hier aber keinen legitimen Grund für einen Punkt (ein Ordnername unter dem
+ * Preview-Verzeichnis ist `bergdolt-c89a`, kein Domainname). Und ein Punkt ist
+ * der einzige Hebel für `..`. Ihn gar nicht erst zuzulassen ist die Fassung,
+ * die man nicht falsch schreiben kann.
+ */
+export const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
+
+/**
+ * Wie `MAX_HOST_LEN`, nur für ein einzelnes Label: 63 Zeichen. Der Wert stammt
+ * aus der DNS-Label-Grenze und ist hier keine fachliche Notwendigkeit, sondern
+ * dieselbe Vorsichtsmaßnahme wie oben — was in einen Pfad eingesetzt wird,
+ * bekommt vorher einen Deckel.
+ */
+const MAX_SLUG_LEN = 63;
+
+export interface StagingRef {
+  /** Der geprüfte Slug — zugleich der Ordnername. */
+  slug: string;
+  /** Absoluter, REALER Pfad des Site-Ordners (Symlinks aufgelöst). */
+  siteDir: string;
+  /** Der Pfad OHNE Präfix, beginnt immer mit "/". Das sieht `route()`. */
+  rest: string;
+  /** `"/p/" + slug`, NIE mit Schrägstrich am Ende (siehe HostCtx.basis). */
+  basis: string;
+}
+
+/**
+ * Die ZWEITE Auflösungsart neben `resolveSite`: Anfrage → Website über einen
+ * Pfad-Abschnitt statt über den Host-Header.
+ *
+ * Damit steht die **erste Stütze** der Kundentrennung (CLAUDE.md, Invariante 10)
+ * auf einem zweiten Bein, und das muss dieselbe Strenge haben wie
+ * `normalizeHost` — das ja zugleich der Traversal-Schutz ist. Dieselben drei
+ * Schranken wie in `resolveSite`: Zeichenprüfung, lexikalisches „direktes Kind",
+ * realpath + `isDirectory()`.
+ *
+ * **Bewusst wird hier NICHTS normalisiert** — kein `toLowerCase`, kein
+ * abgeschnittenes `www.`, kein Wurzelpunkt. Das ist der eine Punkt, an dem
+ * diese Funktion von `normalizeHost` abweicht, und er ist Absicht: Ein
+ * Host-Header schwankt legitim in der Schreibweise, weil ihn Browser und
+ * Zwischenstationen setzen; ein Pfadsegment ist das, was der Betreiber in den
+ * Link geschrieben hat. `/p/KUNDE/` wird deshalb abgelehnt und nicht
+ * kleingeschrieben. Sonst gäbe es zwei URLs für dieselbe Website — und auf
+ * einem case-insensitiven Dateisystem wäre die Faltung ein Weg, an der
+ * Zeichenprüfung vorbei denselben Ordner unter einem anderen Namen zu treffen.
+ *
+ * `path` ist der ROHE `url.pathname`, nicht dekodiert. Das ist wichtig:
+ * `%2e%2e` oder `%00` im Slug fallen so an `SLUG_RE` (das Prozentzeichen ist
+ * darin nicht enthalten), statt vorher zu etwas anderem zu werden. Dass der
+ * WHATWG-Parser Punkt-Segmente ohnehin wegnormalisiert, bevor eine echte
+ * Anfrage hier ankommt, wird NICHT vorausgesetzt — die Schranke darf nicht an
+ * der Normalisierung eines Parsers hängen. Dieselbe Überlegung wie bei der
+ * `dirname`-Prüfung in `resolveSite`.
+ *
+ * Ein Unterordner darf ein Symlink nach außen sein, genau wie im Sammelbetrieb
+ * (Betreiber mounten Sites so); zurückgegeben wird dann der AUFGELÖSTE Pfad,
+ * damit `pathInsideSite` später gegen dasselbe Ziel prüft. Der Traversal-Schutz
+ * sitzt davor und ist lexikalisch.
+ */
+/**
+ * Prüft die Segmente des Restpfades auf das, was Proxy und Editor VERSCHIEDEN
+ * lesen könnten — und lehnt ab, statt zu normalisieren.
+ *
+ * Der Hintergrund ist eine gemessene Kante: **Caddy prüft den normalisierten
+ * Pfad, reicht aber den rohen weiter.** Für `/p/kunde-a/%2e%2e/kunde-b/edit`
+ * hat der Matcher gegen `/p/kunde-b/edit` entschieden und `kunde-b`
+ * freigegeben, während auf der Leitung ein Pfad ankommt, dessen erstes Segment
+ * nach `/p/` `kunde-a` lautet.
+ *
+ * Einig sind beide Seiten trotzdem — aber nicht zufällig: Die WHATWG-URL-Norm
+ * zählt `..`, `%2e%2e`, `.%2e` und `%2e.` ausdrücklich als Doppelpunkt-Segment
+ * und entfernt sie, und genau dieselbe Regel wendet Caddy an. Deshalb MUSS der
+ * Slug aus `new URL(req.url).pathname` kommen und nicht aus der Zeichenkette
+ * davor: Beide Auslegungen zitieren an derselben Stelle dieselbe Norm.
+ * „Roh" heißt hier **nicht prozent-dekodiert**, nicht „nicht normalisiert".
+ *
+ * Was der Parser NICHT wegräumt, bleibt gefährlich und wird deshalb hier
+ * abgewiesen:
+ *   - leere Segmente (`/p/kunde-a//edit`) — der Slug stimmt mit Caddy überein,
+ *     der Rest läuft ins Leere. Fail-closed, aber unbemerkt.
+ *   - `%2f` — wird später zu einem Schrägstrich und wäre damit eine DRITTE
+ *     Lesart desselben Pfades.
+ *   - `.`/`..` in jeder Kodierung, falls diese Funktion je ohne URL-Parser
+ *     aufgerufen wird. Die Schranke darf nicht an der Normalisierung eines
+ *     Parsers hängen — dieselbe Überlegung wie bei der `dirname`-Prüfung.
+ *
+ * Abweisen und nicht selbst normalisieren: Drei Auslegungen desselben Pfades
+ * wären schlimmer als zwei.
+ */
+function restSauber(rest: string): boolean {
+  const segmente = rest.split("/");
+  // segmente[0] ist immer "" — `rest` beginnt per Konstruktion mit "/".
+  for (let i = 1; i < segmente.length; i++) {
+    const segment = segmente[i]!;
+    if (segment === "") {
+      // Leer ist nur ganz am Ende zulässig: der abschließende Schrägstrich.
+      if (i !== segmente.length - 1) return false;
+      continue;
+    }
+    if (/%2f/i.test(segment)) return false;
+    let entschluesselt: string;
+    try {
+      entschluesselt = decodeURIComponent(segment);
+    } catch {
+      // Kaputte Prozent-Kodierung: hier kein Urteil. Sie ist keine zweite
+      // Lesart des Pfades, und wer sie auflösen will, scheitert später ohnehin.
+      continue;
+    }
+    if (entschluesselt === "." || entschluesselt === "..") return false;
+  }
+  return true;
+}
+
+export function resolveStagingPath(sitesRoot: string, path: string): StagingRef | null {
+  if (typeof path !== "string" || !path.startsWith(STAGING_PREFIX)) return null;
+
+  const nachPraefix = path.slice(STAGING_PREFIX.length);
+  const schnitt = nachPraefix.indexOf("/");
+  const slug = schnitt === -1 ? nachPraefix : nachPraefix.slice(0, schnitt);
+  // Ohne Schrägstrich ist es dieselbe Website, nicht 404: sonst hinge die
+  // Erreichbarkeit einer Preview daran, ob jemand den Link mit oder ohne
+  // Schrägstrich weitergibt.
+  const rest = schnitt === -1 ? "/" : nachPraefix.slice(schnitt);
+
+  if (slug.length === 0 || slug.length > MAX_SLUG_LEN) return null;
+  if (!SLUG_RE.test(slug)) return null;
+  if (!restSauber(rest)) return null;
+
+  let root: string;
+  try {
+    root = realpathSync(resolve(sitesRoot));
+  } catch {
+    return null;
+  }
+
+  const abs = resolve(root, slug);
+  // Wie in resolveSite: SLUG_RE schließt "/" und ".." bereits aus, diese
+  // Prüfung ist die zweite, von der Textform unabhängige Schranke.
+  if (dirname(abs) !== root) return null;
+
+  let real: string;
+  try {
+    real = realpathSync(abs);
+    if (!statSync(real).isDirectory()) return null;
+  } catch {
+    return null;
+  }
+  return { slug, siteDir: real, rest, basis: STAGING_PREFIX + slug };
 }
 
 export interface SiteEntry {
@@ -350,26 +525,64 @@ export function erstelleSecretWache(
  * Anfrage entsteht, wirkt `regoro ki --off` ohne Neustart. Betreiberweit
  * gelesen, nicht aus dem Kundenordner — ein Modellzugang bedient alle Kunden.
  */
-export function buildCtx(site: SiteRef, wache?: SecretWache, versand?: Versand | null): HostCtx {
+export interface CtxOptionen {
+  wache?: SecretWache;
+  versand?: Versand | null;
+  /** URL-Präfix dieser Website (siehe `HostCtx.basis`). Ohne Angabe: `""`. */
+  basis?: string;
+  /** Staging-Betrieb. Ohne Angabe: `false` — der Produktionsfall. */
+  staging?: boolean;
+  /**
+   * Ersetzt die aus dem Ordner gelesene Auth-Konfiguration.
+   *
+   * **Nur der Staging-Aussteller in `server.ts` setzt das.** Eine Preview hat
+   * in aller Regel gar keine `auth.json` (es gibt noch keinen Kunden, also auch
+   * keine hinterlegte Kennung), und ohne eine Auth-Konfiguration wäre der
+   * Editor dort fail-closed aus. Der Staging-Handler reicht deshalb ein
+   * flüchtiges, prozesseigenes Geheimnis herein.
+   *
+   * Im Produktionsbetrieb bleibt das Feld unbesetzt, und es gibt dort keinen
+   * Aufrufer, der es besetzen könnte — dieselbe Bauweise wie bei `staging`
+   * selbst (Contract C12).
+   */
+  ersatzAuth?: AuthConfig | null;
+}
+
+export function buildCtx(site: SiteRef, opts: CtxOptionen = {}): HostCtx {
+  const { wache, versand, basis = "", staging = false, ersatzAuth } = opts;
+  const entwurfDir = entwurfPfad(site.siteDir);
   let pages: string[] | undefined;
-  let auth: ReturnType<typeof loadAuthFile> | undefined;
+  let auth: AuthConfig | null | undefined;
   let ki: KiConfig | null | undefined;
   return {
-    repoRoot: site.siteDir,
+    // Die Historie lebt im Entwurfs-Repo, nicht mehr im Site-Ordner
+    // (Invariante 9). Der Site-Ordner ist der ausgelieferte Abzug.
+    repoRoot: entwurfDir,
+    entwurfDir,
+    schwebendDir: schwebendPfad(site.siteDir),
     siteDir: site.siteDir,
+    basis,
+    staging,
     sitePrefix: "",
     versand: versand ?? null,
     get pageWhitelist(): string[] {
-      return (pages ??= discoverPages(site.siteDir));
+      // Aus dem ENTWURF, nicht aus dem Site-Ordner: Der Editor bearbeitet den
+      // Entwurf, und eine dort neu angelegte Seite muss in seiner Liste stehen,
+      // bevor sie je veröffentlicht wurde.
+      return (pages ??= discoverPages(entwurfDir));
     },
     get auth() {
       if (auth === undefined) {
-        const geladen = loadAuthFile(site.siteDir);
-        // Geteiltes Geheimnis = kein Editor (siehe SecretWache).
-        auth =
-          geladen !== null && wache !== undefined && !wache.istEindeutig(site.siteDir)
-            ? null
-            : geladen;
+        if (ersatzAuth !== undefined) {
+          auth = ersatzAuth;
+        } else {
+          const geladen = loadAuthFile(site.siteDir);
+          // Geteiltes Geheimnis = kein Editor (siehe SecretWache).
+          auth =
+            geladen !== null && wache !== undefined && !wache.istEindeutig(site.siteDir)
+              ? null
+              : geladen;
+        }
       }
       return auth;
     },

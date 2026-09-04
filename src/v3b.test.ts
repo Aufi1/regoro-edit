@@ -14,6 +14,7 @@ import { parseHTML } from "linkedom";
 import { mkdtempSync, rmSync, mkdirSync, cpSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { schwebendPfad } from "./arbeitskopie.ts";
 
 const TEST_SECRET = "testsecret-aaaaaaaaaaaaaaaaaaaaaaaa";
 const TEST_NUMMER = "+4915120464812";
@@ -409,7 +410,19 @@ describe("host.ts — /edit/save akzeptiert v3-B-Ops", () => {
     mkdirSync(siteDir, { recursive: true });
     cpSync(REAL_SITE, siteDir, { recursive: true });
     git.ensureRepo(repoRoot);
-    ctx = { repoRoot, siteDir, pageWhitelist: PAGE_WHITELIST, auth: TEST_AUTH };
+    // Drei Orte statt einem (Contract C1). Diese Vorrichtung stammt von davor:
+    // Entwurfs-Sicht und Abzug liegen hier auf demselben Ordner, damit die
+    // Zusicherungen dieses Blocks weiterhin den Router messen und nicht die Ablage.
+    ctx = {
+      repoRoot,
+      entwurfDir: siteDir,
+      schwebendDir: schwebendPfad(siteDir),
+      siteDir,
+      basis: "",
+      staging: false,
+      pageWhitelist: PAGE_WHITELIST,
+      auth: TEST_AUTH,
+    };
   });
 
   function authCookie(): string {
@@ -517,8 +530,14 @@ describe("host.ts — /edit/save akzeptiert v3-B-Ops", () => {
     const cookie = authCookie();
     const res = await save(cookie, "site/index.html", "0".repeat(64), [{ idx: 0, bold: true }]);
     expect(res.status).toBe(409);
-    const json = (await res.json()) as { error?: string };
-    expect(json.error).toBe("hash-mismatch");
+    // Die Fehlerform ist seit „Eine Bearbeitung, zwei Modi" durchgängig
+    // `{"fehler":<kennung>,"grund":<deutscher Satz>}` (Contract C2), und der
+    // Hash-Konflikt trägt die eigene Kennung `konflikt`. Sie ist nötig, weil
+    // derselbe Statuscode inzwischen zwei Bedeutungen hat: Auch der Riegel
+    // gegen eine offene KI-Änderung antwortet 409.
+    const json = (await res.json()) as { fehler?: string; grund?: string };
+    expect(json.fehler).toBe("konflikt");
+    expect(typeof json.grund).toBe("string");
   });
 
   test("Save delete mit pagePath-Traversal → 404", async () => {
@@ -695,7 +714,19 @@ describe("host.ts — v3-B Lücken: href-Edgecases auf Save-Ebene", () => {
     mkdirSync(siteDir, { recursive: true });
     cpSync(REAL_SITE, siteDir, { recursive: true });
     git.ensureRepo(repoRoot);
-    ctx = { repoRoot, siteDir, pageWhitelist: PAGE_WHITELIST, auth: TEST_AUTH };
+    // Drei Orte statt einem (Contract C1). Diese Vorrichtung stammt von davor:
+    // Entwurfs-Sicht und Abzug liegen hier auf demselben Ordner, damit die
+    // Zusicherungen dieses Blocks weiterhin den Router messen und nicht die Ablage.
+    ctx = {
+      repoRoot,
+      entwurfDir: siteDir,
+      schwebendDir: schwebendPfad(siteDir),
+      siteDir,
+      basis: "",
+      staging: false,
+      pageWhitelist: PAGE_WHITELIST,
+      auth: TEST_AUTH,
+    };
   });
 
   function authCookie(): string {

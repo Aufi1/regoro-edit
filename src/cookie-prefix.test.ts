@@ -10,7 +10,9 @@
  *      Cookie dauerhaft aussperren (kein Bypass — die Signatur schlägt fehl —,
  *      aber ein persistenter DoS gegen andere Kunden derselben Domain).
  */
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
+import { cpSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   cookieName,
@@ -21,10 +23,17 @@ import {
   type AuthConfig,
 } from "./auth.ts";
 import { handleEditorRequest, type HostCtx } from "./host.ts";
+import { entwurfPfad, stelleEntwurfBereit } from "./entwurf.ts";
+import { schwebendPfad } from "./arbeitskopie.ts";
 
 const TEST_SECRET = "test-secret-aaaaaaaaaaaaaaaaaaaa";
 const REPO_ROOT = join(import.meta.dir, "..");
 const REAL_SITE = join(REPO_ROOT, "examples", "site");
+
+const tmpDirs: string[] = [];
+afterAll(() => {
+  for (const d of tmpDirs) rmSync(d, { recursive: true, force: true });
+});
 
 /** Ruft eine auth.ts-Funktion in einem frischen Prozess mit gesetztem Env auf. */
 function inSubprocess(insecure: string | null, expr: string): string {
@@ -116,8 +125,12 @@ describe("host.ts — Warnung vor unsicherem Origin auf der Login-Seite", () => 
   async function loginPage(host: string, headers: Record<string, string> = {}) {
     const auth: AuthConfig = { nummern: ["+4915120464812"], emails: [], secret: TEST_SECRET };
     const ctx: HostCtx = {
-      repoRoot: REPO_ROOT,
+      repoRoot: entwurfPfad(REAL_SITE),
+      entwurfDir: entwurfPfad(REAL_SITE),
+      schwebendDir: schwebendPfad(REAL_SITE),
       siteDir: REAL_SITE,
+      basis: "",
+      staging: false,
       pageWhitelist: ["index.html"],
       auth,
     };
@@ -162,9 +175,23 @@ describe("host.ts — untergeschobenes Cookie sperrt die echte Session nicht aus
 
   async function setup() {
     auth = { nummern: ["+4915120464812"], emails: [], secret: TEST_SECRET };
+    /**
+     * Eine tmp-KOPIE, nicht `examples/site` selbst: Die Editor-Sicht kommt seit
+     * C1 aus dem Entwurfs-Repo, und das müsste sonst im Repo angelegt werden —
+     * ein `.git` in `examples/site`, das dort nichts zu suchen hat.
+     */
+    const siteDir = mkdtempSync(join(tmpdir(), "regoro-cookie-"));
+    tmpDirs.push(siteDir);
+    cpSync(REAL_SITE, siteDir, { recursive: true });
+    stelleEntwurfBereit(siteDir);
     ctx = {
-      repoRoot: REPO_ROOT,
-      siteDir: REAL_SITE,
+      repoRoot: entwurfPfad(siteDir),
+      entwurfDir: entwurfPfad(siteDir),
+      schwebendDir: schwebendPfad(siteDir),
+      siteDir,
+      basis: "",
+      staging: false,
+      sitePrefix: "",
       pageWhitelist: ["index.html"],
       auth,
     };

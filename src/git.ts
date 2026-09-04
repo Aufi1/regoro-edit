@@ -75,6 +75,16 @@ export function ensureRepo(repoRoot: string): void {
 const EMPTY_REPO_RE = /unknown revision|ambiguous argument|Needed a single revision|bad revision/i;
 
 /**
+ * „Es gab nichts zu committen" — locale-robust (EN + DE-Varianten von Git).
+ *
+ * Eine Konstante, weil zwei Stellen sie brauchen (`commitEdit` mit Pfadangabe,
+ * `commitAlles` ohne). Getrennt gepflegt drifteten sie auseinander, und ein
+ * no-op wäre auf einem der beiden Wege plötzlich ein Fehler.
+ */
+const NO_OP_COMMIT_RE =
+  /nothing to commit|no changes added|nichts zu committen|nichts zum Commit vorgemerkt|keine Änderungen/i;
+
+/**
  * Zählt die Commits im Repo.
  *   0    = kein Repo, oder ein Repo ganz ohne Commit
  *   n>0  = so viele Commits
@@ -137,23 +147,59 @@ export function commitEdit(repoRoot: string, pagePath: string | string[], msg: s
     const stdout = new TextDecoder().decode(res.stdout);
     const combined = stdout + stderr;
     // No-op tolerieren (locale-robust: EN + DE-Varianten von Git).
-    if (
-      /nothing to commit|no changes added|nichts zu committen|nichts zum Commit vorgemerkt|keine Änderungen/i.test(
-        combined,
-      )
-    ) {
+    if (NO_OP_COMMIT_RE.test(combined)) {
       return;
     }
     throw new Error(`git commit fehlgeschlagen (${res.exitCode}): ${combined}`);
   }
 }
 
-/** Versionshistorie für pagePath, neueste zuerst. */
-export function listVersions(repoRoot: string, pagePath: string): Version[] {
-  const out = git(
-    repoRoot,
-    "log", "--follow", "--format=%H%x1f%aI%x1f%s", "--", pagePath,
-  );
+/**
+ * Committet den INDEX, wie er gerade ist — ohne Pfadangabe; no-op-tolerant.
+ *
+ * Das Gegenstück zu `commitEdit`: die committet einzelne Pfade aus dem
+ * Arbeitsbaum, diese hier den bereits gesetzten Index. Genau das braucht
+ * `restoreVersion`, denn `read-tree` schreibt sein Ergebnis in den Index, und
+ * eine Pfadliste gäbe es dafür gar nicht — die Wiederherstellung besteht ja
+ * auch aus Löschungen, und `git commit -- <pfad>` bräuchte jeden einzelnen
+ * davon namentlich.
+ *
+ * Gemessen: Deckt sich Zieltree und HEAD-Tree, meldet git „nichts zu committen,
+ * Arbeitsverzeichnis unverändert" mit rc=1 — das Wiederherstellen auf den Stand,
+ * auf dem man schon steht, ist kein Fehler und erzeugt keine Leer-Version.
+ */
+function commitAlles(repoRoot: string, msg: string): void {
+  const res = Bun.spawnSync([
+    "git", "-C", repoRoot,
+    "-c", "user.name=Regoro Editor",
+    "-c", "user.email=editor@regoro.local",
+    "commit", "-m", msg,
+  ]);
+  if (res.exitCode !== 0) {
+    const combined =
+      new TextDecoder().decode(res.stdout) + new TextDecoder().decode(res.stderr);
+    if (NO_OP_COMMIT_RE.test(combined)) return;
+    throw new Error(`git commit fehlgeschlagen (${res.exitCode}): ${combined}`);
+  }
+}
+
+/**
+ * Versionshistorie, neueste zuerst — für `pagePath`, oder für die GANZE Website,
+ * wenn kein Pfad angegeben ist.
+ *
+ * Seit „Eine Bearbeitung, zwei Modi" gilt eine Version für die ganze Website:
+ * `restoreVersion` stellt den ganzen Baum her, also muss die Liste, aus der man
+ * auswählt, dieselbe Einheit zeigen. Die Fassung mit Pfad bleibt, weil die
+ * Vorschau einer einzelnen Seite (`showVersion`) sie weiterhin braucht.
+ *
+ * Ohne Pfad **kein `--follow`** — das verlangt genau einen Pfad und bräche sonst
+ * mit „fatal: option '--follow' requires exactly one pathspec".
+ */
+export function listVersions(repoRoot: string, pagePath?: string): Version[] {
+  const out =
+    pagePath === undefined
+      ? git(repoRoot, "log", "--format=%H%x1f%aI%x1f%s")
+      : git(repoRoot, "log", "--follow", "--format=%H%x1f%aI%x1f%s", "--", pagePath);
   const versions: Version[] = [];
   for (const line of out.split("\n")) {
     if (!line.trim()) continue;
@@ -171,14 +217,52 @@ export function showVersion(repoRoot: string, commit: string, pagePath: string):
   return git(repoRoot, "show", "--end-of-options", `${commit}:${pagePath}`);
 }
 
-/** Stellt pagePath auf den Stand von commit zurück und committet das als neue Version. */
-export function restoreVersion(repoRoot: string, commit: string, pagePath: string): void {
-  // Hinweis: `git checkout --end-of-options <rev> -- <path>` ist NICHT möglich
-  // (git verlangt genau eine Referenz, --end-of-options bricht den rev/path-Split).
-  // Schutz gegen Argument-Injection erfolgt daher im Host: commit ist strikt gegen
-  // ^[0-9a-f]{7,40}$ validiert → kann nie mit "-" beginnen / als Flag wirken.
-  // Das explizite `--` trennt zusätzlich Revision von Pfad.
-  git(repoRoot, "checkout", commit, "--", pagePath);
+/**
+ * Stellt die GANZE Website auf den Stand von `commit` zurück und committet das
+ * als neue Version.
+ *
+ * WARUM NICHT `checkout`. Der frühere Weg (`git checkout <commit> -- <pagePath>`)
+ * stellte genau einen Pfad her und **löschte nie**: Was ein Agentenlauf angelegt
+ * hatte, überlebte jede Wiederherstellung. Der naheliegende Ausbau auf den ganzen
+ * Baum hilft nicht — nachgemessen an einem Wegwerf-Repo (v1: `index.html`;
+ * v2: `index.html` geändert + `zusatz.js` neu):
+ *
+ *   git checkout <v1> -- index.html   → zusatz.js bleibt
+ *   git checkout <v1> -- .            → zusatz.js bleibt
+ *   git read-tree -um <v1>            → zusatz.js weg
+ *
+ * Nur `read-tree` gleicht den Index gegen einen Zielbaum ab und entfernt dabei,
+ * was dort nicht vorkommt.
+ *
+ * WARUM `--reset -u` UND NICHT `-um`. Ebenfalls gemessen, und im Plan nicht
+ * erwähnt: `read-tree -um` bricht bei schmutzigem Arbeitsbaum hart ab
+ * („Entry 'index.html' not uptodate. Cannot merge.", rc=128). Eine einzige nicht
+ * committete Datei im Entwurfs-Repo machte das Wiederherstellen damit dauerhaft
+ * unmöglich — das Sicherheitsnetz wäre tot, genau wenn man es braucht.
+ * `--reset -u` verwirft lokale Änderungen und tut sonst dasselbe. Das ist hier
+ * richtig: „auf Version X zurück" ist eine ausdrückliche Ansage des Kunden, und
+ * jeder gespeicherte Stand ist ohnehin ein Commit.
+ *
+ * WARUM `clean` DANEBEN. `read-tree` fasst **unversionierte** Dateien in keiner
+ * Variante an (gemessen). Ohne diesen Schritt überlebte eine unversionierte Datei
+ * die Wiederherstellung und würde vom Arbeitsbaum-Abzug mitveröffentlicht — also
+ * genau das Loch, das dieser Umbau schließen soll, nur eine Ebene versetzt.
+ *
+ * `-e '.*'` IST TRAGEND, NICHT KOSMETIK. Gemessen: `git clean -fd` ohne diesen
+ * Filter löscht `.regoro/` mitsamt `auth.json` — Sitzungsgeheimnis, Entwurfs-Repo
+ * und schwebende Änderung in einem Zug. Der Filter hält jedes Punkt-Segment
+ * heraus (auch legitime Website-Ordner wie `.well-known/`, ebenfalls gemessen).
+ * Wer ihn entfernt, baut einen Datenverlust ein, den kein Aufrufer abfangen kann.
+ *
+ * Die Historie wächst nur nach vorn: Der wiederhergestellte Stand wird ein NEUER
+ * Commit obendrauf, nichts wird umgeschrieben.
+ */
+export function restoreVersion(repoRoot: string, commit: string): void {
+  // --end-of-options: das commit-Argument nie als Option lesen (Defense-in-depth;
+  // der Host validiert commit bereits gegen ^[0-9a-f]{7,40}$). Anders als bei
+  // `checkout` verträgt `read-tree` das Flag — nachgeprüft.
+  git(repoRoot, "read-tree", "--reset", "-u", "--end-of-options", commit);
+  git(repoRoot, "clean", "-fd", "-e", ".*");
   const iso = new Date().toISOString();
-  commitEdit(repoRoot, pagePath, `Wiederhergestellt: ${iso}`);
+  commitAlles(repoRoot, `Wiederhergestellt: ${iso}`);
 }

@@ -38,7 +38,10 @@ example.com {
     # HIER KEINE CSP: `connect-src 'none'` blockierte jedes fetch des Overlays.
     # Der Editor wäre stumm kaputt — Knöpfe reagieren, nichts wird gespeichert,
     # keine Fehlermeldung.
-    @editor path /edit /edit/* /edit-assets/* */edit
+    # Jedes Muster trägt genau EINEN Stern. Mit zweien gälte Go-path.Match, und
+    # ein Stern stünde für EIN Segment — `/edit/agent/events` fiele dann durch
+    # (mit caddy 2.11.4 nachgemessen).
+    @editor path /edit /edit/* /edit-assets/* /edit-vorschau/* */edit
     handle @editor {
         reverse_proxy localhost:8788 {
             # Der Agentenlauf meldet sich über Server-Sent Events; diese Zeile

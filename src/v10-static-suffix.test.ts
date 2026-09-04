@@ -42,6 +42,9 @@ const DATENSCHUTZ_HTML = `<!doctype html><html lang="de"><head><meta charset="ut
 
 const STYLES_CSS = `body { color: #14324f; }\n`;
 
+import { entwurfPfad, stelleEntwurfBereit } from "./entwurf.ts";
+import { schwebendPfad } from "./arbeitskopie.ts";
+
 const PAGE_WHITELIST = ["index.html", "datenschutz.html"];
 
 const tmpRoots: string[] = [];
@@ -62,9 +65,14 @@ function makeCtx(opts: { withIndex?: boolean; authValue?: auth.AuthConfig | null
   if (withIndex) writeFileSync(join(siteDir, "index.html"), INDEX_HTML, "utf8");
   writeFileSync(join(siteDir, "datenschutz.html"), DATENSCHUTZ_HTML, "utf8");
   writeFileSync(join(siteDir, "styles.css"), STYLES_CSS, "utf8");
+  stelleEntwurfBereit(siteDir);
   return {
-    repoRoot: siteDir,
+    repoRoot: entwurfPfad(siteDir),
+    entwurfDir: entwurfPfad(siteDir),
+    schwebendDir: schwebendPfad(siteDir),
     siteDir,
+    basis: "",
+    staging: false,
     pageWhitelist: PAGE_WHITELIST,
     auth: "authValue" in opts ? opts.authValue! : TEST_AUTH,
     sitePrefix: "",
@@ -316,7 +324,18 @@ describe("M3 — Sicherheit: Auth-Datei-/Dotfile-Web-Block", () => {
     // .git/config-Fixture.
     mkdirSync(join(siteDir, ".git"), { recursive: true });
     writeFileSync(join(siteDir, ".git", "config"), "[core]\n  bare = false\n");
-    ctx = { repoRoot: siteDir, siteDir, pageWhitelist: PAGE_WHITELIST, auth: loaded, sitePrefix: "" };
+    stelleEntwurfBereit(siteDir);
+    ctx = {
+      repoRoot: entwurfPfad(siteDir),
+      entwurfDir: entwurfPfad(siteDir),
+      schwebendDir: schwebendPfad(siteDir),
+      siteDir,
+      basis: "",
+      staging: false,
+      pageWhitelist: PAGE_WHITELIST,
+      auth: loaded,
+      sitePrefix: "",
+    };
   });
 
   async function expectBlocked(path: string): Promise<void> {

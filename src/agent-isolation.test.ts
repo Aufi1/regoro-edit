@@ -38,7 +38,9 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAuthFile } from "./auth.ts";
+import { schwebendDateien, schwebendPfad, schwebendVorhanden } from "./arbeitskopie.ts";
 import type { KiConfig } from "./betreiber-config.ts";
+import { entwurfPfad, stelleEntwurfBereit } from "./entwurf.ts";
 import { countCommits, ensureRepo } from "./git.ts";
 import type { HostCtx } from "./host.ts";
 import { bwrapPfad } from "./sandbox.ts";
@@ -106,7 +108,13 @@ function haveBwrap(): boolean {
  * gehört damit zu den Dingen, die ein Lauf ändern darf. `.regoro/auth.json`
  * bleibt ausdrücklich DRIN: die darf er nicht anfassen.
  */
-const AUSGENOMMEN = new Set([".git", ".regoro/kontingent.json"]);
+/**
+ * `.regoro/entwurf/.git` steht hier, seit die Historie im Entwurf lebt: Der
+ * Arbeitsbaum des Entwurfs GEHÖRT in den Schnappschuss (auch dort darf nichts
+ * ankommen), seine git-Interna nicht — die zählt `countCommits` genauer, und
+ * `.git/index` trägt Stat-Daten, die sich ohne Zutun ändern können.
+ */
+const AUSGENOMMEN = new Set([".git", ".regoro/kontingent.json", ".regoro/entwurf/.git"]);
 
 function schnappschuss(dir: string): Record<string, string> {
   const raus: Record<string, string> = {};
@@ -126,6 +134,7 @@ function schnappschuss(dir: string): Record<string, string> {
 }
 
 let siteDir: string;
+let entwurfDir: string;
 let runtime: string;
 let ctx: HostCtx;
 let vorher: Record<string, string>;
@@ -134,12 +143,20 @@ let commitsVorher: number | null;
 beforeEach(async () => {
   siteDir = tmp("regoro-iso-site-");
   cpSync(REAL_SITE, siteDir, { recursive: true });
-
-  // Reihenfolge wie in `cmdInit` (CLAUDE.md, Invariante 2): erst das Repo mit
-  // dem Baseline-Commit, dann die Auth-Datei — das Secret kann so gar nicht in
-  // die Historie geraten.
-  ensureRepo(siteDir);
   await createAuthFile(siteDir, [NUMMER]);
+
+  /**
+   * Seit „Eine Bearbeitung, zwei Modi" liegt die Historie im Entwurf, nicht im
+   * Site-Ordner (Invariante 9 in neuer Fassung). Der Agent liest aus dem
+   * Entwurf und legt sein Ergebnis in `schwebend/` ab — die ausgelieferte
+   * Website berührt er auf keinem der beiden Wege.
+   *
+   * Das Secret kann dabei so wenig in die Historie geraten wie vorher:
+   * `stelleEntwurfBereit` überträgt keine Punkt-Segmente, `.regoro/` bleibt
+   * draußen (festgenagelt in `entwurf.test.ts`).
+   */
+  stelleEntwurfBereit(siteDir);
+  entwurfDir = entwurfPfad(siteDir);
 
   // Die Arbeitskopien landen unter RUNTIME_DIRECTORY (in Produktion setzt
   // systemd das). Ein eigener tmp-Ordner je Test macht sichtbar, ob wirklich
@@ -148,16 +165,22 @@ beforeEach(async () => {
   process.env.RUNTIME_DIRECTORY = runtime;
 
   ctx = {
-    repoRoot: siteDir,
+    repoRoot: entwurfDir,
+    entwurfDir,
+    schwebendDir: schwebendPfad(siteDir),
     siteDir,
+    basis: "",
+    staging: false,
     pageWhitelist: PAGES,
     auth: null,
     sitePrefix: "",
     ki: KI,
   };
 
+  // EIN Schnappschuss über den ganzen Kundenordner — er umfasst damit den
+  // Abzug, den Arbeitsbaum des Entwurfs UND die Abwesenheit von `schwebend/`.
   vorher = schnappschuss(siteDir);
-  commitsVorher = countCommits(siteDir);
+  commitsVorher = countCommits(entwurfDir);
 });
 
 /**
@@ -191,20 +214,37 @@ async function sammelbetrieb(): Promise<{ fremd: string; fremdesSecret: string; 
   const fremdesSecret = JSON.parse(readFileSync(join(fremd, ".regoro", "auth.json"), "utf8")).secret as string;
   expect(fremdesSecret).toHaveLength(64); // Voraussetzung: es gibt überhaupt eines
 
-  // Unsere eigene Site zieht als Geschwister daneben.
+  // Unsere eigene Site zieht als Geschwister daneben — mitsamt ihrem Entwurf,
+  // der als `.regoro/entwurf` innerhalb des kopierten Ordners mitwandert.
   const eigen = join(sitesRoot, "kunde-a.test");
   cpSync(siteDir, eigen, { recursive: true });
   siteDir = eigen;
-  ctx = { ...ctx, repoRoot: eigen, siteDir: eigen };
+  entwurfDir = entwurfPfad(eigen);
+  ctx = {
+    ...ctx,
+    repoRoot: entwurfDir,
+    entwurfDir,
+    schwebendDir: schwebendPfad(eigen),
+    siteDir: eigen,
+  };
   vorher = schnappschuss(eigen);
-  commitsVorher = countCommits(eigen);
+  commitsVorher = countCommits(entwurfDir);
   return { fremd, fremdesSecret, sitesRoot };
 }
 
-/** Die Zusicherung, um die es in dieser Datei geht. */
+/**
+ * Die Zusicherung, um die es in dieser Datei geht — jetzt über alle drei Orte.
+ *
+ * Der Schnappschuss umfasst den ganzen Kundenordner: den ausgelieferten Abzug,
+ * den Arbeitsbaum des Entwurfs und die **Abwesenheit** von `.regoro/schwebend/`.
+ * `schwebendVorhanden` steht trotzdem ausdrücklich daneben — eine Abwesenheit,
+ * die nur als Nebenwirkung eines Ordnervergleichs geprüft wird, liest sich beim
+ * nächsten Umbau wie eine, die niemand gemeint hat.
+ */
 function siteIstUnberuehrt(): void {
   expect(schnappschuss(siteDir)).toEqual(vorher);
-  expect(countCommits(siteDir)).toBe(commitsVorher);
+  expect(countCommits(entwurfDir)).toBe(commitsVorher);
+  expect(schwebendVorhanden(siteDir)).toBe(false);
 }
 
 const text = (e: AgentEreignis[]): string =>
@@ -216,23 +256,36 @@ const fehler = (e: AgentEreignis[]) => e.find((x) => x.t === "fehler");
 // Die fünf Szenarien des Plans
 // ===========================================================================
 describe.skipIf(!haveBwrap())("ein Agentenlauf und was von ihm ankommt", () => {
-  test("(1) harmlose Seite: genau eine Datei mehr, genau ein Commit", async () => {
+  test("(1) harmlose Seite: genau eine Datei mehr — in schwebend/, ohne Commit", async () => {
     // Der gute Fall zuerst. Ohne ihn bewiesen (2)–(5) nichts: ein Ablauf, der
     // grundsätzlich nichts übernimmt, wäre trivial „sicher" und völlig nutzlos.
+    //
+    // GEÄNDERT mit „Eine Bearbeitung, zwei Modi": Der Lauf endet bei der
+    // schwebenden Änderung. Vorher stand hier „genau ein Commit"; ein Commit
+    // entsteht jetzt erst, wenn der Kunde übernimmt. Der Test misst deshalb an
+    // einem anderen Ort — aber dieselbe Sache: dass überhaupt etwas ankommt.
     const e = await laufDurch("harmlos");
 
     expect(fehler(e)).toBeUndefined();
     const f = fertig(e) as { dateien: string[]; commit: string | null } | undefined;
     expect(f?.dateien).toEqual(["leistungen.html"]);
-    expect(f?.commit).toMatch(/^[0-9a-f]{7,40}$/);
 
+    expect(schwebendVorhanden(siteDir)).toBe(true);
+    expect(schwebendDateien(siteDir)).toEqual(["leistungen.html"]);
+    expect(readFileSync(join(schwebendPfad(siteDir), "leistungen.html"), "utf8")).toContain("Badsanierung");
+
+    // Genau EINE Änderung im Kundenordner, und die liegt unter `.regoro/schwebend/`.
     const nachher = schnappschuss(siteDir);
     const neu = Object.keys(nachher).filter((k) => !(k in vorher));
-    expect(neu).toEqual(["leistungen.html"]);
-    // Alles andere ist Byte für Byte dasselbe geblieben.
-    for (const k of Object.keys(vorher)) expect(nachher[k]).toBe(vorher[k]);
-    expect(countCommits(siteDir)).toBe((commitsVorher ?? 0) + 1);
-    expect(readFileSync(join(siteDir, "leistungen.html"), "utf8")).toContain("Badsanierung");
+    expect(neu.every((k) => k.startsWith(".regoro/schwebend/"))).toBe(true);
+    expect(neu).toContain(".regoro/schwebend/leistungen.html");
+    // Alles andere ist Byte für Byte dasselbe geblieben — Abzug UND Entwurf.
+    for (const k of Object.keys(vorher)) expect(`${k}: ${nachher[k]}`).toBe(`${k}: ${vorher[k]}`);
+
+    // Und die beiden Orte, an denen es NICHT stehen darf.
+    expect(existsSync(join(siteDir, "leistungen.html"))).toBe(false);
+    expect(existsSync(join(entwurfDir, "leistungen.html"))).toBe(false);
+    expect(countCommits(entwurfDir)).toBe(commitsVorher);
   }, 30_000);
 
   test("(2) Inline-Skript: abgelehnt, Website unberührt", async () => {

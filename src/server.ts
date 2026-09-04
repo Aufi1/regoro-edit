@@ -12,8 +12,9 @@
  * der Server trotzdem (fail-closed: /edit → 404), gibt aber eine Warnung aus.
  * Setup: `regoro init <dir>`.
  */
-import { join, relative, resolve, sep } from "node:path";
+import { join, resolve } from "node:path";
 import { existsSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import {
   handleEditorRequest,
   isEditorPath,
@@ -21,12 +22,29 @@ import {
   type AnfrageZeitgrenze,
   type HostCtx,
 } from "./host.ts";
-import { authFilePath, loadAuthFile, pruefeAuthDatei } from "./auth.ts";
+import {
+  authFilePath,
+  checkCookie,
+  issueCookie,
+  loadAuthFile,
+  pruefeAuthDatei,
+  readCookieTokens,
+  type AuthConfig,
+} from "./auth.ts";
 import { ladeVersand, type Versand } from "./versand.ts";
 import { loadKiConfig } from "./betreiber-config.ts";
-import { raeumeVerwaisteAuf } from "./arbeitskopie.ts";
+import { raeumeVerwaisteAuf, schwebendPfad } from "./arbeitskopie.ts";
+import { entwurfPfad } from "./entwurf.ts";
 // Seiten-Ermittlung wohnt in sites.ts — sie gehört zur Website, nicht zum Server.
-import { buildCtx, discoverPages, erstelleSecretWache, resolveSite } from "./sites.ts";
+import {
+  buildCtx,
+  discoverPages,
+  erstelleSecretWache,
+  resolveSite,
+  resolveStagingPath,
+  STAGING_PREFIX,
+  type SiteRef,
+} from "./sites.ts";
 
 /**
  * Endpunkt für Caddys `on_demand_tls { ask … }`: 200, wenn für diesen Namen
@@ -42,10 +60,10 @@ export const TLS_ASK_PATH = "/_regoro/tls-ask";
 
 interface SingleSiteOptions {
   siteDir: string;
-  repoRoot: string;
   pageWhitelist?: string[];
   port?: number;
   sitesRoot?: undefined;
+  staging?: undefined;
   /** Abweichender Pfad zu versand.json (Tests, lokales Ausprobieren). */
   versandConfig?: string;
   /** Direkt gesetzter Versand — hat Vorrang vor versandConfig (Tests). */
@@ -56,10 +74,19 @@ interface MultiSiteOptions {
   sitesRoot: string;
   port?: number;
   siteDir?: undefined;
-  repoRoot?: undefined;
   pageWhitelist?: undefined;
   versandConfig?: string;
   versand?: Versand | null;
+  /**
+   * Staging (Preview): Zuordnung über `/p/<slug>/` statt über den Host-Header,
+   * und **keine Anmeldung**.
+   *
+   * Die Fahne hängt am PROZESS und nicht am Kundenordner — ein Schalter je
+   * Website wäre eine Datei, die jemand versehentlich mitkopiert, und dann
+   * stünde eine echte Kundenwebsite ohne Anmeldung offen. Der
+   * Produktionsprozess wird nie mit dieser Fahne gestartet.
+   */
+  staging?: boolean;
 }
 
 /** Genau eines von `siteDir` (Einzel-) und `sitesRoot` (Sammelbetrieb). */
@@ -113,13 +140,9 @@ function singleSiteHandler(opts: SingleSiteOptions, versand: Versand | null): Ha
   // bewusst festgelegt (Tests tun das), und ein heimliches Nachladen von Platte
   // wäre etwas anderes als das, wonach er gefragt hat.
   const festeListe = opts.pageWhitelist;
-  let seiten = festeListe ?? discoverPages(opts.siteDir);
+  const entwurfDir = entwurfPfad(opts.siteDir);
+  let seiten = festeListe ?? discoverPages(entwurfDir);
   let seitenGelesen = Date.now();
-
-  // git-Pfad-Präfix der Seiten relativ zum repoRoot (posix-normalisiert).
-  // Gleicher Pfad (siteDir === repoRoot) → "" (Seiten liegen top-level).
-  const rawPrefix = relative(opts.repoRoot, opts.siteDir);
-  const sitePrefix = rawPrefix === "" ? "" : rawPrefix.split(sep).join("/");
 
   const befund = pruefeAuthDatei(opts.siteDir);
   const auth = befund.art === "ok" ? befund.auth : null;
@@ -145,10 +168,19 @@ function singleSiteHandler(opts: SingleSiteOptions, versand: Versand | null): Ha
   }
 
   const ctx: HostCtx = {
-    repoRoot: opts.repoRoot,
+    // Die Historie lebt im Entwurfs-Repo (Invariante 9). Wohin sie zeigt, ist
+    // deshalb keine Angabe des Aufrufers mehr, sondern folgt aus dem
+    // Site-Ordner — es gibt genau einen richtigen Ort.
+    repoRoot: entwurfDir,
+    entwurfDir,
+    schwebendDir: schwebendPfad(opts.siteDir),
     siteDir: opts.siteDir,
+    basis: "",
+    staging: false,
     auth,
-    sitePrefix,
+    // Der Arbeitsbaum des Entwurfs-Repos IST die Website, die Seiten liegen
+    // darin top-level.
+    sitePrefix: "",
     /**
      * Verzögert und mit kurzer Gültigkeit, NICHT einmalig beim Start.
      *
@@ -168,7 +200,9 @@ function singleSiteHandler(opts: SingleSiteOptions, versand: Versand | null): Ha
       const jetzt = Date.now();
       if (jetzt - seitenGelesen >= SEITEN_SCAN_TTL_MS) {
         seitenGelesen = jetzt;
-        seiten = discoverPages(opts.siteDir);
+        // Aus dem ENTWURF: eine dort neu angelegte Seite muss in der Liste des
+        // Editors stehen, bevor sie je veröffentlicht wurde.
+        seiten = discoverPages(entwurfDir);
       }
       return seiten;
     },
@@ -220,7 +254,201 @@ function multiSiteHandler(sitesRootRaw: string, versand: Versand | null): Handle
     }
     const site = resolveSite(sitesRoot, req.headers.get("host"));
     if (site === null) return notFound();
-    return handleEditorRequest(req, url, buildCtx(site, wache, versand), srv);
+    return handleEditorRequest(req, url, buildCtx(site, { wache, versand }), srv);
+  };
+}
+
+/**
+ * Der Zutritt zum Staging-Editor — **und der einzige Ort, an dem er wohnt**.
+ *
+ * Eine Preview kennt keine Anmeldung: Der Interessent bekommt einen Link, und
+ * dahinter steht ein bedienbarer Editor. Die Auth-Wand in `host.ts` wird dafür
+ * NICHT angefasst (Contract C12); sie prüft weiter echt gegen das
+ * site-eigene Geheimnis. Nur der Aussteller des Cookies ist hier ein anderer:
+ * Statt Kennung und Einmalcode genügt der Aufruf der Adresse.
+ *
+ * **Warum das strukturell und nicht per Fahne gelöst ist:** Der
+ * Produktionsprozess enthält diesen Code nicht — `multiSiteHandler` ruft ihn
+ * nirgends. Es gibt dort also keinen Zustand, den jemand falsch setzen könnte,
+ * damit eine Kundenwebsite ohne Anmeldung aufgeht. Dieselbe Überlegung wie beim
+ * Verzicht auf eine Fahne in `auth.json`, eine Ebene tiefer.
+ *
+ * **Kein Redirect.** Der naheliegende Weg — Cookie setzen und auf dieselbe URL
+ * umleiten — hat zwei Nachteile: Eine API-Anfrage des Overlays kann mit einer
+ * Umleitung auf sich selbst nichts anfangen, und verwirft der Browser das
+ * `Secure`-Cookie (HTTP unter fremdem Namen, siehe EDITOR_INSECURE_COOKIE),
+ * entsteht eine Anmeldeschleife ohne jede Fehlermeldung. Stattdessen wird das
+ * frische Cookie in DIESELBE Anfrage geprägt und der Antwort als `Set-Cookie`
+ * beigelegt; die erste Anfrage wird also schon beantwortet.
+ */
+function stagingZutritt(
+  req: Request,
+  auth: AuthConfig,
+): { setCookie: string } | null {
+  // Ein gültiges Cookie ist da? Dann nichts tun — sonst bekäme jede Anfrage ein
+  // neues, und zwei Tabs überschrieben einander fortlaufend.
+  if (readCookieTokens(req.headers.get("cookie")).some((t) => checkCookie(auth, t))) {
+    return null;
+  }
+  const setCookie = issueCookie(auth);
+  // Aus "name=token; Path=/; …" wird der Cookie-Kopf "name=token".
+  const paar = setCookie.split(";", 1)[0]!;
+
+  /**
+   * DIE HEADER DER ANFRAGE WERDEN AN ORT UND STELLE GEÄNDERT — nicht über einen
+   * neu gebauten `new Request(req, { headers })`. Das ist kein Stilfrage,
+   * sondern gemessen:
+   *
+   *   Bun 1.x, `idleTimeout: 2`, ein Strom der 4 s schweigt
+   *     req.headers.set(…), danach srv.timeout(req, 0)   → spätes Byte kommt an
+   *     new Request(req, {headers}), srv.timeout(r2, 0)  → Verbindung abgeschnitten
+   *     gar kein timeout-Aufruf (Gegenprobe)             → Verbindung abgeschnitten
+   *
+   * `srv.timeout()` erkennt einen rekonstruierten Request nicht wieder und
+   * ignoriert ihn STILLSCHWEIGEND — es wirft nicht. Der Ereignisstrom der
+   * KI-Seitenleiste (`srv.timeout(req, 0)` in `handleAgentEvents`) wäre damit
+   * ausschließlich im Staging nach zehn Sekunden Stille tot, ohne Fehler
+   * irgendwo. Wer das hier "sauberer" macht, baut genau diesen Fehler ein.
+   */
+  req.headers.set("cookie", paar);
+  return { setCookie };
+}
+
+/**
+ * Das Sitzungs-Geheimnis einer Preview.
+ *
+ * Hat der Ordner eine `auth.json` (weil `regoro init` dort lief), gilt deren
+ * Geheimnis — dasselbe wie in Produktion. Hat er keine, entsteht hier ein
+ * flüchtiges, das nur im Arbeitsspeicher dieses Prozesses lebt.
+ *
+ * **Warum nicht einfach eine `auth.json` anlegen?** Weil das Anlegen dann an
+ * einer UNAUTHENTIFIZIERTEN Anfrage hinge: Ein GET von irgendwem schriebe
+ * Dateien ins Sammelverzeichnis. Dazu käme eine erfundene Kennung (ohne
+ * mindestens eine wirft `createAuthFile`, und `pruefeAuthDatei` lehnt eine
+ * leere Liste als ungültig ab), und `createAuthFile` überschreibt eine
+ * bestehende Datei kommentarlos — in einem Anfrage-Pfad die falsche Waffe.
+ *
+ * Der Preis ist gering: Nach einem Neustart des Dienstes ist das Geheimnis weg
+ * und die offenen Preview-Sitzungen sind ungültig. Beim nächsten Aufruf des
+ * Links wird ein neues geprägt — dem Interessenten fällt nichts auf.
+ *
+ * Der Schlüssel ist der REALE Ordnerpfad, nicht der Slug: Zwei Slugs, die per
+ * Symlink auf dasselbe Verzeichnis zeigen, sind dieselbe Preview.
+ */
+function fluechtigesGeheimnis(siteDir: string, speicher: Map<string, AuthConfig>): AuthConfig {
+  let vorhanden = speicher.get(siteDir);
+  if (vorhanden === undefined) {
+    vorhanden = { nummern: [], emails: [], secret: randomBytes(32).toString("hex") };
+    speicher.set(siteDir, vorhanden);
+  }
+  return vorhanden;
+}
+
+/**
+ * Repariert eine Anfrage, der das Preview-Präfix fehlt.
+ *
+ * Eine Fabrik-Seite verlinkt wurzel-absolut (`href="/impressum.html"`,
+ * `href="/"`). Unter `/p/<slug>/` fragt der Browser diese Pfade OHNE Präfix an,
+ * und damit wäre in der Vorschau die gesamte Navigation tot — nachgesehen an
+ * `examples/site`, dort steht genau diese Form.
+ *
+ * Trägt die Anfrage einen gleich-originen `Referer`, der unter einer gültigen
+ * Preview liegt, wird sie dorthin umgeleitet. Fehlt der Referer, bleibt es beim
+ * 404 von vorher — die Reparatur nimmt also nichts weg, sie gibt nur etwas
+ * zurück.
+ *
+ * Kein Open-Redirect: Das Ziel ist immer `basis + pfad`, beginnt also mit
+ * `/p/`, ist nie protokoll-relativ und zeigt nie auf einen fremden Host. Und
+ * kein Rechtezuwachs: Wer den Referer setzen kann, könnte die Zieladresse auch
+ * direkt aufrufen.
+ *
+ * `Cache-Control: no-store` ist Pflicht — die Umleitung gilt NUR zusammen mit
+ * dem Referer, der sie begründet. Ein Zwischenspeicher, der sie behielte,
+ * schickte später auch Anfragen ohne Referer in die falsche Preview.
+ */
+function praefixReparatur(req: Request, url: URL, sitesRoot: string): Response | null {
+  // Was schon unter `/p/` liegt, ist nicht falsch adressiert, sondern hat einen
+  // unzulässigen Slug — daran ändert ein Referer nichts.
+  if (url.pathname.startsWith(STAGING_PREFIX)) return null;
+
+  const referer = req.headers.get("referer");
+  if (referer === null) return null;
+  let herkunft: URL;
+  try {
+    herkunft = new URL(referer);
+  } catch {
+    return null;
+  }
+  // Nur der eigene Host. Verglichen wird der Name, nicht die Herkunft: hinter
+  // dem Proxy spricht der Browser https, dieser Prozess hört http.
+  if (herkunft.host !== url.host) return null;
+
+  const treffer = resolveStagingPath(sitesRoot, herkunft.pathname);
+  if (treffer === null) return null;
+
+  return new Response(null, {
+    status: 302,
+    headers: {
+      Location: `${treffer.basis}${url.pathname}${url.search}`,
+      "Cache-Control": "no-store",
+    },
+  });
+}
+
+/**
+ * Staging: der Pfad-Abschnitt `/p/<slug>/` entscheidet, um wessen Website es
+ * geht. Unbekannt oder kein sauberer Slug → 404, nie eine Vermutung.
+ *
+ * Hostbasierte Adressen bedient dieser Zweig ABSICHTLICH nicht: Sonst wäre jede
+ * Preview zusätzlich unter ihrem Ordnernamen als Host erreichbar — und zwar
+ * ohne Anmeldung.
+ *
+ * Ohne `SecretWache`, anders als im Sammelbetrieb. Preview-Ordner entstehen aus
+ * einer Vorlage, geteilte Geheimnisse sind dort also der wahrscheinliche Fall,
+ * und die Wache schaltete reihenweise Editoren ab. Sie kaufte hier auch nichts:
+ * Ein geteiltes Geheimnis hieße, dass das Cookie von Preview A auch bei B gilt
+ * — um B zu erreichen, braucht man aber B's Slug, und wer den hat, bekommt dort
+ * ohnehin ein Cookie ausgestellt (siehe `stagingZutritt`). Es geht nichts
+ * verloren, was nicht schon offen wäre. **In Produktion gilt das nicht**, dort
+ * bleibt die Wache scharf: Ein Cookie ersetzt dort einen Einmalcode.
+ */
+function stagingHandler(sitesRootRaw: string, versand: Versand | null): Handler {
+  const sitesRoot = resolve(sitesRootRaw);
+  const geheimnisse = new Map<string, AuthConfig>();
+
+  return async (req, url, srv) => {
+    const treffer = resolveStagingPath(sitesRoot, url.pathname);
+    if (treffer === null) return praefixReparatur(req, url, sitesRoot) ?? notFound();
+
+    const site: SiteRef = { host: treffer.slug, siteDir: treffer.siteDir };
+    const auth =
+      loadAuthFile(treffer.siteDir) ?? fluechtigesGeheimnis(treffer.siteDir, geheimnisse);
+
+    // Das Präfix abstreifen, BEVOR `route()` den Pfad sieht — host.ts kennt
+    // weiterhin nur `/edit/...` und benutzt `ctx.basis` allein zum ERZEUGEN von
+    // URLs. Auf einer Kopie, damit das Original unberührt bleibt; gemessen:
+    // der Setter erhält Prozentkodierungen unverändert.
+    const innen = new URL(url);
+    innen.pathname = treffer.rest;
+
+    const ctx = buildCtx(site, {
+      versand,
+      basis: treffer.basis,
+      staging: true,
+      ersatzAuth: auth,
+    });
+
+    // Der Zutritt gilt nur den Editor-Routen. Eine öffentliche Seite oder ein
+    // Bild braucht kein Cookie — und ein Suchmaschinen-Roboter, der die Vorschau
+    // findet, soll keines bekommen.
+    const zutritt = isEditorPath(treffer.rest) ? stagingZutritt(req, auth) : null;
+    const antwort = await handleEditorRequest(req, innen, ctx, srv);
+    if (zutritt === null) return antwort;
+
+    // `Set-Cookie` nachtragen, ohne die Antwort neu zu bauen: Der Körper kann
+    // ein laufender Ereignisstrom sein, und den umzupacken hieße, ihn anzufassen.
+    antwort.headers.append("Set-Cookie", zutritt.setCookie);
+    return antwort;
   };
 }
 
@@ -235,9 +463,11 @@ export function startServer(opts: ServerOptions): { port: number } {
   raeumeVerwaisteAuf();
   const versand = ladeVersandSicher(opts);
   const handler =
-    opts.sitesRoot !== undefined
-      ? multiSiteHandler(opts.sitesRoot, versand)
-      : singleSiteHandler(opts, versand);
+    opts.sitesRoot === undefined
+      ? singleSiteHandler(opts, versand)
+      : opts.staging === true
+        ? stagingHandler(opts.sitesRoot, versand)
+        : multiSiteHandler(opts.sitesRoot, versand);
 
   const server = Bun.serve({
     port,
@@ -264,9 +494,9 @@ export function startServer(opts: ServerOptions): { port: number } {
 }
 
 if (import.meta.main) {
-  // Rückwärts-kompatibler Bootstrap für regoro: site/ unter cwd.
-  const repoRoot = process.cwd();
-  const siteDir = process.env.SITE_DIR ?? join(repoRoot, "site");
-  const { port } = startServer({ siteDir, repoRoot });
+  // Bootstrap für den Direktstart: site/ unter cwd. Wo die Historie liegt, ist
+  // keine Angabe mehr — sie folgt aus dem Site-Ordner (Invariante 9).
+  const siteDir = process.env.SITE_DIR ?? join(process.cwd(), "site");
+  const { port } = startServer({ siteDir });
   console.log(`Regoro Editor läuft auf http://localhost:${port}/edit/login`);
 }

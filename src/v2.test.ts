@@ -15,6 +15,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { schwebendPfad } from "./arbeitskopie.ts";
 
 const TEST_SECRET = "testsecret-aaaaaaaaaaaaaaaaaaaaaaaa";
 const TEST_NUMMER = "+4915120464812";
@@ -311,12 +312,36 @@ describe("host.ts — POST /edit/upload (Feature B)", () => {
   });
 
   beforeEach(() => {
+    /**
+     * Entwurf und Abzug liegen hier AUSDRÜCKLICH auf zwei verschiedenen
+     * Ordnern.
+     *
+     * Bis eben lagen sie auf demselben, und dadurch war die Zusicherung „die
+     * neue Datei liegt in assets/" von einem Zufall am Leben gehalten: Der
+     * Upload schreibt in den Entwurf, `assetFiles()` las im Abzug — beides
+     * derselbe Pfad, also grün, egal wohin geschrieben wurde. Der Test konnte
+     * nicht mehr rot werden. Genau danach ist zu suchen, wenn sich unter einer
+     * Prüfung die Bedeutung eines Pfades ändert.
+     */
     const repoRoot = makeTmpDir("regoro-upload-");
-    const siteDir = join(repoRoot, "site");
-    mkdirSync(siteDir, { recursive: true });
+    const entwurfDir = join(repoRoot, "site");
+    mkdirSync(entwurfDir, { recursive: true });
+    cpSync(REAL_SITE, entwurfDir, { recursive: true });
+    // Der ausgelieferte Abzug: eigener Ordner, eigener Inhalt. Was hier
+    // ankommt, hat der Upload falsch gemacht.
+    const siteDir = makeTmpDir("regoro-upload-abzug-");
     cpSync(REAL_SITE, siteDir, { recursive: true });
     git.ensureRepo(repoRoot);
-    ctx = { repoRoot, siteDir, pageWhitelist: PAGE_WHITELIST, auth: TEST_AUTH };
+    ctx = {
+      repoRoot,
+      entwurfDir,
+      schwebendDir: schwebendPfad(siteDir),
+      siteDir,
+      basis: "",
+      staging: false,
+      pageWhitelist: PAGE_WHITELIST,
+      auth: TEST_AUTH,
+    };
   });
 
   function authCookie(): string {
@@ -350,13 +375,19 @@ describe("host.ts — POST /edit/upload (Feature B)", () => {
     return Promise.resolve(host.handleEditorRequest(req, url, ctx));
   }
 
+  /** Die Assets des ENTWURFS — dorthin schreibt der Upload (host.ts, Schritt 7). */
   function assetFiles(): string[] {
+    return readdirSync(join(ctx.entwurfDir, "assets"));
+  }
+
+  /** Die Assets des Abzugs. Hier darf ein Upload NICHTS anlegen. */
+  function abzugAssetFiles(): string[] {
     return readdirSync(join(ctx.siteDir, "assets"));
   }
 
-  function call(method: string, path: string): Promise<Response> {
+  function call(method: string, path: string, cookie?: string): Promise<Response> {
     const url = new URL("http://localhost:8788" + path);
-    const req = new Request(url, { method });
+    const req = new Request(url, { method, headers: cookie ? { cookie } : {} });
     return Promise.resolve(host.handleEditorRequest(req, url, ctx));
   }
 
@@ -364,6 +395,7 @@ describe("host.ts — POST /edit/upload (Feature B)", () => {
     const cookie = authCookie();
     const pagePath = "site/index.html";
     const before = assetFiles().length;
+    const abzugVorher = abzugAssetFiles().length;
     const versionsBefore = git.listVersions(ctx.repoRoot, pagePath).length;
 
     const res = await uploadRequest({
@@ -373,19 +405,39 @@ describe("host.ts — POST /edit/upload (Feature B)", () => {
     expect(res.status).toBe(200);
     const json = (await res.json()) as { ok: boolean; src: string; fileHash: string };
     expect(json.ok).toBe(true);
-    expect(json.src).toMatch(/^\/assets\/upload-[0-9a-f]+\.png$/);
     expect(json.fileHash).toMatch(/^[0-9a-f]{64}$/);
 
-    // Neue Datei liegt INNERHALB site/assets/.
+    /**
+     * ZWEI Werte, nicht einer (Contract C11).
+     *
+     * Die Antwort geht an den BROWSER, der gerade die Editier-Ansicht offen
+     * hat — dort muss die frisch hochgeladene Datei sofort zu sehen sein, und
+     * sie liegt bis zum Veröffentlichen nur im Entwurf. Also der Vorschau-
+     * Präfix.
+     */
+    expect(json.src).toMatch(/^\/edit-vorschau\/assets\/upload-[0-9a-f]+\.png$/);
+
+    // Neue Datei liegt im ENTWURF …
     const after = assetFiles();
     expect(after.length).toBe(before + 1);
     const newFile = after.find((f) => /^upload-[0-9a-f]+\.png$/.test(f));
     expect(newFile).toBeDefined();
+    // … und NICHT im Abzug. Der Upload veröffentlicht nichts.
+    expect(abzugAssetFiles().length).toBe(abzugVorher);
 
-    // Seiten-<img idx 0> trägt jetzt den neuen src.
+    /**
+     * Und die andere Hälfte, die wichtigere: Im GESPEICHERTEN HTML steht der
+     * Präfix NICHT.
+     *
+     * Er ist eine Sicht für den angemeldeten Kunden, kein Bestandteil der
+     * Website. Käme er ins Markup, ginge er beim nächsten Veröffentlichen live
+     * — und jeder Besucher bekäme für dieses Bild einen 404 von einer Route,
+     * die es für ihn gar nicht gibt.
+     */
     const pageHtml = readFileSync(join(ctx.repoRoot, pagePath), "utf8");
     const firstImgSrc = parseHTML(pageHtml).document.querySelector("img")!.getAttribute("src");
-    expect(firstImgSrc).toBe(json.src);
+    expect(firstImgSrc).toBe(`/assets/${newFile}`);
+    expect(pageHtml).not.toContain("edit-vorschau");
 
     // Git-Historie ist gewachsen.
     const versionsAfter = git.listVersions(ctx.repoRoot, pagePath).length;
@@ -423,16 +475,17 @@ describe("host.ts — POST /edit/upload (Feature B)", () => {
     expect(res.status).toBe(200);
     const json = (await res.json()) as { ok: boolean; src: string };
     expect(json.ok).toBe(true);
-    expect(json.src).toMatch(/^\/assets\/upload-[0-9a-f]+\.webp$/);
+    expect(json.src).toMatch(/^\/edit-vorschau\/assets\/upload-[0-9a-f]+\.webp$/);
 
     const after = assetFiles();
     expect(after.length).toBe(before + 1);
-    expect(after.some((f) => /^upload-[0-9a-f]+\.webp$/.test(f))).toBe(true);
+    const neu = after.find((f) => /^upload-[0-9a-f]+\.webp$/.test(f));
+    expect(neu).toBeDefined();
 
-    // Seiten-<img idx 0> trägt den neuen .webp-src.
+    // Seiten-<img idx 0> trägt den neuen .webp-src — ohne Vorschau-Präfix.
     const firstImgSrc = parseHTML(readFileSync(join(ctx.repoRoot, pagePath), "utf8"))
       .document.querySelector("img")!.getAttribute("src");
-    expect(firstImgSrc).toBe(json.src);
+    expect(firstImgSrc).toBe(`/assets/${neu}`);
   });
 
   // LÜCKE v2-Validation: Polyglot (gültige Bild-Magic-Bytes + angehängtes HTML/Script).
@@ -451,12 +504,14 @@ describe("host.ts — POST /edit/upload (Feature B)", () => {
     expect(res.status).toBe(200);
     const json = (await res.json()) as { src: string };
     // Sichere, server-generierte .png-Extension — KEIN .html, KEIN .svg.
-    expect(json.src).toMatch(/^\/assets\/upload-[0-9a-f]+\.png$/);
+    expect(json.src).toMatch(/^\/edit-vorschau\/assets\/upload-[0-9a-f]+\.png$/);
     expect(json.src).not.toMatch(/\.(html?|svg|js)$/i);
 
-    // Das Asset wird über den statischen Asset-Zweig als image/png ausgeliefert,
-    // niemals als text/html → kein XSS über den Bild-Pfad.
-    const assetRes = await call("GET", json.src);
+    // Das Asset wird als image/png ausgeliefert, niemals als text/html → kein
+    // XSS über den Bild-Pfad. Abgefragt wird der Weg, den auch der Browser des
+    // Kunden nimmt: die Vorschau, hinter der Auth-Wand — im Abzug liegt die
+    // Datei zu diesem Zeitpunkt noch gar nicht.
+    const assetRes = await call("GET", json.src, cookie);
     expect(assetRes.status).toBe(200);
     expect((assetRes.headers.get("content-type") ?? "").toLowerCase()).toContain("image/png");
     expect((assetRes.headers.get("content-type") ?? "").toLowerCase()).not.toContain("text/html");
@@ -470,8 +525,11 @@ describe("host.ts — POST /edit/upload (Feature B)", () => {
       bytes: fakeImageTextBytes(), filename: "evil.png", contentType: "image/png",
     });
     expect(res.status).toBe(400);
-    const json = (await res.json()) as { error?: string };
-    expect(json.error).toBeDefined();
+    // Fehlerform seit Contract C2: `fehler` für die Maschine, `grund` für den
+    // Kunden — beide, nicht eins von beiden.
+    const json = (await res.json()) as { fehler?: string; grund?: string };
+    expect(json.fehler).toBeDefined();
+    expect(typeof json.grund).toBe("string");
     expect(assetFiles().length).toBe(before); // nichts geschrieben
   });
 
@@ -521,12 +579,16 @@ describe("host.ts — POST /edit/upload (Feature B)", () => {
     expect(existsSync(join(ctx.repoRoot, "etc"))).toBe(false);
   });
 
-  test("symlinked assets escape → 400, KEINE Datei außerhalb siteDir (Greptile-Fix)", async () => {
-    // site/assets ist ein Symlink auf ein Verzeichnis AUSSERHALB von siteDir.
+  test("symlinked assets escape → 400, KEINE Datei außerhalb des Entwurfs (Greptile-Fix)", async () => {
+    // `assets` ist ein Symlink auf ein Verzeichnis AUSSERHALB des Entwurfs.
     // Der lexikalische Pfad-Check würde passieren; nur die realpath-Prüfung fängt
     // den Escape. Erwartung: fail-closed (400), nichts wird außerhalb geschrieben.
+    //
+    // Der Symlink steht im ENTWURF, nicht im Abzug: Dorthin schreibt der Upload.
+    // Im Abzug gelegt, liefe der Upload ungestört durch und dieser Test wäre
+    // eine Falle, die nie zuschnappt.
     const outside = makeTmpDir("regoro-outside-");
-    const assetsPath = join(ctx.siteDir, "assets");
+    const assetsPath = join(ctx.entwurfDir, "assets");
     rmSync(assetsPath, { recursive: true, force: true });
     symlinkSync(outside, assetsPath, "dir");
 
@@ -536,8 +598,9 @@ describe("host.ts — POST /edit/upload (Feature B)", () => {
     });
 
     expect(res.status).toBe(400);
-    const json = (await res.json()) as { error?: string };
-    expect(json.error).toBeDefined();
+    const json = (await res.json()) as { fehler?: string; grund?: string };
+    expect(json.fehler).toBeDefined();
+    expect(typeof json.grund).toBe("string");
     // Nichts durch den Symlink hindurch nach außerhalb geschrieben.
     expect(readdirSync(outside).length).toBe(0);
   });
@@ -574,7 +637,7 @@ describe("host.ts — POST /edit/upload (Feature B)", () => {
     expect(existsSync(join(ctx.repoRoot, "etc"))).toBe(false);
     if (res.status === 200) {
       const json = (await res.json()) as { src: string };
-      expect(json.src).toMatch(/^\/assets\/upload-[0-9a-f]+\.png$/);
+      expect(json.src).toMatch(/^\/edit-vorschau\/assets\/upload-[0-9a-f]+\.png$/);
     }
   });
 });
@@ -657,7 +720,19 @@ describe("host.ts — Mixed-Content-Save-Roundtrip same-session (Feature A)", ()
     mkdirSync(siteDir, { recursive: true });
     cpSync(REAL_SITE, siteDir, { recursive: true });
     git.ensureRepo(repoRoot);
-    ctx = { repoRoot, siteDir, pageWhitelist: PAGE_WHITELIST, auth: TEST_AUTH };
+    // Drei Orte statt einem (Contract C1). Diese Vorrichtung stammt von davor:
+    // Entwurfs-Sicht und Abzug liegen hier auf demselben Ordner, damit die
+    // Zusicherungen dieses Blocks weiterhin den Router messen und nicht die Ablage.
+    ctx = {
+      repoRoot,
+      entwurfDir: siteDir,
+      schwebendDir: schwebendPfad(siteDir),
+      siteDir,
+      basis: "",
+      staging: false,
+      pageWhitelist: PAGE_WHITELIST,
+      auth: TEST_AUTH,
+    };
   });
 
   function authCookie(): string {

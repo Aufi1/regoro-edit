@@ -79,6 +79,11 @@ export interface ServiceOpts {
    */
   multi?: boolean;
   /**
+   * Staging: ein Dienst für alle Previews unter `siteDir`, EIN Hostname, die
+   * Zuordnung über `/p/<slug>/`. Schließt `multi` aus.
+   */
+  staging?: boolean;
+  /**
    * Browser-Herkünfte, die die CSP zusätzlich zulässt — aus
    * `alleBrowserHerkuenfte()` der Integrationen DIESER Website. Leer oder
    * fehlend heißt `connect-src 'none'`, also der geschlossene Normalfall.
@@ -206,6 +211,73 @@ export const CADDY_HOST_RE =
   "^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*(:[0-9]+)?$";
 
 /**
+ * Die Zeile, die Editor-Routen an den Bun-Prozess reicht — EINE Definition für
+ * Einzel- und Sammelbetrieb, damit die beiden nicht auseinanderlaufen.
+ *
+ * Muss `isEditorPath()` in host.ts spiegeln. `/edit*` allein reicht NICHT: es
+ * verfehlt die Suffix-Route `/impressum.html/edit` (in Produktion war der Editor
+ * damit für JEDE Unterseite 404) und fängt zugleich öffentliche Seiten wie
+ * `/edit-preise.html` ein.
+ *
+ * **Warum jedes dieser Muster genau EINEN Stern trägt** — das ist keine
+ * Schönheit, sondern die Bedingung, unter der es überhaupt funktioniert.
+ * Gemessen mit caddy 2.11.4 auf der Leitung: Caddys `path`-Matcher hat zwei
+ * Semantiken. Ein EINZELNER Stern am Anfang oder Ende ist ein Suffix- bzw.
+ * Präfix-Vergleich und überquert Schrägstriche; ab dem ZWEITEN Stern gilt
+ * Go-`path.Match`, und dort steht ein Stern für GENAU EIN Segment.
+ *
+ *   "/edit/" + Stern                  ein Stern, am Ende → `/edit/agent/events` trifft ✓
+ *   "/p/" + Stern + "/edit/" + Stern  zwei Sterne        → dasselbe fällt DURCH ✗
+ *
+ * (In Sternen ausgeschrieben, weil die zweite Zeile sonst diesen
+ * Kommentarblock beendete — der Stern-Schrägstrich schließt ihn.)
+ *
+ * Deshalb kann diese Glob-Form das Staging-Präfix nicht ausdrücken (das Präfix
+ * erzwänge den zweiten Stern) — der Staging-Block benutzt `path_regexp`.
+ */
+const EDITOR_MATCHER = "@editor path /edit /edit/* /edit-assets/* /edit-vorschau/* */edit";
+
+/**
+ * Der Slug-Anteil des Staging-Matchers. Spiegelt `SLUG_RE` in sites.ts Zeichen
+ * für Zeichen — per Test aneinander gebunden, genau wie `CADDY_HOST_RE` und
+ * `HOST_RE`.
+ *
+ * Anders als dort ist das hier KEINE Traversal-Schranke: Im Staging setzt Caddy
+ * nichts aus der Anfrage in einen Dateipfad ein (es gibt kein `root`, kein
+ * `file_server` — alles geht an den Bun-Prozess). Die Zeichenprüfung sorgt
+ * allein dafür, dass Caddy nicht LAXER urteilt als der Editor: Alles, was hier
+ * fälschlich als Editor-Pfad durchginge, verlöre die Content-Security-Policy,
+ * die der öffentliche Zweig setzt.
+ */
+export const CADDY_SLUG_RE = "[a-z0-9]([a-z0-9-]*[a-z0-9])?";
+
+/**
+ * Der Editor-Matcher des Staging-Betriebs, als Regexp statt als Glob.
+ *
+ * Spiegelt `isEditorPath()` Alternative für Alternative, unter dem Präfix:
+ *   `edit`              ← path === "/edit"
+ *   `edit/.*`           ← path.startsWith("/edit/")
+ *   `edit-assets/.*`    ← path.startsWith("/edit-assets/")
+ *   `edit-vorschau/.*`  ← path.startsWith("/edit-vorschau/")   (C11)
+ *   `[a-z0-9-]+\.html/edit` ← die Suffix-Route
+ *
+ * Die letzte Alternative ist bewusst enger als `isEditorPath()` (das jedes
+ * `*.html/edit` in jeder Tiefe nimmt) und deckt genau die Route ab, die
+ * `route()` wirklich auflöst. Strenger darf der Proxy sein, laxer nie.
+ *
+ * Gemessen mit echtem caddy über 82 Pfade, 0 Abweichungen — darunter die
+ * Gegenproben, die NICHT treffen dürfen: `/p/k/edit-preise.html`,
+ * `/p/k/edit-vorschau-preise.html`, `/p/k/blog/edit/beitrag.html`,
+ * `/p/KUNDE/edit`, `/p/kun.de/edit`, `/p/../edit`.
+ */
+export function editorMatcherStaging(): string {
+  return (
+    `@editor path_regexp ^/p/${CADDY_SLUG_RE}/` +
+    String.raw`(edit|edit/.*|edit-assets/.*|edit-vorschau/.*|[a-z0-9-]+\.html/edit)$`
+  );
+}
+
+/**
  * Liegt der Site-Ordner unter /home oder /root? Dann darf `ProtectHome=yes` NICHT
  * gesetzt werden: systemd macht diese Verzeichnisse dann leer und unzugänglich,
  * und `ReadWritePaths` hebt das nicht auf — der Dienst startet nicht.
@@ -286,6 +358,41 @@ ${KI_SCHRITTE}`;
 }
 
 /**
+ * Aktivierung im Staging. Wie der Einzelbetrieb, aber mit zwei Unterschieden,
+ * die man beim Einrichten sehen muss: die Fahne in der Unit und die Adresse,
+ * die man dem Interessenten schickt.
+ */
+function activationStepsStaging(o: ServiceOpts, unit: string): string {
+  const domainFlag = o.domain ? ` --domain ${o.domain}` : "";
+  return `# 1. Unit schreiben und starten
+regoro service ${shQuote(o.siteDir)} --staging --systemd | sudo tee /etc/systemd/system/${unit}.service > /dev/null
+sudo systemctl daemon-reload
+sudo systemctl enable --now ${unit}
+
+# 2. Caddy-Block anhängen (ersetzt einen bestehenden Block für die Domain!)
+regoro service ${shQuote(o.siteDir)} --staging --caddy${domainFlag} | sudo tee -a /etc/caddy/Caddyfile > /dev/null
+sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+sudo systemctl reload caddy
+
+# 3. Eine Preview anlegen: Website hineinlegen, DANN initialisieren
+#    ("erst deployen, dann initialisieren" — der Baseline-Commit entsteht auf
+#    dem fertigen Stand). Der Ordnername ist der Slug: nur a-z, 0-9, Bindestrich,
+#    KEIN Punkt.
+mkdir ${shQuote(`${o.siteDir}/beispiel-a1b2`)}
+# … Website hineinkopieren …
+regoro init ${shQuote(`${o.siteDir}/beispiel-a1b2`)} --nummer <deine-nummer>
+
+# 4. Prüfen — und das ist zugleich die Adresse für den Interessenten
+curl -sI ${editorUrl(o.domain ?? "intern.deine-domain.de")}/p/beispiel-a1b2/edit | head -1
+
+# ACHTUNG: Hinter dieser Adresse ist der Editor OHNE ANMELDUNG erreichbar.
+# Wer den Link hat, kann bearbeiten. Der Kostendeckel je Preview ist einmalig
+# und liegt bei einer Million Token (STAGING_KONTINGENT), ohne Monatsreset.
+
+${KI_SCHRITTE}`;
+}
+
+/**
  * Die Schritte, die nur für die KI-Seitenleiste nötig sind — gleich in beiden
  * Betriebsarten. Ohne bwrap startet kein Agentenlauf; ohne das AppArmor-Profil
  * startet bwrap auf Ubuntu nicht.
@@ -312,13 +419,16 @@ export function shQuote(s: string): string {
 
 /** systemd-Unit. Bewusst schmal: kein Netzwerkzugriff nötig, nur der Site-Ordner. */
 export function systemdUnit(o: ServiceOpts): string {
-  const command = o.multi ? "serve" : "run";
+  // Staging ist `serve` mit einer Fahne — dieselbe Betriebsart wie der
+  // Sammelbetrieb, nur mit der Zuordnung über den Pfad. Die Fahne steht in
+  // ExecStart und damit im Prozess, nicht in einer Datei, die jemand mitkopiert.
+  const command = o.staging ? "serve --staging" : o.multi ? "serve" : "run";
   const protectHome = siteIsUnderHome(o.siteDir)
     ? `# ProtectHome bewusst NICHT gesetzt: die Site liegt unter /home bzw. /root,
 # systemd würde das Verzeichnis leeren und der Dienst käme nicht hoch.`
     : "ProtectHome=yes";
   return `[Unit]
-Description=Regoro Editor — ${o.slug}${o.multi ? " (Sammelbetrieb)" : ""}
+Description=Regoro Editor — ${o.slug}${o.multi ? " (Sammelbetrieb)" : o.staging ? " (STAGING, ohne Anmeldung)" : ""}
 Documentation=https://github.com/Aufi1/regoro-edit
 After=network.target
 
@@ -437,6 +547,7 @@ profile bwrap /usr/bin/bwrap flags=(unconfined) {
  */
 export function caddyBlock(o: ServiceOpts): string {
   if (o.multi) return caddyBlockMulti(o);
+  if (o.staging) return caddyBlockStaging(o);
   const domain = o.domain ?? "example.com";
   return `${domain} {
     encode gzip
@@ -456,7 +567,10 @@ export function caddyBlock(o: ServiceOpts): string {
     # HIER KEINE CSP: \`connect-src 'none'\` blockierte jedes fetch des Overlays.
     # Der Editor wäre stumm kaputt — Knöpfe reagieren, nichts wird gespeichert,
     # keine Fehlermeldung.
-    @editor path /edit /edit/* /edit-assets/* */edit
+    # Jedes Muster trägt genau EINEN Stern. Mit zweien gälte Go-path.Match, und
+    # ein Stern stünde für EIN Segment — \`/edit/agent/events\` fiele dann durch
+    # (mit caddy 2.11.4 nachgemessen).
+    ${EDITOR_MATCHER}
     handle @editor {
         reverse_proxy 127.0.0.1:${o.port} {
 ${SSE_KOMMENTAR}
@@ -553,7 +667,10 @@ https:// {
     #
     # HIER KEINE CSP: \`connect-src 'none'\` blockierte jedes fetch des Overlays.
     # Der Editor wäre stumm kaputt — Knöpfe reagieren, nichts wird gespeichert.
-    @editor path /edit /edit/* /edit-assets/* */edit
+    # Jedes Muster trägt genau EINEN Stern. Mit zweien gälte Go-path.Match, und
+    # ein Stern stünde für EIN Segment — \`/edit/agent/events\` fiele dann durch
+    # (mit caddy 2.11.4 nachgemessen).
+    ${EDITOR_MATCHER}
     handle @editor {
         reverse_proxy 127.0.0.1:${o.port} {
 ${SSE_KOMMENTAR}
@@ -574,6 +691,87 @@ ${cspZweigeMulti(o)}
 
     handle {
         respond 404
+    }
+}
+`;
+}
+
+/**
+ * Caddy-Block für den Staging-Betrieb: EIN Hostname, viele Previews unter
+ * `/p/<slug>/`.
+ *
+ * **Der Unterschied zu beiden Produktionsblöcken ist, was hier FEHLT: `root`
+ * und `file_server`.** Im Staging liefert Caddy keine einzige Datei selbst aus,
+ * alles geht an den Bun-Prozess. Zwei Gründe, beide zwingend:
+ *
+ *   1. Die öffentliche Sicht einer Preview IST der Entwurf
+ *      (`<siteDir>/.regoro/entwurf`), nicht der Site-Ordner — es wird ja nie
+ *      veröffentlicht. Ein `file_server` auf den Site-Ordner zeigte dem
+ *      Interessenten den Ausgangsstand und nicht seine eigenen Änderungen.
+ *   2. Damit gibt es hier **keinen Pfad, auf dem ein Name aus der ANFRAGE in
+ *      einen Dateipfad gerät**. Die ganze `@badhost`/`CADDY_HOST_RE`-Familie des
+ *      Sammelbetriebs entfällt konstruktiv statt per Regel — dort ist sie nötig,
+ *      weil `{host}` im `root` steht.
+ *
+ * Der Preis ist ein Prozesssprung je Bild. Für eine Handvoll Interessenten auf
+ * einem internen Hostnamen ist das nichts; die Extension-Allowlist und der
+ * Dotfile-Block des Editors sind dafür die einzige Wahrheit statt einer zweiten
+ * Kopie, die driften kann (Invariante 3).
+ *
+ * Kein `on_demand_tls`: Es gibt genau einen Hostnamen, also ein gewöhnliches
+ * Zertifikat. `caddyGlobalBlock()` gibt für Staging deshalb nichts aus, und der
+ * `tls-ask`-Endpunkt wird nicht gebraucht.
+ */
+function caddyBlockStaging(o: ServiceOpts): string {
+  const domain = o.domain ?? "intern.example.com";
+  return `# Staging: EIN Hostname, viele Previews unter /p/<slug>/. Der Ordnername unter
+# ${o.siteDir} ist der Slug — dieselbe Zuordnung wie im Sammelbetrieb, nur über
+# den Pfad statt über den Host-Header (SLUG_RE in sites.ts).
+#
+# ACHTUNG: Hinter diesem Block ist der Editor OHNE ANMELDUNG erreichbar. Er
+# gehört auf einen internen Hostnamen und niemals vor Kundenwebsites.
+${domain} {
+    encode gzip
+
+    # Auth-Datei + alle Dotfiles, in jeder Tiefe. Regexp, kein Glob:
+    # \`path /.*\` deckt nur führende Punkte, /assets/.geheim.html käme durch.
+    #
+    # STEHT VOR @editor UND GEWINNT DAMIT: gemessen sind \`.regoro/entwurf/\` und
+    # \`.regoro/schwebend/\` so in jeder Tiefe unerreichbar, auch prozentkodiert
+    # (\`%2eregoro\`, \`%2E\`) und auch mit \`/edit\`-Suffix. Diese Reihenfolge nicht
+    # umstellen.
+    @hidden path_regexp (^|/)\\.
+    handle @hidden {
+        respond 404
+    }
+
+    # Editor-Routen an den Bun-Prozess. Als REGEXP und nicht als Glob wie in
+    # Produktion: Caddys \`path\`-Glob überquert Schrägstriche nur bei einem
+    # EINZELNEN Stern am Anfang oder Ende — ab dem zweiten gilt Go-path.Match und
+    # ein Stern steht für genau ein Segment. Das Präfix \`/p/<slug>/\` erzwingt
+    # aber einen zweiten Stern. Gemessen mit caddy 2.11.4: \`/p/*/edit/*\` verfehlt
+    # \`/edit/agent/events\`, \`/edit/agent/verlaeufe\` und \`/edit/version/<id>\` —
+    # also genau die Routen der KI-Seitenleiste, und zwar lautlos.
+    #
+    # HIER KEINE CSP: \`connect-src 'none'\` blockierte jedes fetch des Overlays.
+    ${editorMatcherStaging()}
+    handle @editor {
+        reverse_proxy 127.0.0.1:${o.port} {
+${SSE_KOMMENTAR}
+            flush_interval -1
+        }
+    }
+
+    # Alles andere ist die Vorschau selbst — auch sie kommt aus dem Bun-Prozess,
+    # denn nur der kennt den Entwurf. Kein \`root\`, kein \`file_server\`: siehe
+    # caddyBlockStaging() in src/service.ts.
+    handle {
+        ${cspZeile(o.browserHerkuenfte)}
+        ${NOSNIFF_ZEILE}
+        reverse_proxy 127.0.0.1:${o.port} {
+${SSE_KOMMENTAR}
+            flush_interval -1
+        }
     }
 }
 `;
@@ -632,6 +830,7 @@ ${zweige.join("\n")}
 export function activationSteps(o: ServiceOpts): string {
   const unit = `regoro-${o.slug}`;
   if (o.multi) return activationStepsMulti(o, unit);
+  if (o.staging) return activationStepsStaging(o, unit);
   const domainFlag = o.domain ? ` --domain ${o.domain}` : "";
   return `# 1. Unit schreiben und starten
 regoro service ${shQuote(o.siteDir)} --systemd | sudo tee /etc/systemd/system/${unit}.service > /dev/null

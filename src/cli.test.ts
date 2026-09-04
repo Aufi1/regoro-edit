@@ -142,47 +142,140 @@ describe("regoro disable", () => {
     };
   }
 
-  /** Simuliert eine gespeicherte Bearbeitung: zweiter Commit im Site-Repo. */
+  /**
+   * Startet `regoro run <dir>` auf einem freien Port und ruft `fn` mit der
+   * Basis-URL. Der Port kommt aus der Startausgabe — `PORT=0` lässt das
+   * Betriebssystem wählen, und nur der Prozess selbst weiß danach, welcher es
+   * geworden ist.
+   */
+  async function mitServer(site: string, fn: (basis: string) => Promise<void>): Promise<void> {
+    const proc = Bun.spawn(["bun", CLI, "run", site], {
+      env: { ...process.env, PORT: "0" },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    try {
+      const dec = new TextDecoder();
+      const reader = proc.stdout.getReader();
+      let out = "";
+      let port = 0;
+      for (let i = 0; i < 200 && port === 0; i++) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        out += dec.decode(value);
+        port = Number(/localhost:(\d+)/.exec(out)?.[1] ?? 0);
+      }
+      expect(`Port aus der Startausgabe: ${port > 0}`).toBe("Port aus der Startausgabe: true");
+      await fn(`http://127.0.0.1:${port}`);
+    } finally {
+      proc.kill();
+      await proc.exited;
+    }
+  }
+
+  /**
+   * Simuliert eine gespeicherte Bearbeitung: ein zweiter Commit im
+   * ENTWURFS-Repo. Dort — und nur dort — liegt die Kundenarbeit, an der sich
+   * `--purge` die Zähne ausbeißen soll. Geschrieben wird in den Arbeitsbaum des
+   * Entwurfs und nicht in den Site-Ordner: der ist nur noch ein Abzug.
+   */
   function makeEdit(at: string): void {
-    writeFileSync(join(at, "index.html"), "<html><body><p>Geändert</p></body></html>");
-    Bun.spawnSync(["git", "-C", at, "add", "-A"]);
+    const entwurf = join(at, ".regoro", "entwurf");
+    writeFileSync(join(entwurf, "index.html"), "<html><body><p>Geändert</p></body></html>");
+    Bun.spawnSync(["git", "-C", entwurf, "add", "-A"]);
     Bun.spawnSync([
-      "git", "-C", at,
+      "git", "-C", entwurf,
       "-c", "user.name=T", "-c", "user.email=t@t.local",
       "commit", "-m", "Edit",
     ]);
   }
 
-  test("entfernt .regoro/, lässt Website und Historie stehen", () => {
+  test("schaltet den Editor aus, lässt Website UND Kundenarbeit stehen", async () => {
+    /**
+     * DER TEST, DER DEN DATENVERLUST VERHINDERT — und der einzige in dieser
+     * Datei, dessen Erwartung man in die falsche Richtung auflösen kann.
+     *
+     * Vorher galt: `.regoro/` ist Editor-Zubehör und darf ganz weg, die
+     * Historie liegt daneben in `<siteDir>/.git`. Jetzt liegt ALLES in
+     * `.regoro/`, und ein unverändertes „lösch das Verzeichnis" nimmt die
+     * gesamte Kundenarbeit mit. Genau das ist einmal passiert.
+     *
+     * Wer diesen Fall künftig rot sieht, prüfe zuerst, ob der CODE die
+     * Ausnahmeliste verloren hat — nicht, ob die Erwartung zu streng ist.
+     *
+     * Drei Dinge bleiben, und jedes aus einem eigenen Grund:
+     *   entwurf/              die Historie und jede gespeicherte Änderung
+     *   schwebend/            ein Lauf, der Kontingent gekostet hat
+     *   veroeffentlicht.json  die Notbremse gegen einen fremden Schreiber
+     *
+     * Und die zweite Hälfte, ohne die der Test das Abschalten selbst nicht mehr
+     * misst: `/edit*` MUSS danach 404 geben. Gemessen am echten Prozess, nicht
+     * am Fehlen einer Datei — fail-closed ist eine Eigenschaft des Servers.
+     */
     makeSite(dir);
     expect(runInit([], { cwd: dir }).code).toBe(0);
+    // Eine schwebende Änderung, wie sie ein KI-Lauf hinterlässt.
+    mkdirSync(join(dir, ".regoro", "schwebend"), { recursive: true });
+    writeFileSync(join(dir, ".regoro", "schwebend", "index.html"), "<html><body>OFFEN</body></html>");
 
     const r = runDisable();
 
     expect(r.code).toBe(0);
-    expect(existsSync(join(dir, ".regoro"))).toBe(false);
-    expect(existsSync(join(dir, "index.html"))).toBe(true); // Website unangetastet
-    expect(existsSync(join(dir, ".git"))).toBe(true); // Historie bleibt
     expect(r.stdout).toContain("Editor ist für diese Site aus");
-  });
+    expect(existsSync(join(dir, ".regoro", "auth.json"))).toBe(false); // der Zugang ist weg
+    expect(existsSync(join(dir, "index.html"))).toBe(true); // Website unangetastet
 
-  test("gelöschte Gesprächsverläufe werden GENANNT, nicht stillschweigend entfernt", () => {
-    /**
-     * `disable` löscht das ganze `.regoro/` — seit der KI-Seitenleiste liegen
-     * dort auch die Gespräche, und die enthalten wörtlich, was der Kunde
-     * geschrieben hat. Die Meldung sprach nur von der Auth-Datei und davon,
-     * dass die Website weiterläuft; wer sie las, hatte keinen Anlass zu
-     * vermuten, dass er gerade Kundentext löscht.
-     *
-     * Der Test hält die MELDUNG fest, nicht die Löschregel. Ob Verläufe ein
-     * Abschalten überdauern sollen, ist eine offene Frage der Aufbewahrung.
-     */
+    // Die drei Ausnahmen — einzeln, damit eine verlorene sichtbar wird.
+    expect(existsSync(join(dir, ".regoro", "entwurf", ".git"))).toBe(true);
+    expect(existsSync(join(dir, ".regoro", "schwebend", "index.html"))).toBe(true);
+    expect(existsSync(join(dir, ".regoro", "veroeffentlicht.json"))).toBe(true);
+    // Und die Historie ist nicht nur da, sie hat auch Inhalt.
+    const commits = Bun.spawnSync(["git", "-C", join(dir, ".regoro", "entwurf"), "rev-list", "--count", "HEAD"]);
+    expect(Number(commits.stdout.toString().trim())).toBeGreaterThan(0);
+
+    // GEGENPROBE: Der Editor ist wirklich aus — am laufenden Server gemessen.
+    await mitServer(dir, async (basis) => {
+      expect((await fetch(`${basis}/edit`, { redirect: "manual" })).status).toBe(404);
+      expect((await fetch(`${basis}/edit/login`, { redirect: "manual" })).status).toBe(404);
+      // … und die Website läuft weiter. Ohne diese Zeile wäre die 404 oben auch
+      // dann erfüllt, wenn der Prozess gar nichts mehr ausliefert.
+      expect((await fetch(`${basis}/index.html`)).status).toBe(200);
+    });
+  }, 30_000);
+
+  test("GEGENPROBE: VOR dem Abschalten ist der Editor erreichbar", async () => {
+    // Sonst misst der Fall darüber nur, dass irgendein 404 kommt — etwa weil
+    // `run` gar nicht startet oder die Site nie eingerichtet war.
     makeSite(dir);
     expect(runInit([], { cwd: dir }).code).toBe(0);
+    await mitServer(dir, async (basis) => {
+      expect((await fetch(`${basis}/edit/login`, { redirect: "manual" })).status).toBe(200);
+    });
+  }, 30_000);
+
+  /** Legt zwei Gesprächsverläufe an — Kundentext im Wortlaut. */
+  function legeVerlaeufeAn(): string {
     const vdir = join(dir, ".regoro", "verlauf");
     mkdirSync(vdir, { recursive: true });
     writeFileSync(join(vdir, "a.jsonl"), '{"type":"session"}\n');
     writeFileSync(join(vdir, "b.jsonl"), '{"type":"session"}\n');
+    return vdir;
+  }
+
+  test("gelöschte Gesprächsverläufe werden GENANNT, nicht stillschweigend entfernt", () => {
+    /**
+     * Die Ausnahmeliste von `disable` führt drei Einträge — `entwurf/`,
+     * `schwebend/` und `veroeffentlicht.json`. `verlauf/` steht NICHT darin und
+     * verschwindet also weiterhin. Das ist eine Entscheidung über Aufbewahrung
+     * und nicht Gegenstand dieses Tests; was er festhält, ist die MELDUNG.
+     *
+     * Denn die Gespräche enthalten wörtlich, was der Kunde geschrieben hat. Wer
+     * nur „Auth-Datei entfernt — die Website läuft weiter" liest, hat keinen
+     * Anlass zu vermuten, dass er gerade Kundentext löscht.
+     */
+    makeSite(dir);
+    expect(runInit([], { cwd: dir }).code).toBe(0);
+    const vdir = legeVerlaeufeAn();
 
     const r = runDisable();
 
@@ -190,9 +283,12 @@ describe("regoro disable", () => {
     expect(r.stdout).toContain("2 gespeicherte Gespräche");
     expect(r.stdout).toContain(".regoro/verlauf/");
     expect(existsSync(vdir)).toBe(false);
+    // Und die drei Ausnahmen sind davon unberührt — der Satz gilt den
+    // Gesprächen, nicht dem Entwurf.
+    expect(existsSync(join(dir, ".regoro", "entwurf", ".git"))).toBe(true);
   });
 
-  test("Gegenprobe: ohne Verläufe steht der Satz NICHT da", () => {
+  test("GEGENPROBE: ohne Verläufe steht der Satz NICHT da", () => {
     // Sonst wäre die Prüfung darüber auch dann grün, wenn der Satz IMMER
     // erschiene — und jedes Abschalten meldete gelöschte Gespräche, die es nie
     // gab. Eine Warnung, die immer kommt, liest bald niemand mehr.
@@ -223,15 +319,15 @@ describe("regoro disable", () => {
     expect(existsSync(join(dir, ".regoro", "auth.json"))).toBe(true);
   });
 
-  test("--purge entfernt .git, wenn nur der Baseline-Commit existiert", () => {
+  test("--purge entfernt das Entwurfs-Repo, wenn nur der Baseline-Commit existiert", () => {
     makeSite(dir);
     expect(runInit([], { cwd: dir }).code).toBe(0);
 
     const r = runDisable(["--purge"]);
 
     expect(r.code).toBe(0);
-    expect(existsSync(join(dir, ".git"))).toBe(false);
-    expect(existsSync(join(dir, "index.html"))).toBe(true);
+    expect(existsSync(join(dir, ".regoro"))).toBe(false);
+    expect(existsSync(join(dir, "index.html"))).toBe(true); // die Website bleibt IMMER
   });
 
   test("--purge VERWEIGERT, sobald gespeicherte Bearbeitungen existieren", () => {
@@ -244,7 +340,7 @@ describe("regoro disable", () => {
     expect(r.code).toBe(1);
     expect(r.stderr).toContain("gespeicherte Bearbeitungen");
     // NICHTS wurde gelöscht — auch die Auth-Datei nicht.
-    expect(existsSync(join(dir, ".git"))).toBe(true);
+    expect(existsSync(join(dir, ".regoro", "entwurf", ".git"))).toBe(true);
     expect(existsSync(join(dir, ".regoro", "auth.json"))).toBe(true);
   });
 
@@ -256,8 +352,10 @@ describe("regoro disable", () => {
     const r = runDisable();
 
     expect(r.code).toBe(0);
-    expect(existsSync(join(dir, ".regoro"))).toBe(false);
-    expect(existsSync(join(dir, ".git"))).toBe(true);
+    expect(existsSync(join(dir, ".regoro", "auth.json"))).toBe(false); // Editor aus
+    // Und die zwei Versionen sind noch da — das ist der ganze Unterschied
+    // zwischen `disable` und `disable --purge`.
+    expect(existsSync(join(dir, ".regoro", "entwurf", ".git"))).toBe(true);
     expect(r.stdout).toContain("2 Versionen");
   });
 
@@ -270,7 +368,7 @@ describe("regoro disable", () => {
     const proc = Bun.spawnSync(["bun", CLI, "disable", site], { cwd: dir });
 
     expect(proc.exitCode).toBe(0);
-    expect(existsSync(join(site, ".regoro"))).toBe(false);
+    expect(existsSync(join(site, ".regoro", "auth.json"))).toBe(false);
   });
 
   // Fail-closed: Kann git die Historie nicht lesen (z.B. "dubious ownership"),
@@ -302,7 +400,8 @@ describe("regoro disable", () => {
 
       expect(r.code).toBe(1);
       expect(r.stderr).toContain("lässt sich nicht lesen");
-      expect(existsSync(join(dir, ".git"))).toBe(true); // Historie gerettet
+      // Historie gerettet — sie liegt jetzt im Entwurfs-Repo.
+      expect(existsSync(join(dir, ".regoro", "entwurf", ".git"))).toBe(true);
       expect(existsSync(join(dir, ".regoro", "auth.json"))).toBe(true);
     });
 
@@ -313,8 +412,10 @@ describe("regoro disable", () => {
       const r = withFakeGit([]);
 
       expect(r.code).toBe(0);
-      expect(existsSync(join(dir, ".regoro"))).toBe(false);
-      expect(existsSync(join(dir, ".git"))).toBe(true); // unangetastet
+      expect(existsSync(join(dir, ".regoro", "auth.json"))).toBe(false); // Editor aus
+      // Unangetastet — gerade WEIL git nichts sagen konnte: Was unbekannt ist,
+      // wird nicht gelöscht.
+      expect(existsSync(join(dir, ".regoro", "entwurf", ".git"))).toBe(true);
       expect(r.stdout).toContain("nicht lesbar");
     });
   });
@@ -398,16 +499,44 @@ describe("regoro init", () => {
     expect(after).not.toBe(before); // neuer Hash + neues Secret
   });
 
+  test("init legt das Entwurfs-Repo an — sonst ist der Editor nach init tot", () => {
+    /**
+     * DER TEST, DER DEN FEHLER BEIM NAMEN NENNT.
+     *
+     * Seit C1/C4 liegt die Historie in `<siteDir>/.regoro/entwurf`, und
+     * `host.ts` schaltet fail-closed ab, sobald es ein `<siteDir>/.git` OHNE
+     * dieses Repo findet (`istNichtMigriert`) — jede `/edit*`-Route gibt dann
+     * 404. Genau diesen Zustand erzeugt ein `init`, das nur das alte Repo
+     * anlegt: Der Editor ist unmittelbar nach der Einrichtung tot, und zwar
+     * stumm — die Website läuft, nur der Editor antwortet nirgends.
+     *
+     * Gefunden hat das der Binary-Test unten (404 statt Overlay). Der sieht die
+     * WIRKUNG; diese Zeilen sehen die URSACHE, laufen in Millisekunden und
+     * brauchen kein kompiliertes Binary.
+     */
+    makeSite(dir);
+    expect(runInit([], { cwd: dir }).code).toBe(0);
+
+    expect(existsSync(join(dir, ".regoro", "entwurf", ".git"))).toBe(true);
+    // Und der Arbeitsbaum ist die Website, nicht ein leeres Repo.
+    expect(existsSync(join(dir, ".regoro", "entwurf", "index.html"))).toBe(true);
+  });
+
   test("Auth-Datei ist 0600 und landet NICHT im Baseline-Commit", () => {
     makeSite(dir);
     expect(runInit([], { cwd: dir }).code).toBe(0);
 
     expect(statSync(join(dir, ".regoro", "auth.json")).mode & 0o777).toBe(0o600);
 
-    const tracked = gitTracked(dir);
+    // Der Baseline-Commit liegt im ENTWURFS-Repo, nicht mehr im Site-Ordner.
+    const tracked = gitTracked(join(dir, ".regoro", "entwurf"));
     expect(tracked).toContain("index.html");
+    // DER PUNKT: Aus `.regoro/` steht NICHTS im Commit — dort liegt das
+    // Sitzungs-Geheimnis. Der Arbeitsbaum des Entwurfs entsteht aus
+    // `siteDateien()`, und die liefert keine Punkt-Pfade; die `.gitignore` des
+    // Site-Ordners ist deshalb hier weder nötig noch vorhanden.
     expect(tracked.some((f) => f.includes(".regoro"))).toBe(false);
-    expect(tracked).toContain(".gitignore");
+    expect(tracked.some((f) => f.startsWith("."))).toBe(false);
   });
 
   // Regression: `git` schlug fehl (z.B. "dubious ownership", wenn der Site-Ordner
@@ -488,8 +617,10 @@ describe("regoro init", () => {
       const stderr = proc.stderr.toString();
 
       expect(proc.exitCode).toBe(1);
-      expect(stderr).toContain(`safe.directory '${spaced}'`);
-      expect(stderr).toContain(`chown -R "$(id -un)" '${spaced}'`);
+      // Der Pfad mit Leerzeichen ist der ENTWURFS-Pfad — dort arbeitet git.
+      // Das Quoting ist der Punkt: ohne es zerfiele der Befehl beim Kopieren.
+      expect(stderr).toContain(`safe.directory '${join(spaced, ".regoro", "entwurf")}'`);
+      expect(stderr).toContain(`chown -R "$(id -un)" '${join(spaced, ".regoro", "entwurf")}'`);
 
       rmSync(bin, { recursive: true, force: true });
       rmSync(spaced, { recursive: true, force: true });
@@ -506,7 +637,7 @@ describe("regoro init", () => {
 
       expect(r.code).toBe(0);
       expect(existsSync(join(dir, ".regoro", "auth.json"))).toBe(true);
-      expect(gitTracked(dir)).toContain("index.html");
+      expect(gitTracked(join(dir, ".regoro", "entwurf"))).toContain("index.html");
     });
   });
 
@@ -609,6 +740,76 @@ describe("regoro serve", () => {
     expect(out).toContain("backup_alt");
     expect(out).toContain("läuft auf");
   }, 20000);
+
+  // =========================================================================
+  // `--staging`: die Betriebsform hängt am PROZESS, nicht am Kundenordner
+  // =========================================================================
+  describe("regoro serve --staging", () => {
+    /** Ein Sammelverzeichnis mit einer Preview darin (Ordnername = Slug). */
+    function stagingWurzel(): string {
+      const root = join(dir, "previews");
+      mkdirSync(join(root, "bergdolt-3432"), { recursive: true });
+      makeSite(join(root, "bergdolt-3432"));
+      return root;
+    }
+
+    test("die Fahne wird erkannt und die Betriebsform benannt", async () => {
+      // Wer einen Staging-Prozess startet, muss es in der Startausgabe sehen —
+      // ein Prozess, der stillschweigend ohne Anmeldung ausliefert, ist genau
+      // das, wovor die Entscheidung „Prozess statt Ordner-Fahne" schützt.
+      const out = await runServeBriefly(["--staging", stagingWurzel()], dir);
+      expect(out).toMatch(/staging/i);
+      expect(out).toContain("läuft auf");
+    }, 20000);
+
+    test("GEGENPROBE: `--staging` scheitert NICHT an der Flag-Prüfung", () => {
+      // Ohne diesen Fall wäre der Tippfehler-Test unten auch grün, wenn
+      // `checkFlags` schlicht JEDES Flag ablehnte. Geprüft an einem leeren
+      // Verzeichnis: der Abbruch muss der INHALTLICHE sein.
+      mkdirSync(join(dir, "leer"));
+      const r = runCli(["serve", "--staging", join(dir, "leer")]);
+      expect(r.code).toBe(1);
+      expect(r.stderr).not.toContain("unbekannte Option");
+      expect(r.stderr).toContain("keine Website-Ordner");
+    });
+
+    test("ein Tippfehler in der Fahne wird abgelehnt statt still ignoriert", () => {
+      // `--stagin` still zu schlucken hieße: ein Staging-Prozess, der in
+      // Wahrheit ein Produktionsprozess ist — oder umgekehrt.
+      const r = runCli(["serve", "--stagin", stagingWurzel()]);
+      expect(r.code).toBe(1);
+      expect(r.stderr).toContain("unbekannte Option");
+    });
+
+    test("`run --staging` gibt es NICHT — die Fahne gehört dem Sammelbetrieb", () => {
+      /**
+       * Der Einzelbetrieb bedient genau eine Website unter ihrer eigenen
+       * Domain. Eine Preview-Fahne dort wäre ein Weg, eine echte Kundenwebsite
+       * ohne Anmeldung auszuliefern — und zwar mit einem einzigen vergessenen
+       * Argument in einer systemd-Unit. Sie muss abprallen, nicht wirken.
+       */
+      makeSite(dir);
+      const r = runCli(["run", dir, "--staging"]);
+      expect(r.code).toBe(1);
+      expect(r.stderr).toContain("unbekannte Option");
+    });
+
+    test("Ordnernamen, die keine Slugs sind, machen keine Preview", () => {
+      // Im Sammelbetrieb ist der Ordnername die Domain, im Staging der Slug —
+      // und ein Slug hat keine Punkte (C7). Ein Verzeichnis, aus dem keine
+      // einzige Preview erreichbar ist, darf keinen Server starten, der alles
+      // 404t; dieselbe Entscheidung wie beim leeren Sammelverzeichnis.
+      const root = join(dir, "nur-punkte");
+      mkdirSync(join(root, "kunde.de"), { recursive: true });
+      makeSite(join(root, "kunde.de"));
+      const r = runCli(["serve", "--staging", root]);
+      expect(r.code).toBe(1);
+      // Und zwar aus dem RICHTIGEN Grund: Solange `--staging` noch gar nicht
+      // erlaubt ist, bräche der Befehl ohnehin ab — dieser Fall wäre grün,
+      // ohne je etwas über Slugs gesagt zu haben.
+      expect(r.stderr).not.toContain("unbekannte Option");
+    });
+  });
 });
 
 describe("regoro serve — Argument-Zerlegung", () => {

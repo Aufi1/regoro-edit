@@ -13,14 +13,17 @@
  * durchlaufen — und es geht garantiert nichts hinaus.
  */
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { AUTH_DIR_NAME, createAuthFile } from "./auth.ts";
+import { dirname, join } from "node:path";
+import { AUTH_DIR_NAME, createAuthFile, issueCookie, loadAuthFile } from "./auth.ts";
+import { fileSha256 } from "./apply.ts";
 import type { KiConfig } from "./betreiber-config.ts";
-import { countCommits, ensureRepo } from "./git.ts";
+import { entwurfPfad, stelleEntwurfBereit } from "./entwurf.ts";
+import { countCommits } from "./git.ts";
+import * as host from "./host.ts";
 import type { HostCtx } from "./host.ts";
-import { bwrapPfad } from "./sandbox.ts";
+import { bwrapPfad, sandboxArgv, standardVerstecke } from "./sandbox.ts";
 import { brichAb, ereignisse, laufAktiv, starteLauf, type AgentEreignis } from "./agent.ts";
 import { pruefeKontingent, verbucheTokens, TOKEN_KONTINGENT } from "./kontingent.ts";
 import { startServer } from "./server.ts";
@@ -82,19 +85,54 @@ function haveBwrap(): boolean {
 }
 
 let siteDir: string;
+let entwurfDir: string;
 let runtime: string;
 let ctx: HostCtx;
 let commitsVorher: number | null;
 
+/**
+ * Eine Website, wie sie nach `regoro init` dasteht: ausgelieferter Abzug plus
+ * Entwurfs-Repo unter `.regoro/entwurf`.
+ *
+ * KEIN `ensureRepo(siteDir)` mehr. Der Site-Ordner hat seit dem Umbau kein
+ * eigenes `.git` (Invariante 9 in neuer Fassung) — eines dort wäre genau die
+ * Lage, in der `pruefeAltRepo` den Editor fail-closed abschaltet.
+ */
+async function macheKunde(prefix: string): Promise<{ siteDir: string; entwurfDir: string }> {
+  const site = tmp(prefix);
+  cpSync(REAL_SITE, site, { recursive: true });
+  await createAuthFile(site, [NUMMER]);
+  stelleEntwurfBereit(site);
+  return { siteDir: site, entwurfDir: entwurfPfad(site) };
+}
+
+function baueCtx(site: string, entwurf: string, zusatz: Partial<HostCtx> = {}): HostCtx {
+  return {
+    // Die Historie lebt im Entwurf, nicht im Abzug (Contract C1).
+    repoRoot: entwurf,
+    entwurfDir: entwurf,
+    schwebendDir: join(site, AUTH_DIR_NAME, "schwebend"),
+    siteDir: site,
+    basis: "",
+    staging: false,
+    pageWhitelist: PAGES,
+    auth: null,
+    sitePrefix: "",
+    ki: KI,
+    ...zusatz,
+  };
+}
+
 beforeEach(async () => {
-  siteDir = tmp("regoro-agent-site-");
-  cpSync(REAL_SITE, siteDir, { recursive: true });
-  ensureRepo(siteDir);
-  await createAuthFile(siteDir, [NUMMER]);
+  const kunde = await macheKunde("regoro-agent-site-");
+  siteDir = kunde.siteDir;
+  entwurfDir = kunde.entwurfDir;
   runtime = tmp("regoro-agent-run-");
-  commitsVorher = countCommits(siteDir);
+  // Gezählt wird im Entwurf: dort entstehen die Commits, sobald der Kunde
+  // übernimmt. Im Abzug entsteht überhaupt keiner mehr.
+  commitsVorher = countCommits(entwurfDir);
   process.env.RUNTIME_DIRECTORY = runtime;
-  ctx = { repoRoot: siteDir, siteDir, pageWhitelist: PAGES, auth: null, sitePrefix: "", ki: KI };
+  ctx = baueCtx(siteDir, entwurfDir);
 });
 
 function start(auftrag: string) {
@@ -109,6 +147,18 @@ async function sammle(): Promise<AgentEreignis[]> {
 
 const text = (e: AgentEreignis[]): string =>
   e.filter((x) => x.t === "text").map((x) => (x as { inhalt: string }).inhalt).join("\n");
+
+/**
+ * Ist das Ergebnis des Laufs angekommen?
+ *
+ * Seit „Eine Bearbeitung, zwei Modi" heißt das: in der SCHWEBENDEN Änderung,
+ * nicht im Site-Ordner. Die Tests, die vorher `existsSync(siteDir/…)` gefragt
+ * haben, fragen jetzt hier — sonst prüften sie einen Ort, an dem der Lauf
+ * absichtlich nichts mehr ablegt, und wären dauerhaft rot ohne Aussage.
+ */
+async function angekommen(site: string, rel: string): Promise<boolean> {
+  return (await schwebendApi()).schwebendDateien(site).includes(rel);
+}
 
 /**
  * Wartet, bis kein Lauf mehr registriert ist — zum Aufräumen nach `brichAb`.
@@ -302,7 +352,7 @@ describe.skipIf(!haveBwrap())("das Worker-Protokoll", () => {
     expect(f.t).toBe("fertig");
     expect(f.dateien).toEqual([]);
     expect(f.commit).toBeNull();
-    expect(countCommits(siteDir)).toBe(commitsVorher); // und wirklich kein Commit
+    expect(countCommits(entwurfDir)).toBe(commitsVorher); // und wirklich kein Commit
   }, 30_000);
 
   test("ein `fertig` OHNE abschließenden Zeilenumbruch geht nicht verloren", async () => {
@@ -317,7 +367,7 @@ describe.skipIf(!haveBwrap())("das Worker-Protokoll", () => {
 
     expect(e.map((x) => x.t)).toContain("werkzeug"); // die Zeile MIT Umbruch kam an
     expect(e.at(-1)?.t).toBe("fertig"); // und die ohne auch
-    expect(existsSync(join(siteDir, "leistungen.html"))).toBe(true); // und wurde übernommen
+    expect(await angekommen(siteDir, "leistungen.html")).toBe(true); // und liegt bereit
   }, 30_000);
 
   test("unverständliche Zeilen bringen den Lauf nicht zum Absturz", async () => {
@@ -336,7 +386,7 @@ describe.skipIf(!haveBwrap())("das Worker-Protokoll", () => {
 
     expect(e.at(-1)?.t).toBe("fertig"); // NICHT bloß „fertig oder fehler"
     expect(e.map((x) => x.t)).toContain("werkzeug"); // die guten Zeilen danach kamen an
-    expect(existsSync(join(siteDir, "leistungen.html"))).toBe(true);
+    expect(await angekommen(siteDir, "leistungen.html")).toBe(true);
   }, 30_000);
 });
 
@@ -371,18 +421,19 @@ describe.skipIf(!haveBwrap())("nur ein Lauf je Website", () => {
   test("zwei Websites laufen unabhängig voneinander", async () => {
     // Ein Prozess bedient alle Kunden (Invariante 10). Ein Zähler, der nicht
     // nach Site trennt, sperrte Kunde B aus, weil Kunde A gerade arbeitet.
-    const zweite = tmp("regoro-agent-site2-");
-    cpSync(REAL_SITE, zweite, { recursive: true });
-    ensureRepo(zweite);
-    await createAuthFile(zweite, [NUMMER]);
-    const ctx2: HostCtx = { ...ctx, repoRoot: zweite, siteDir: zweite };
+    const zweite = await macheKunde("regoro-agent-site2-");
+    const ctx2: HostCtx = baueCtx(zweite.siteDir, zweite.entwurfDir);
 
     expect(start("warten").ok).toBe(true);
     const b = starteLauf(ctx2, "harmlos", { workerBefehl: [process.execPath, "run", ATTRAPPE] });
     expect(b.ok).toBe(true);
 
-    for await (const _ of ereignisse(zweite)) void _;
-    expect(existsSync(join(zweite, "leistungen.html"))).toBe(true);
+    for await (const _ of ereignisse(zweite.siteDir)) void _;
+    // Kunde B ist durchgelaufen, während A noch arbeitet — sein Ergebnis liegt
+    // in SEINER schwebenden Änderung, nicht in seiner ausgelieferten Website.
+    const { schwebendDateien } = await schwebendApi();
+    expect(schwebendDateien(zweite.siteDir)).toEqual(["leistungen.html"]);
+    expect(existsSync(join(zweite.siteDir, "leistungen.html"))).toBe(false);
     brichAb(siteDir); // siehe oben: Aufräumen, keine Zusicherung
   }, 60_000);
 });
@@ -423,7 +474,7 @@ describe.skipIf(!haveBwrap())("Abbruch", () => {
     expect(zweiter).toEqual({ ok: true, laufId: expect.any(String) });
     const e = await sammle();
     expect(e.at(-1)?.t).toBe("fertig");
-    expect(existsSync(join(siteDir, "leistungen.html"))).toBe(true);
+    expect(await angekommen(siteDir, "leistungen.html")).toBe(true);
   }, 90_000);
 
   test("auch ein SOFORT abgebrochener Lauf sperrt die Website nicht", async () => {
@@ -462,11 +513,14 @@ describe.skipIf(!haveBwrap())("Abbruch", () => {
 // Kontingent
 // ===========================================================================
 describe.skipIf(!haveBwrap())("Kontingent", () => {
+  /** Diese Datei fährt ausschließlich Produktion — Staging hat sein eigenes. */
+  const ART = "monatlich" as const;
+
   test("ein gelungener Lauf wird verbucht", async () => {
-    const vorher = pruefeKontingent(siteDir);
+    const vorher = pruefeKontingent(siteDir, ART);
     expect(start("harmlos").ok).toBe(true);
     await sammle();
-    const nachher = pruefeKontingent(siteDir);
+    const nachher = pruefeKontingent(siteDir, ART);
 
     expect(nachher.tokens).toBe(vorher.tokens + 1234);
     expect(nachher.laeufe).toBe(vorher.laeufe + 1);
@@ -476,15 +530,15 @@ describe.skipIf(!haveBwrap())("Kontingent", () => {
   test("auch ein gescheiterter Lauf wird verbucht — Token sind trotzdem weg", async () => {
     // Wer nur Erfolge verbucht, hat einen Freifahrtschein gebaut: Ein Lauf, der
     // absichtlich am Validator scheitert, kostet dieselben Token und zählte nie.
-    const vorher = pruefeKontingent(siteDir);
+    const vorher = pruefeKontingent(siteDir, ART);
     expect(start("inline-skript").ok).toBe(true);
     await sammle();
-    expect(pruefeKontingent(siteDir).laeufe).toBe(vorher.laeufe + 1);
+    expect(pruefeKontingent(siteDir, ART).laeufe).toBe(vorher.laeufe + 1);
   }, 30_000);
 
   test("ein erschöpftes Kontingent lässt gar keinen Lauf beginnen", async () => {
-    verbucheTokens(siteDir, TOKEN_KONTINGENT + 1);
-    expect(pruefeKontingent(siteDir).erschoepft).toBe(true);
+    verbucheTokens(siteDir, TOKEN_KONTINGENT + 1, ART);
+    expect(pruefeKontingent(siteDir, ART).erschoepft).toBe(true);
 
     expect(start("harmlos")).toEqual({ ok: false, grund: "kontingent" });
     expect(existsSync(join(siteDir, "leistungen.html"))).toBe(false);
@@ -506,7 +560,7 @@ describe("Serverneustart während eines Laufs", () => {
     const fremd = join(runtime, "nicht-von-uns");
     mkdirSync(fremd, { recursive: true });
 
-    startServer({ siteDir, repoRoot: siteDir, port: 0, versand: attrappenVersand() });
+    startServer({ siteDir, port: 0, versand: attrappenVersand() });
 
     expect(existsSync(verwaist)).toBe(false);
     // Nur `lauf-*` — RUNTIME_DIRECTORY kann in Produktion noch anderes tragen.
@@ -648,4 +702,536 @@ describe("das Kontextfenster erreicht den Arbeiter", () => {
     // IMMER denselben Wert trüge und die Abfrage gar nichts bewirkte.
     expect(String(STANDARD_CONTEXT_WINDOW)).not.toBe("1048576");
   });
+});
+
+// ===========================================================================
+// Der Lauf endet bei der schwebenden Änderung (Plan §2, Contract C6)
+// ===========================================================================
+/**
+ * Der Zugang zu den sechs Funktionen aus Contract C6.
+ *
+ * Dynamisch, nicht statisch: Solange sie fehlen, bräche ein statischer Import
+ * die GANZE Datei beim Laden weg — vierzig grüne Tests dieser Suite verschwänden
+ * mit ihr, und kein einzelner Fehlschlag sagte mehr, welche Zusicherung fehlt.
+ */
+type SchwebendApi = {
+  schwebendPfad(siteDir: string): string;
+  schwebendVorhanden(siteDir: string): boolean;
+  schwebendDateien(siteDir: string): string[];
+  schwebendSeit(siteDir: string): string | null;
+  legeSchwebendAn(
+    siteDir: string,
+    dateien: Map<string, Buffer>,
+    basis: Map<string, string | null>,
+  ): void;
+  verwirfSchwebend(siteDir: string): void;
+};
+
+async function schwebendApi(): Promise<SchwebendApi> {
+  return (await import("./arbeitskopie.ts")) as unknown as SchwebendApi;
+}
+
+/**
+ * Legt eine schwebende Änderung ab, mit dem Pflicht-Bezugspunkt aus C6.
+ *
+ * `basis` ist der Stand im ENTWURF zum Zeitpunkt der Ablage (`null` = gab es
+ * dort nicht). Er ist Pflicht, weil `409 fremd-geaendert` ohne ihn gar nicht
+ * anschlagen könnte — siehe den Block „eine Übernahme über fremder Arbeit"
+ * weiter unten, der genau das misst.
+ */
+async function legeAb(dateien: Map<string, Buffer>, quelle: string = entwurfDir): Promise<void> {
+  const { legeSchwebendAn } = await schwebendApi();
+  const { byteHashDatei } = await import("./arbeitskopie.ts");
+  const basis = new Map<string, string | null>();
+  for (const rel of dateien.keys()) {
+    const pfad = join(quelle, rel);
+    basis.set(rel, existsSync(pfad) ? byteHashDatei(pfad) : null);
+  }
+  legeSchwebendAn(siteDir, dateien, basis);
+}
+
+const fehlerVon = (e: AgentEreignis[]) => e.find((x) => x.t === "fehler");
+const fertigVon = (e: AgentEreignis[]) => e.find((x) => x.t === "fertig");
+
+describe.skipIf(!haveBwrap())("ein Lauf endet bei schwebend/, nicht in der Website", () => {
+  test("die erzeugte Seite liegt in der schwebenden Änderung", async () => {
+    const { schwebendDateien, schwebendPfad, schwebendSeit, schwebendVorhanden } = await schwebendApi();
+    expect(schwebendVorhanden(siteDir)).toBe(false); // Messapparat: vorher nichts
+
+    expect(start("harmlos").ok).toBe(true);
+    const e = await sammle();
+    expect(fehlerVon(e)).toBeUndefined();
+
+    expect(schwebendVorhanden(siteDir)).toBe(true);
+    expect(schwebendDateien(siteDir)).toEqual(["leistungen.html"]);
+    expect(readFileSync(join(schwebendPfad(siteDir), "leistungen.html"), "utf8")).toContain("Badsanierung");
+    expect(schwebendSeit(siteDir)).not.toBeNull();
+  }, 30_000);
+
+  test("GEGENPROBE: in der ausgelieferten Website steht davon nichts", async () => {
+    // Der ganze Punkt des Umbaus. Der erste Moment, in dem der Kunde das
+    // Ergebnis sieht, darf nicht der sein, in dem es schon öffentlich ist.
+    expect(start("harmlos").ok).toBe(true);
+    await sammle();
+
+    expect(existsSync(join(siteDir, "leistungen.html"))).toBe(false);
+    expect(countCommits(entwurfDir)).toBe(commitsVorher);
+  }, 30_000);
+
+  test("das `fertig`-Ereignis nennt dieselben Dateien wie schwebendDateien", async () => {
+    // Sonst zeigte die Seitenleiste etwas anderes an, als beim Übernehmen
+    // geschrieben würde.
+    const { schwebendDateien } = await schwebendApi();
+    expect(start("harmlos").ok).toBe(true);
+    const e = await sammle();
+
+    const f = fertigVon(e) as { dateien: string[] } | undefined;
+    expect(f?.dateien).toEqual(schwebendDateien(siteDir));
+  }, 30_000);
+
+  test("die Arbeitskopie ist danach trotzdem weg", async () => {
+    // `schwebend/` ist die neue Ablage, nicht die alte unter der Runtime-Wurzel.
+    // Bliebe die Kopie liegen, füllte sich /run über Wochen.
+    expect(start("harmlos").ok).toBe(true);
+    await sammle();
+    expect(readdirSync(runtime).filter((n) => n.startsWith("lauf-"))).toEqual([]);
+  }, 30_000);
+});
+
+// ===========================================================================
+// Was NICHT in die schwebende Änderung gelangt
+// ===========================================================================
+/**
+ * Die Sorgfalt von `uebernehmen` bleibt vollständig — sie zielt nur auf einen
+ * anderen Ort. Ein Lauf, der am Validator, an einem Symlink oder an einer
+ * Löschung scheitert, darf auch in `schwebend/` nichts hinterlassen: Der Kunde
+ * bekäme sonst etwas zum Übernehmen angeboten, das die Prüfung nicht bestanden
+ * hat.
+ */
+describe.skipIf(!haveBwrap())("ein gescheiterter Lauf hinterlässt auch in schwebend/ nichts", () => {
+  test("GEGENPROBE ZUERST: der gute Fall legt wirklich etwas an", async () => {
+    // Ohne diese Zeile wären alle drei Prüfungen darunter auch dann grün, wenn
+    // NIE etwas nach `schwebend/` geschrieben würde — die teuerste Sorte
+    // wertloser Nachweis, dreimal an einem Tag in diesem Repo passiert.
+    const { schwebendVorhanden } = await schwebendApi();
+    expect(start("harmlos").ok).toBe(true);
+    await sammle();
+    expect(schwebendVorhanden(siteDir)).toBe(true);
+  }, 30_000);
+
+  test("eine vom Validator abgelehnte Datei (Service Worker)", async () => {
+    const { schwebendVorhanden, schwebendDateien } = await schwebendApi();
+    expect(start("inline-skript").ok).toBe(true);
+    const e = await sammle();
+
+    expect(fehlerVon(e)).toBeDefined();
+    expect(schwebendVorhanden(siteDir)).toBe(false);
+    expect(schwebendDateien(siteDir)).toEqual([]);
+    expect(existsSync(join(siteDir, "leistungen.html"))).toBe(false);
+  }, 30_000);
+
+  test("ein Symlink in der Arbeitskopie", async () => {
+    const { schwebendVorhanden } = await schwebendApi();
+    expect(start("symlink-auf:/etc/passwd").ok).toBe(true);
+    const e = await sammle();
+
+    expect(fehlerVon(e)).toBeDefined();
+    expect(schwebendVorhanden(siteDir)).toBe(false);
+  }, 30_000);
+
+  test("eine gelöschte Datei — es gibt keinen Löschweg für den Agenten", async () => {
+    const { schwebendVorhanden } = await schwebendApi();
+    expect(start("loeschen").ok).toBe(true);
+    const e = await sammle();
+
+    expect(fehlerVon(e)).toBeDefined();
+    expect(schwebendVorhanden(siteDir)).toBe(false);
+  }, 30_000);
+});
+
+// ===========================================================================
+// Eine Übernahme über fremder Arbeit — wofür der Bezugspunkt da ist
+// ===========================================================================
+/**
+ * WAS HIER AUF DEM SPIEL STEHT. Die schwebende Änderung ist auf einem
+ * bestimmten Stand des Entwurfs entstanden und überdauert Tage. Bewegt sich der
+ * Entwurf darunter, gehört sie nicht mehr dorthin: Ihre Übernahme schriebe den
+ * neueren Stand mit dem älteren zu — die Handarbeit des Kunden wäre weg, ohne
+ * Meldung, an einer Datei, mit der der Auftrag nichts zu tun hatte.
+ *
+ * Genau deshalb ist `basis` in `legeSchwebendAn` ein PFLICHT-Parameter. Ohne
+ * ihn gäbe es keinen Bezugspunkt, `schwebendFremdGeaendert` fände nie etwas,
+ * und diese Prüfung wäre eine, die nicht anschlagen kann. Ein optionaler
+ * Parameter, dessen Fehlen eine Sicherheitsprüfung stilllegt, ist selbst der
+ * Weg in den Zustand, gegen den er schützt.
+ */
+describe("uebernimmSchwebend und der Bezugspunkt", () => {
+  const SCHWEBEND = "<html><body><p>VOM ASSISTENTEN</p></body></html>";
+
+  test("GEGENPROBE ZUERST: ohne Fremdänderung läuft die Übernahme durch", async () => {
+    // Sie trägt den Block. Eine Übernahme, die grundsätzlich scheitert,
+    // bestünde jede Abbruch-Prüfung und wäre trotzdem kaputt.
+    const { uebernimmSchwebend } = await import("./agent.ts");
+    await legeAb(new Map([["index.html", Buffer.from(SCHWEBEND)]]));
+
+    const erg = uebernimmSchwebend(ctx) as { ok: boolean; dateien?: string[] };
+
+    expect(erg.ok).toBe(true);
+    expect(readFileSync(join(entwurfDir, "index.html"), "utf8")).toContain("VOM ASSISTENTEN");
+    expect(countCommits(entwurfDir)).toBe((commitsVorher ?? 0) + 1);
+  });
+
+  test("bewegt sich der Entwurf darunter, wird NICHT übernommen", async () => {
+    const { uebernimmSchwebend } = await import("./agent.ts");
+    await legeAb(new Map([["index.html", Buffer.from(SCHWEBEND)]]));
+
+    // Der Kunde (oder ein Betreiber von Hand) ändert dieselbe Seite im Entwurf.
+    const vonHand = "<html><body><p>VON HAND GESPEICHERT</p></body></html>";
+    writeFileSync(join(entwurfDir, "index.html"), vonHand);
+
+    const erg = uebernimmSchwebend(ctx) as { ok: boolean; grund?: string; dateien?: string[] };
+
+    expect(erg.ok).toBe(false);
+    expect(erg.grund).toBe("fremd-geaendert");
+    // Mit Dateiliste — der Kunde soll erfahren, WORAN es liegt.
+    expect(erg.dateien).toEqual(["index.html"]);
+    // Und die frische Handarbeit steht unversehrt da.
+    expect(readFileSync(join(entwurfDir, "index.html"), "utf8")).toBe(vonHand);
+    expect(countCommits(entwurfDir)).toBe(commitsVorher);
+  });
+
+  test("eine unbeteiligte Datei im Entwurf stört die Übernahme nicht", async () => {
+    // Sonst scheiterte jede Übernahme, sobald irgendwo sonst gespeichert wurde —
+    // die Prüfung wäre so scharf, dass sie den Normalfall trifft.
+    const { uebernimmSchwebend } = await import("./agent.ts");
+    await legeAb(new Map([["index.html", Buffer.from(SCHWEBEND)]]));
+    writeFileSync(join(entwurfDir, "impressum.html"), "<html><body><p>woanders</p></body></html>");
+
+    expect((uebernimmSchwebend(ctx) as { ok: boolean }).ok).toBe(true);
+  });
+
+  test("ohne schwebende Änderung: keine-schwebende-aenderung", async () => {
+    const { uebernimmSchwebend } = await import("./agent.ts");
+    const erg = uebernimmSchwebend(ctx) as { ok: boolean; grund?: string };
+    expect(erg.ok).toBe(false);
+    expect(erg.grund).toBe("keine-schwebende-aenderung");
+  });
+});
+
+// ===========================================================================
+// Immer nur EINE Bearbeitung offen (Plan §3, Contract C2)
+// ===========================================================================
+describe("solange eine KI-Änderung offen ist, nimmt der Editor keine zweite Bearbeitung an", () => {
+  /**
+   * Ein eigener Ctx mit echter Auth — der Ctx der Datei trägt `auth: null`,
+   * und ohne Anmeldung gäbe jede dieser Routen 404 (Invariante 4). Genau der
+   * Fehler, an dem die Prüfung „Agent-Routen geben 404 ohne ki.json" einmal
+   * gescheitert ist: richtiges Ergebnis, falscher Grund.
+   */
+  function httpCtx(): HostCtx {
+    return baueCtx(siteDir, entwurfDir, { auth: loadAuthFile(siteDir), versand: attrappenVersand() });
+  }
+
+  function ruf(methode: string, pfad: string, opts: { cookie?: string; body?: unknown } = {}): Promise<Response> {
+    const ctxHttp = httpCtx();
+    const url = new URL("http://localhost:8788" + pfad);
+    const kopf: Record<string, string> = {};
+    if (opts.cookie) kopf.cookie = opts.cookie;
+    if (opts.body !== undefined) kopf["content-type"] = "application/json";
+    return Promise.resolve(
+      host.handleEditorRequest(
+        new Request(url, {
+          method: methode,
+          headers: kopf,
+          body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
+        }),
+        url,
+        ctxHttp,
+      ),
+    );
+  }
+
+  const angemeldet = (): string => issueCookie(loadAuthFile(siteDir)!).split(";")[0]!;
+
+  /**
+   * Ein Speichern, das ohne schwebende Änderung durchgehen MUSS.
+   *
+   * Der Hash kommt aus dem ENTWURF, nicht aus dem Abzug: Der Text-Editor
+   * schreibt seit dem Umbau dorthin, und das Optimistic Locking vergleicht
+   * gegen den Stand, den der Kunde im Editor gesehen hat.
+   */
+  function speicherAnfrage(hash?: string): Promise<Response> {
+    return ruf("POST", "/edit/save", {
+      cookie: angemeldet(),
+      body: {
+        pagePath: "index.html",
+        fileHash: hash ?? fileSha256(readFileSync(join(entwurfDir, "index.html"), "utf8")),
+        edits: [],
+      },
+    });
+  }
+
+  test("GEGENPROBE: ohne offene Änderung geht dasselbe Speichern durch", async () => {
+    // Sie trägt den ganzen Block — und sie prüft zugleich die Vorrichtung: Ist
+    // der Ctx veraltet (falscher Ordner, falscher Seitenpfad), scheitert diese
+    // Zeile, und niemand deutet den 409 darunter als Erfolg.
+    const r = await speicherAnfrage();
+    expect(r.status).toBe(200);
+  });
+
+  test("POST /edit/save gibt 409 mit `schwebende-aenderung`", async () => {
+    await legeAb(new Map([["index.html", Buffer.from("<html><body><p>KI</p></body></html>")]]));
+
+    const r = await speicherAnfrage();
+    expect(r.status).toBe(409);
+    expect(((await r.json()) as { fehler?: string }).fehler).toBe("schwebende-aenderung");
+  });
+
+  test("GEGENPROBE: der Hash-Konflikt ist ein ANDERER 409", async () => {
+    // Beide antworten 409. Ohne den Blick in den Rumpf wäre der Test oben auch
+    // dann grün, wenn der Server nur den Hash nicht mag — und die Sperre
+    // existierte gar nicht.
+    const r = await speicherAnfrage("0".repeat(64));
+    expect(r.status).toBe(409);
+    const koerper = (await r.json()) as { fehler?: string };
+    expect(koerper.fehler).toBeDefined();
+    expect(koerper.fehler).not.toBe("schwebende-aenderung");
+  });
+
+  test("POST /edit/agent gibt 409 mit `schwebende-aenderung`", async () => {
+    await legeAb(new Map([["index.html", Buffer.from("<html><body><p>KI</p></body></html>")]]));
+
+    const r = await ruf("POST", "/edit/agent", { cookie: angemeldet(), body: { auftrag: "harmlos" } });
+    expect(r.status).toBe(409);
+    expect(((await r.json()) as { fehler?: string }).fehler).toBe("schwebende-aenderung");
+    // Und kein Lauf ist dabei angesprungen — sonst kostete die Ablehnung Token.
+    expect(laufAktiv(siteDir)).toBeNull();
+  });
+
+  test.skipIf(!haveBwrap())("GEGENPROBE: ohne offene Änderung startet derselbe Auftrag", async () => {
+    const r = await ruf("POST", "/edit/agent", { cookie: angemeldet(), body: { auftrag: "harmlos" } });
+    expect(r.status).toBe(200);
+    brichAb(siteDir);
+    await warteBisRuhig(siteDir);
+  }, 30_000);
+
+  // =========================================================================
+  // Die Vorschau zeigt den Entwurf — auch bei Stylesheets (Contract C11)
+  // =========================================================================
+  /**
+   * DAS SCHADENSBILD, gemessen von Backend-Dev: `renderEditView` macht relative
+   * Asset-URLs root-absolut. Ohne eigenen Präfix landeten sie im ÖFFENTLICHEN
+   * Zweig — in Produktion sogar direkt bei Caddy, ohne dass der Bun-Prozess
+   * überhaupt gefragt wird. Die „Vorschau" zeigte damit Entwurfs-HTML über
+   * VERÖFFENTLICHTEM CSS.
+   *
+   * Das trifft nicht einen Randfall: Der Agent fasst Stylesheets routinemäßig
+   * an. Für jede solche Änderung prüfte der Kunde das Falsche, und „erst
+   * ansehen, dann übernehmen" — der Zweck dieses ganzen Umbaus — wäre genau
+   * dort gebrochen, wo er gebraucht wird.
+   */
+  const ALT = "body{color:#000}";
+  const NEU_IM_ENTWURF = "body{color:#111;font-size:18px}";
+  const NEU_SCHWEBEND = "body{color:#f0f;font-size:99px}";
+
+  /** Alle drei Stände auseinanderziehen: Abzug, Entwurf, schwebende Änderung. */
+  async function dreiStaendeCss(): Promise<void> {
+    writeFileSync(join(siteDir, "styles.css"), ALT);
+    writeFileSync(join(entwurfDir, "styles.css"), NEU_IM_ENTWURF);
+    await legeAb(new Map([["styles.css", Buffer.from(NEU_SCHWEBEND)]]));
+  }
+
+  test("die schwebende Änderung am Stylesheet kommt über /edit-vorschau, nicht über /", async () => {
+    await dreiStaendeCss();
+
+    const vorschau = await ruf("GET", "/edit-vorschau/styles.css", { cookie: angemeldet() });
+    expect(vorschau.status).toBe(200);
+    expect(await vorschau.text()).toBe(NEU_SCHWEBEND);
+
+    // GEGENPROBE auf demselben Server, im selben Test: Die Besucher bekommen
+    // weiterhin den veröffentlichten Stand. Fielen die beiden nicht
+    // auseinander, wäre die Vorschau wertlos — und der Test, der nur die erste
+    // Hälfte prüft, gäbe grün dafür.
+    const oeffentlich = await ruf("GET", "/styles.css");
+    expect(oeffentlich.status).toBe(200);
+    expect(await oeffentlich.text()).toBe(ALT);
+  });
+
+  test("ohne schwebende Änderung zeigt die Vorschau den ENTWURF", async () => {
+    // Der zweite Stand: gespeichert, noch nicht veröffentlicht. Auch er gehört
+    // in die Vorschau — sonst sähe der Kunde beim Begutachten seine eigene
+    // Arbeit von gestern nicht.
+    const { verwirfSchwebend } = await schwebendApi();
+    await dreiStaendeCss();
+    verwirfSchwebend(siteDir);
+
+    const vorschau = await ruf("GET", "/edit-vorschau/styles.css", { cookie: angemeldet() });
+    expect(await vorschau.text()).toBe(NEU_IM_ENTWURF);
+    expect(await (await ruf("GET", "/styles.css")).text()).toBe(ALT);
+  });
+
+  test("die Vorschau steht hinter der Auth-Wand: unangemeldet 404", async () => {
+    // 404, nicht 401 — Invariante 4. Ein 401 verriete, dass es hier etwas gibt.
+    await dreiStaendeCss();
+
+    const ohne = await ruf("GET", "/edit-vorschau/styles.css");
+    expect(ohne.status).toBe(404);
+    // Und ein ungültiges Cookie ist wie gar keines.
+    const gefaelscht = await ruf("GET", "/edit-vorschau/styles.css", { cookie: "regoro_edit=gefaelscht" });
+    expect(gefaelscht.status).toBe(404);
+  });
+
+  test("die Editier-Ansicht verweist wirklich auf den Vorschau-Präfix", async () => {
+    // Ohne diese Zeile könnte der Präfix tadellos funktionieren und trotzdem
+    // ungenutzt bleiben: Das ausgelieferte HTML zeigte weiter auf `/styles.css`,
+    // und der gemessene Fehler wäre unverändert da.
+    await dreiStaendeCss();
+
+    const ansicht = await ruf("GET", "/edit", { cookie: angemeldet() });
+    expect(ansicht.status).toBe(200);
+    const html = await ansicht.text();
+    expect(html).toContain("/edit-vorschau/styles.css");
+    expect(html).not.toMatch(/href="\/styles\.css"/);
+  });
+});
+
+// ===========================================================================
+// Der Agent kommt selbst nicht an die schwebende Änderung heran (Invariante 11)
+// ===========================================================================
+/**
+ * GEMESSEN, NICHT NACHGEBAUT.
+ *
+ * Die frühere Fassung baute die Kommandozeile aus `agent.ts` nach und fuhr
+ * `bwrap` selbst. Sie prüfte damit, ob `sandboxArgv` erzeugt, was der Test
+ * erwartet — nicht, ob die Sandbox hält: Ändert jemand die Aufrufform ohne die
+ * Wirkung, wird sie rot; ändert jemand die Wirkung ohne die Form, bleibt sie
+ * grün. Genau falsch herum.
+ *
+ * Jetzt läuft ein ECHTER Lauf durch `starteLauf`, mit dem Ablauf, den auch ein
+ * Kundenauftrag nimmt, und die Attrappe meldet beide Hälften: „ich habe es
+ * wirklich versucht" und „ich hätte schreiben können, nur nicht dorthin".
+ */
+const MARKE = "DURCHGERUTSCHT-ATTRAPPE";
+
+type Schreibbericht = {
+  versuche: { pfad: string; ergebnis: string }[];
+  inDerKopie: string;
+};
+
+describe.skipIf(!haveBwrap())("die Sandbox hat genau EINEN beschreibbaren Pfad", () => {
+  test("kein Schreibversuch nach .regoro/ kommt an — der Agent erreicht ihn nicht", async () => {
+    /**
+     * Die drei Ziele sind mit Bedacht gewählt: die schwebende Ablage (dort
+     * trüge ein Selbstschreiber ungeprüftes Markup ein, das der Kunde für ein
+     * Ergebnis der Prüfung hielte), das Sitzungsgeheimnis (Stütze 2 der
+     * Invariante 10) und die ausgelieferte Startseite (der Weg an jeder
+     * Prüfung vorbei direkt zum Besucher).
+     */
+    const { schwebendPfad, schwebendDateien } = await schwebendApi();
+    const ziele = [
+      join(schwebendPfad(siteDir), "leistungen.html"),
+      join(siteDir, AUTH_DIR_NAME, "auth.json"),
+      join(siteDir, "index.html"),
+    ];
+    const authVorher = readFileSync(join(siteDir, AUTH_DIR_NAME, "auth.json"));
+    const indexVorher = readFileSync(join(siteDir, "index.html"));
+
+    expect(start(`schreiben-auf:${ziele.join(",")}`).ok).toBe(true);
+    const e = await sammle();
+
+    const bericht = JSON.parse(text(e)) as Schreibbericht;
+
+    /**
+     * ERST die Gegenprobe. Ohne sie wäre „nichts angekommen" auch dann erfüllt,
+     * wenn die Attrappe gar nichts getan hätte oder bwrap nie gestartet wäre —
+     * und dann bewiese der ganze Test nichts. Sie ist hier keine Formsache:
+     * genau diese Zeile ist der Unterschied zwischen einer Messung und einer
+     * Behauptung.
+     */
+    expect(bericht.inDerKopie).toBe("ok");
+    expect(bericht.versuche).toHaveLength(ziele.length);
+
+    for (const { pfad, ergebnis } of bericht.versuche) {
+      // Kein „ok" — und der Grund kommt vom Betriebssystem, nicht von einem
+      // Tippfehler im Pfad. EROFS (nur lesbar) oder ENOENT (unter einem
+      // tmpfs-Deckel verschwunden) sind die beiden Formen, in denen die
+      // Sandbox antwortet.
+      expect(`${pfad} → ${ergebnis}`).not.toContain("→ ok");
+      expect(`${pfad} → ${ergebnis}`).toMatch(/EROFS|ENOENT|EACCES/);
+    }
+
+    // Und auf der Platte ist wirklich nichts angekommen.
+    expect(readFileSync(join(siteDir, AUTH_DIR_NAME, "auth.json"))).toEqual(authVorher);
+    expect(readFileSync(join(siteDir, "index.html"))).toEqual(indexVorher);
+    expect(existsSync(join(schwebendPfad(siteDir), "leistungen.html"))).toBe(false);
+
+    /**
+     * Wo das Ergebnis STATTDESSEN landet — der Beleg, dass der ganze Weg
+     * gelaufen ist und nicht bloß irgendwo abgebrochen wurde: Die Datei, die
+     * die Attrappe in ihrer Arbeitskopie anlegen durfte, steht jetzt als
+     * schwebende Änderung bereit, hineingetragen vom Elternprozess.
+     */
+    expect(schwebendDateien(siteDir)).toEqual(["schreibprobe.html"]);
+    expect(readFileSync(join(schwebendPfad(siteDir), "schreibprobe.html"), "utf8")).not.toContain(MARKE);
+  }, 30_000);
+
+  test("dasselbe für den Entwurf und das Sammelverzeichnis der Nachbarn", async () => {
+    // Der Entwurf trägt die Historie des Kunden; das Elternverzeichnis der
+    // Läufe die Arbeitskopien der anderen Kunden. Beide sind für den Worker
+    // ebenso unerreichbar wie der Rest.
+    const ziele = [
+      join(entwurfDir, "index.html"),
+      join(entwurfDir, ".git", "config"),
+      join(runtime, "fremder-lauf.txt"),
+      "/etc/regoro-schreibprobe",
+    ];
+    const entwurfVorher = readFileSync(join(entwurfDir, "index.html"));
+
+    expect(start(`schreiben-auf:${ziele.join(",")}`).ok).toBe(true);
+    const bericht = JSON.parse(text(await sammle())) as Schreibbericht;
+
+    expect(bericht.inDerKopie).toBe("ok"); // Gegenprobe, wie oben
+    for (const { pfad, ergebnis } of bericht.versuche) {
+      expect(`${pfad} → ${ergebnis}`).not.toContain("→ ok");
+    }
+    expect(readFileSync(join(entwurfDir, "index.html"))).toEqual(entwurfVorher);
+    expect(existsSync(join(runtime, "fremder-lauf.txt"))).toBe(false);
+    expect(existsSync("/etc/regoro-schreibprobe")).toBe(false);
+  }, 30_000);
+
+  test("GEGENPROBE OHNE SANDBOX: ohne bwrap kämen diese Schreibversuche durch", async () => {
+    /**
+     * Der Messapparat selbst. Die beiden Tests darüber zeigen, dass nichts
+     * ankommt — sie können aber nicht zeigen, dass das AN DER SANDBOX liegt.
+     * Käme derselbe Schreibversuch auch ungesperrt nicht durch (falscher Pfad,
+     * fehlende Rechte, Attrappe kaputt), wären sie grün und wertlos.
+     *
+     * Deshalb hier dieselbe Attrappe, direkt gestartet, ohne `bwrap` — und sie
+     * MUSS durchkommen. Der Lauf läuft dabei nicht über `starteLauf`: Es geht
+     * nur um die Frage „ist der Schreibweg an sich offen?".
+     */
+    const ziel = join(tmp("regoro-ungesperrt-"), "erreichbar.txt");
+    const kopie = join(runtime, "lauf-ungesperrt");
+    mkdirSync(kopie, { recursive: true, mode: 0o700 });
+
+    const kind = Bun.spawn([process.execPath, "run", ATTRAPPE], {
+      cwd: kopie,
+      env: {
+        PATH: process.env.PATH ?? "",
+        REGORO_ARBEITSKOPIE: kopie,
+        REGORO_AUFTRAG: `schreiben-auf:${ziel}`,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const aus = await new Response(kind.stdout).text();
+    await kind.exited;
+
+    const zeile = aus.split("\n").find((z) => z.includes("versuche"));
+    expect(zeile).toBeDefined();
+    const bericht = JSON.parse(JSON.parse(zeile!).inhalt) as Schreibbericht;
+
+    expect(bericht.versuche[0]!.ergebnis).toBe("ok");
+    expect(readFileSync(ziel, "utf8")).toContain(MARKE);
+  }, 30_000);
 });

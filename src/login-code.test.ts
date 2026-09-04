@@ -14,6 +14,8 @@ import { createAuthFile, loadAuthFile, cookieName } from "./auth.ts";
 import { attrappenVersand, type Attrappe } from "./versand.ts";
 import { vergisseAlleCodes, CODE_GUELTIG_MS, MAX_VERSUCHE } from "./codes.ts";
 import { vergisseBremse } from "./bremse.ts";
+import { entwurfPfad, stelleEntwurfBereit } from "./entwurf.ts";
+import { schwebendPfad } from "./arbeitskopie.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
 const REAL_SITE = join(REPO_ROOT, "examples", "site");
@@ -35,11 +37,18 @@ beforeEach(async () => {
   const siteDir = mkdtempSync(join(tmpdir(), "regoro-login-"));
   dirs.push(siteDir);
   cpSync(REAL_SITE, siteDir, { recursive: true });
+  // Die Editor-Sicht kommt aus dem Entwurfs-Repo (C1) — ohne es gäbe `/edit`
+  // auch mit gültigem Cookie 404, und der Test hier misst die ANMELDUNG.
+  stelleEntwurfBereit(siteDir);
   await createAuthFile(siteDir, [NUMMER, ADRESSE]);
   versand = attrappenVersand();
   ctx = {
-    repoRoot: siteDir,
+    repoRoot: entwurfPfad(siteDir),
+    entwurfDir: entwurfPfad(siteDir),
+    schwebendDir: schwebendPfad(siteDir),
     siteDir,
+    basis: "",
+    staging: false,
     pageWhitelist: PAGES,
     auth: loadAuthFile(siteDir),
     sitePrefix: "",

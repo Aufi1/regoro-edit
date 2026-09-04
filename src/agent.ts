@@ -4,15 +4,23 @@
  * Die Reihenfolge ist die aus dem Architektur-Bild des Plans und keine davon
  * ist verschiebbar:
  *   1. Kontingent prüfen        — vor jeder Ausgabe, sonst ist der Deckel keiner
- *   2. Arbeitskopie anlegen     — der Agent sieht den Site-Ordner nie
+ *   2. Arbeitskopie anlegen     — kopiert aus dem ENTWURF; der Agent sieht
+ *                                  weder den Site-Ordner noch ein Repo
  *   3. Weiterleitung starten    — sie hält die Schlüssel, der Worker nicht
  *   4. Worker in bwrap starten
  *   5. JSONL begleiten, Fragen im ELTERNPROZESS beantworten
  *   6. Worker beenden           — VOR dem Vergleichen (§13.15, TOCTOU)
  *   7. Änderungen ermitteln
  *   8. jede Datei validieren    — eine Ablehnung lässt den ganzen Lauf scheitern
- *   9. Realpath-Prüfung, schreiben, EIN Commit
+ *   9. Realpath-Prüfung, Ablage als SCHWEBENDE Änderung
  *  10. Kontingent buchen, Kopie löschen
+ *
+ * **Der Lauf endet bei der schwebenden Änderung, nicht in der Website.** Bis
+ * hierher lief alles wie zuvor; nur der letzte Schritt schreibt nicht mehr
+ * selbst. Erst `uebernimmSchwebend` (vom Kunden ausgelöst) trägt das Ergebnis
+ * in den Entwurf und committet dort. Der Grund steht im Plan: Der erste Moment,
+ * in dem der Kunde das Ergebnis sah, war bis dahin der, in dem es schon
+ * öffentlich war.
  *
  * Was dieser Datei anvertraut ist und sonst nirgends steht: Ein Lauf gehört der
  * WEBSITE, nicht der HTTP-Anfrage (§13.14). Schließt der Kunde den Tab, läuft er
@@ -31,8 +39,14 @@ import {
   byteHashDatei,
   ermittleAenderungen,
   legeArbeitskopieAn,
+  legeSchwebendAn,
   leseStand,
   raeumeAuf,
+  schwebendDateien,
+  schwebendFremdGeaendert,
+  schwebendPfad,
+  schwebendVorhanden,
+  verwirfSchwebend,
   type Ausgangsstand,
 } from "./arbeitskopie.ts";
 import {
@@ -43,7 +57,7 @@ import {
   waehleAus,
 } from "./verlauf.ts";
 import { ermittleModellGrenzen, type ModellGrenzen } from "./modell-info.ts";
-import { pruefeKontingent, verbucheTokens } from "./kontingent.ts";
+import { pruefeKontingent, verbucheTokens, type Kontingentart } from "./kontingent.ts";
 import { validateAgentOutput } from "./validate.ts";
 import { alleBrowserHerkuenfte, loadIntegrationen } from "./integrationen.ts";
 import { starteRelay } from "./relay.ts";
@@ -63,7 +77,10 @@ export type StartErgebnis =
   | { ok: true; laufId: string }
   // Maschinenlesbar, nicht der deutsche Satz: den Wortlaut für den Browser
   // besitzt Dev-Web (Contract §10). Stünde er hier auch, driftete er auseinander.
-  | { ok: false; grund: "laeuft-bereits" | "kontingent" | "keine-sandbox" };
+  | {
+      ok: false;
+      grund: "laeuft-bereits" | "kontingent" | "keine-sandbox" | "schwebende-aenderung";
+    };
 
 export type StartOptionen = {
   /** Ersetzt den Worker — ausschließlich für Tests (Attrappe). */
@@ -80,6 +97,25 @@ export type StartOptionen = {
    */
   verlauf?: string | null;
 };
+
+/**
+ * Nach welcher Regel sich das Kontingent dieser Website erneuert.
+ *
+ * Aus dem Ctx abgeleitet, nicht aus dem Kundenordner — genau wie das „ohne
+ * Anmeldung" (Plan): Ein Schalter je Website wäre eine Datei, die jemand
+ * mitkopiert, und dann liefe eine Preview auf dem Produktionskontingent
+ * mitsamt Monatsreset. Als Prozess-Eigenschaft kann das nicht passieren.
+ *
+ * **Die EINE Zuordnung Betriebsform → Verfallsregel**, exportiert, damit
+ * `host.ts` dieselbe benutzt. Stünde sie an zwei Stellen, zeigte die
+ * Seitenleiste eines Tages ein anderes Kontingent an, als der Lauf verbraucht.
+ * (`kontingent.ts` benennt die Regel bewusst nach dem Mechanismus und nicht
+ * nach dem Einsatzort — die Übersetzung dazwischen gehört hierher, wo der Ctx
+ * bekannt ist.)
+ */
+export function kontingentArt(ctx: HostCtx): Kontingentart {
+  return ctx.staging ? "einmalig" : "monatlich";
+}
 
 /** Höchstens so viele Ereignisse werden für einen Neuverbinder aufgehoben (§13.14). */
 const PUFFER_GRENZE = 500;
@@ -205,7 +241,19 @@ export async function* ereignisse(siteDir: string): AsyncGenerator<AgentEreignis
 export function starteLauf(ctx: HostCtx, auftrag: string, opts: StartOptionen = {}): StartErgebnis {
   if (laufAktiv(ctx.siteDir)) return { ok: false, grund: "laeuft-bereits" };
 
-  const kontingent = pruefeKontingent(ctx.siteDir);
+  /**
+   * IMMER NUR EINE BEARBEITUNG OFFEN (Plan §3).
+   *
+   * Der Riegel steht HIER und nicht nur in der Route: Ein zweiter Lauf über
+   * einer noch nicht angesehenen Änderung würde deren Grundlage verschieben —
+   * der Kunde sähe eine Zusammenfassung zu einem Stand, den es nicht mehr gibt,
+   * und die erste Arbeit wäre bezahlt und weg. Wer `starteLauf` künftig von
+   * einem zweiten Eingangskanal aus ruft (der Plan nennt WhatsApp), bekommt den
+   * Riegel damit von selbst mit.
+   */
+  if (schwebendVorhanden(ctx.siteDir)) return { ok: false, grund: "schwebende-aenderung" };
+
+  const kontingent = pruefeKontingent(ctx.siteDir, kontingentArt(ctx));
   if (kontingent.erschoepft) return { ok: false, grund: "kontingent" };
 
   // Fehlt bwrap, startet KEIN Lauf. Kein stiller Rückfall auf einen
@@ -275,7 +323,7 @@ async function fuehreAus(ctx: HostCtx, auftrag: string, opts: StartOptionen, lau
   }
 
   const integrationen = loadIntegrationen(ctx.siteDir);
-  const kontingent = pruefeKontingent(ctx.siteDir);
+  const kontingent = pruefeKontingent(ctx.siteDir, kontingentArt(ctx));
   let kopie: string | null = null;
   let relay: { port: number; stop(): void } | null = null;
   let geseheneTokens = 0;
@@ -284,7 +332,7 @@ async function fuehreAus(ctx: HostCtx, auftrag: string, opts: StartOptionen, lau
   let ausgang: Ausgangsstand | null = null;
 
   try {
-    kopie = legeArbeitskopieAn(ctx.siteDir);
+    kopie = legeArbeitskopieAn(ctx.entwurfDir);
     /**
      * Der Stand der Website zum Zeitpunkt der Kopie.
      *
@@ -296,7 +344,7 @@ async function fuehreAus(ctx: HostCtx, auftrag: string, opts: StartOptionen, lau
      * Direkt NACH dem Kopieren gelesen, nicht davor: Was zwischen beiden Zeilen
      * geschieht, gehört noch zum Ausgangszustand.
      */
-    ausgang = leseStand(ctx.siteDir);
+    ausgang = leseStand(ctx.entwurfDir);
 
     /**
      * Verlauf: aufräumen, auswählen, in die Arbeitskopie legen.
@@ -396,7 +444,7 @@ async function fuehreAus(ctx: HostCtx, auftrag: string, opts: StartOptionen, lau
     // Verbucht wird IMMER, auch nach einem gescheiterten Lauf: Die Token sind
     // trotzdem ausgegeben. Wer nur Erfolge verbucht, hat einen Freifahrtschein
     // gebaut — ein Lauf, der absichtlich am Validator scheitert, zählte nie.
-    verbucheTokens(ctx.siteDir, geseheneTokens);
+    verbucheTokens(ctx.siteDir, geseheneTokens, kontingentArt(ctx));
     beende(lauf);
   }
 }
@@ -781,10 +829,21 @@ function findeSymlink(kopie: string, rel = ""): string | null {
 }
 
 /**
- * Vergleicht Kopie und Original und übernimmt, was durchkommt — alles oder
- * nichts. Eine einzige Ablehnung lässt den ganzen Lauf scheitern: Eine halb
- * übernommene Änderung wäre eine Website in einem Zustand, den niemand gewollt
- * und niemand geprüft hat.
+ * Vergleicht Kopie und Entwurf und legt ab, was durchkommt — alles oder nichts.
+ * Eine einzige Ablehnung lässt den ganzen Lauf scheitern: Eine halb übernommene
+ * Änderung wäre ein Entwurf in einem Zustand, den niemand gewollt und niemand
+ * geprüft hat.
+ *
+ * **Verglichen wird gegen den ENTWURF, nicht gegen die ausgelieferte Website.**
+ * Der Agent hat aus dem Entwurf kopiert, also ist der Entwurf sein Original.
+ * Gegen die Website zu vergleichen hieße, gespeicherte, noch nicht
+ * veröffentlichte Kundenarbeit als „vom Agenten geändert" zu lesen und sie beim
+ * Übernehmen zu überschreiben.
+ *
+ * **Geschrieben wird in die schwebende Ablage**, nicht in den Entwurf. Alle
+ * Prüfungen darunter bleiben Zeile für Zeile stehen — sie entscheiden weiterhin
+ * darüber, ob überhaupt etwas entsteht, nur eben eine Ablage statt einer
+ * Änderung an der Website.
  */
 function uebernehmen(
   ctx: HostCtx,
@@ -842,11 +901,11 @@ function uebernehmen(
   if (!geaendert.length) return { ok: true, dateien: [], commit: null };
 
   const browserHerkuenfte = alleBrowserHerkuenfte(integrationen);
-  const zuSchreiben: { rel: string; ziel: string; inhalt: string }[] = [];
+  const zuSchreiben: { rel: string; ziel: string; inhalt: Buffer }[] = [];
 
   for (const [i, rel] of geaendert.sort().entries()) {
     const quelle = join(kopie, rel);
-    const ziel = join(ctx.siteDir, rel);
+    const ziel = join(ctx.entwurfDir, rel);
 
     // BEIDE Seiten prüfen (§13.15). `pathInsideSite(siteDir, ziel)` allein sähe
     // bei einem Symlink `kopie/kontakt.html -> /etc/passwd` nichts Falsches:
@@ -861,12 +920,27 @@ function uebernehmen(
     }
     if (stat.isSymbolicLink()) return { ok: false, grund: `symlink:${rel}` };
     if (!pathInsideSite(kopie, quelle)) return { ok: false, grund: `ausserhalb-kopie:${rel}` };
-    if (!pathInsideSite(ctx.siteDir, ziel)) return { ok: false, grund: `ausserhalb-site:${rel}` };
+    if (!pathInsideSite(ctx.entwurfDir, ziel)) return { ok: false, grund: `ausserhalb-site:${rel}` };
 
-    const inhalt = readFileSync(quelle, "utf8");
+    /**
+     * EINMAL die Bytes lesen, den Text daraus ableiten — nicht umgekehrt.
+     *
+     * Vorher stand hier `readFileSync(quelle, "utf8")` und derselbe String ging
+     * wieder hinaus. Für HTML und CSS ist das folgenlos, für eine `.webp` oder
+     * `.woff2` nicht: Jedes ungültige Byte wird beim Dekodieren zu U+FFFD und
+     * beim Schreiben zu drei anderen Bytes — die Datei käme beschädigt an. Der
+     * Validator braucht weiterhin Text; er bekommt ihn, aber abgelegt werden
+     * die Originalbytes. (Dieselbe Falle wie bei `byteHashDatei`, dort schon
+     * beschrieben.)
+     */
+    const roh = readFileSync(quelle);
+    const inhalt = roh.toString("utf8");
     const alt = existsSync(ziel) ? readFileSync(ziel, "utf8") : null;
     const erg = validateAgentOutput(rel, inhalt, alt, {
-      siteDir: ctx.siteDir,
+      // Der Entwurf ist das Original dieses Laufs — aus ihm wurde kopiert, und
+      // die bekannten CSS-Klassen und Farbwerte stehen dort, nicht in der
+      // zuletzt veröffentlichten Fassung.
+      siteDir: ctx.entwurfDir,
       browserHerkuenfte,
       anzahlBisher: i,
       // Nur für die weichen Hinweise. Hier werden sie zwar verworfen — der Lauf
@@ -878,7 +952,7 @@ function uebernehmen(
     });
     if (!erg.ok) return { ok: false, grund: erg.grund };
 
-    zuSchreiben.push({ rel, ziel, inhalt });
+    zuSchreiben.push({ rel, ziel, inhalt: roh });
   }
 
   /**
@@ -902,22 +976,165 @@ function uebernehmen(
   const kollision = ersteKollision(zuSchreiben, ausgang);
   if (kollision) return { ok: false, grund: kollision };
 
+  /**
+   * Der Stand des ENTWURFS in genau diesem Augenblick — der Boden, auf dem die
+   * schwebende Änderung zu liegen kommt.
+   *
+   * Direkt nach `ersteKollision` gelesen und nicht aus `ausgang` abgeleitet:
+   * `ausgang` kann fehlen (ältere Aufrufer übergeben ihn nicht), und dann stünde
+   * hier für jede Datei „gab es nicht" — beim Übernehmen sähe das aus wie eine
+   * fremde Änderung an allem, und der Kunde bekäme seine Arbeit nie eingespielt.
+   * Gemessen wird deshalb, was wirklich dasteht.
+   */
+  const basis = new Map<string, string | null>();
+  for (const { rel, ziel } of zuSchreiben) {
+    try {
+      basis.set(rel, existsSync(ziel) ? byteHashDatei(ziel) : null);
+    } catch {
+      basis.set(rel, null);
+    }
+  }
+
+  legeSchwebendAn(
+    ctx.siteDir,
+    new Map(zuSchreiben.map((z) => [z.rel, z.inhalt] as const)),
+    basis,
+  );
+
+  /**
+   * KEIN Commit und kein Hash mehr — der Lauf ändert die Website nicht.
+   *
+   * `commit` bleibt im Ereignis stehen und ist ab jetzt immer `null`. Das Feld
+   * zu entfernen hieße, den Ereignistyp zu brechen und jeden Zuhörer
+   * mitzuziehen, für eine Angabe, die es zu diesem Zeitpunkt schlicht nicht
+   * gibt: Einen Commit erzeugt erst `uebernimmSchwebend`, wenn der Kunde
+   * zugestimmt hat.
+   */
+  return { ok: true, dateien: zuSchreiben.map((z) => z.rel), commit: null };
+}
+
+// ===========================================================================
+// Vom Kunden ausgelöst: die schwebende Änderung in den Entwurf übernehmen
+// ===========================================================================
+
+/**
+ * Das Ergebnis von `uebernimmSchwebend` — maschinenlesbar, wie `StartErgebnis`.
+ * Den deutschen Wortlaut besitzt `host.ts`; stünde er hier auch, driftete er.
+ */
+export type SchwebendErgebnis =
+  | { ok: true; dateien: string[]; commit: string | null }
+  | { ok: false; grund: "keine-schwebende-aenderung" }
+  | { ok: false; grund: "fremd-geaendert"; dateien: string[] }
+  | { ok: false; grund: "validierung"; dateien: { pfad: string; grund: string }[] }
+  | { ok: false; grund: "abgelehnt"; kennung: string };
+
+/**
+ * Trägt die schwebende Änderung in den Entwurf und committet sie dort.
+ *
+ * **Hier wird ein zweites Mal validiert, und das ist kein Versehen.** Die erste
+ * Prüfung lief am Ende des Laufs gegen den Entwurf, wie er damals war. Zwischen
+ * damals und jetzt können Tage liegen — der Plan verlangt ausdrücklich, dass
+ * eine offene Änderung Neustarts überlebt. `validateAgentOutput` urteilt gegen
+ * den VORZUSTAND („was schon vorher dastand, bleibt gültig"), und der ist eine
+ * andere Datei als damals, sobald sich am Entwurf etwas geändert hat. Die
+ * Prüfung, die zählt, ist deshalb die unmittelbar vor dem Schreiben.
+ *
+ * Die Reihenfolge ist dieselbe wie im Lauf und aus demselben Grund: erst alle
+ * Prüfungen, dann alles schreiben. Ein Abbruch mittendrin hinterließe einen
+ * Entwurf, den weder Agent noch Kunde je so gewollt hat.
+ */
+export function uebernimmSchwebend(ctx: HostCtx): SchwebendErgebnis {
+  const dateien = schwebendDateien(ctx.siteDir);
+  if (dateien.length === 0) return { ok: false, grund: "keine-schwebende-aenderung" };
+
+  const ablage = schwebendPfad(ctx.siteDir);
+
+  /**
+   * Hat sich der Entwurf unter der Änderung bewegt?
+   *
+   * Im Normalbetrieb kann er das nicht — Speichern, Hochladen, Wiederherstellen
+   * und ein zweiter Auftrag sind gesperrt, solange etwas schwebt. Die Prüfung
+   * ist trotzdem da, weil die Sperre eine Aussage über den HEUTIGEN Code ist und
+   * die Ablage Tage überdauert: Ein Betreiber, der von Hand im Entwurfs-Repo
+   * arbeitet, ein Neustart mitten im Ablegen, ein künftiger dritter Schreibweg.
+   * Sie kostet ein paar Hashes und verhindert, dass eine Änderung auf einem
+   * Untergrund landet, für den sie nie gedacht war.
+   */
+  const fremd = schwebendFremdGeaendert(ctx.siteDir, ctx.entwurfDir);
+  if (fremd.length > 0) return { ok: false, grund: "fremd-geaendert", dateien: fremd };
+
+  // Wie im Lauf: ein Symlink in der Ablage hat nur eine mögliche Herkunft, und
+  // sie ist keine gute. Die Ablage schreibt allein der Elternprozess — was hier
+  // liegt, hat er selbst hingelegt oder jemand mit Zugriff auf die Platte.
+  const symlink = findeSymlink(ablage);
+  if (symlink) return { ok: false, grund: "abgelehnt", kennung: `symlink:${symlink}` };
+
+  const browserHerkuenfte = alleBrowserHerkuenfte(loadIntegrationen(ctx.siteDir));
+  const zuSchreiben: { rel: string; ziel: string; inhalt: Buffer }[] = [];
+  const abgelehnt: { pfad: string; grund: string }[] = [];
+
+  for (const [i, rel] of dateien.entries()) {
+    const quelle = join(ablage, rel);
+    const ziel = join(ctx.entwurfDir, rel);
+
+    // BEIDE Seiten, wie beim Lauf (§13.15): Das Ziel liegt sauber im Entwurf,
+    // gelesen würde bei einem Symlink trotzdem etwas ganz anderes.
+    let stat;
+    try {
+      stat = lstatSync(quelle);
+    } catch {
+      return { ok: false, grund: "abgelehnt", kennung: `unlesbar:${rel}` };
+    }
+    if (stat.isSymbolicLink()) return { ok: false, grund: "abgelehnt", kennung: `symlink:${rel}` };
+    if (!pathInsideSite(ablage, quelle)) {
+      return { ok: false, grund: "abgelehnt", kennung: `ausserhalb-ablage:${rel}` };
+    }
+    if (!pathInsideSite(ctx.entwurfDir, ziel)) {
+      return { ok: false, grund: "abgelehnt", kennung: `ausserhalb-entwurf:${rel}` };
+    }
+
+    const roh = readFileSync(quelle);
+    const alt = existsSync(ziel) ? readFileSync(ziel, "utf8") : null;
+    const erg = validateAgentOutput(rel, roh.toString("utf8"), alt, {
+      siteDir: ctx.entwurfDir,
+      browserHerkuenfte,
+      anzahlBisher: i,
+    });
+    // Hier wird GESAMMELT statt beim ersten Nein abgebrochen: Der Kunde steht
+    // vor der Entscheidung und soll alle Gründe auf einmal sehen, nicht einen
+    // pro Klick. Geschrieben wird trotzdem nur, wenn die Liste leer bleibt.
+    if (!erg.ok) abgelehnt.push({ pfad: rel, grund: erg.grund });
+    else zuSchreiben.push({ rel, ziel, inhalt: roh });
+  }
+
+  if (abgelehnt.length > 0) return { ok: false, grund: "validierung", dateien: abgelehnt };
+
   for (const { ziel, inhalt } of zuSchreiben) {
     mkdirSync(dirname(ziel), { recursive: true });
     writeFileSync(ziel, inhalt);
   }
 
-  const dateien = zuSchreiben.map((z) => z.rel);
-  const pfade = dateien.map((rel) => (ctx.sitePrefix ? `${ctx.sitePrefix}/${rel}` : rel));
-  commitEdit(ctx.repoRoot, pfade, "KI-Seitenleiste: Auftrag umgesetzt");
+  /**
+   * COMMITTEN IST PFLICHT, nicht Kosmetik. `git read-tree --reset -u` bricht bei
+   * schmutzigem Arbeitsbaum ab — eine einzige nicht committete Datei im Entwurf
+   * macht das Wiederherstellen dauerhaft unmöglich, also genau dann, wenn man es
+   * braucht. Jeder Schreibweg in den Entwurf endet deshalb mit einem Commit.
+   */
+  const pfade = zuSchreiben.map((z) => (ctx.sitePrefix ? `${ctx.sitePrefix}/${z.rel}` : z.rel));
+  commitEdit(ctx.repoRoot, pfade, "KI-Seitenleiste: Auftrag übernommen");
+
+  // Erst nach dem Commit wegwerfen: Scheitert das Committen, bleibt die Ablage
+  // stehen und der Kunde kann es erneut versuchen. Andersherum wäre die Arbeit
+  // weg und der Entwurf in einem Zustand, den niemand mehr zurücknehmen kann.
+  verwirfSchwebend(ctx.siteDir);
 
   let commit: string | null = null;
   try {
     commit = git(ctx.repoRoot, "rev-parse", "--short", "HEAD").trim() || null;
   } catch {
-    /* ohne Hash ist der Lauf trotzdem gelungen */
+    /* ohne Hash ist die Übernahme trotzdem gelungen */
   }
-  return { ok: true, dateien, commit };
+  return { ok: true, dateien: zuSchreiben.map((z) => z.rel), commit };
 }
 
 

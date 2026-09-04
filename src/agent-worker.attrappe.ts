@@ -66,6 +66,14 @@ function schreibeAbsolut(absPfad: string, inhalt: string): string {
   }
 }
 
+/**
+ * Der Fingerabdruck der Attrappe. Steht in allem, was sie an Stellen zu
+ * schreiben versucht, die ihr nicht gehören — damit ein Test nicht nur „die
+ * Datei ist unverändert" prüfen kann, sondern „von DIESEM Lauf steht nichts
+ * darin".
+ */
+const MARKE = "DURCHGERUTSCHT-ATTRAPPE";
+
 const HARMLOS =
   "<!doctype html>\n<html lang=de><head><meta charset=utf-8><title>Leistungen</title>" +
   '<link rel=stylesheet href="/styles.css"></head><body>' +
@@ -153,6 +161,42 @@ async function lauf(): Promise<void> {
         sende({ t: "text", inhalt: `symlink fehlgeschlagen: ${String(err)}` });
       }
       sende({ t: "fertig", zusammenfassung: "Symlink gelegt." });
+      return;
+    }
+
+    /**
+     * Versucht, an ABSOLUTE Pfade außerhalb der Arbeitskopie zu SCHREIBEN.
+     *
+     * WARUM ES DAS BRAUCHT. Die schwebende Änderung liegt seit „Eine
+     * Bearbeitung, zwei Modi" im Kundenordner (`<siteDir>/.regoro/schwebend/`) —
+     * dieselbe Spannung wie beim Gesprächsverlauf: haltbar wie die Website, und
+     * trotzdem für den Agenten unerreichbar. Der Elternprozess trägt das
+     * geprüfte Ergebnis dort hinein, der Worker nie selbst.
+     *
+     * Der Nachweis dafür stand vorher als NACHBILDUNG im Test: Er baute die
+     * Kommandozeile aus `agent.ts` nach und prüfte damit, ob `sandboxArgv`
+     * erzeugt, was der Test erwartet — nicht, ob die Sandbox hält. Falsch
+     * herum: Ändert jemand die Aufrufform ohne die Wirkung, wird er rot; ändert
+     * jemand die Wirkung ohne die Form, bleibt er grün.
+     *
+     * BEIDE HÄLFTEN WERDEN GEMELDET, und das ist der Punkt: „ich habe es
+     * wirklich versucht" (`versuche`) UND „ich hätte schreiben können"
+     * (`inDerKopie`). Ohne die zweite wäre der wichtigste Test dieser Arbeit
+     * auch dann grün, wenn die Attrappe gar nichts täte.
+     *
+     * `ziel` ist eine kommagetrennte Liste absoluter Pfade; ohne Angabe wird
+     * `/etc/regoro-schreibprobe` versucht.
+     */
+    case "schreiben-auf": {
+      const pfade = (ziel === "" ? "/etc/regoro-schreibprobe" : ziel).split(",").filter((p) => p !== "");
+      const versuche = pfade.map((pfad) => ({ pfad, ergebnis: schreibeAbsolut(pfad, MARKE) }));
+      // Die Gegenprobe im selben Lauf: In die eigene Arbeitskopie GEHT es.
+      // Bewusst eine gültige Seite — so endet der Lauf regulär, und der Test
+      // sieht zusätzlich, wo das Ergebnis stattdessen landet.
+      const inDerKopie = schreibe("schreibprobe.html", HARMLOS);
+      sende({ t: "text", inhalt: JSON.stringify({ versuche, inDerKopie }) });
+      log(`schreiben-auf: ${versuche.map((v) => `${v.pfad}=${v.ergebnis}`).join(" ")} kopie=${inDerKopie}`);
+      sende({ t: "fertig", zusammenfassung: "Schreibversuche beendet." });
       return;
     }
 

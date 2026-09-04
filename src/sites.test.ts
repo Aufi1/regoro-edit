@@ -13,7 +13,8 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync, symlinkSync, cpSync, rea
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { normalizeHost, resolveSite, buildCtx, listSites } from "./sites.ts";
-import { createAuthFile } from "./auth.ts";
+import { createAuthFile, AUTH_DIR_NAME } from "./auth.ts";
+import { entwurfPfad, stelleEntwurfBereit } from "./entwurf.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
 const REAL_SITE = join(REPO_ROOT, "examples", "site");
@@ -175,16 +176,49 @@ describe("buildCtx", () => {
     const root = makeRoot("regoro-ctx-");
     const siteDir = join(root, "kunde-a.test");
     cpSync(REAL_SITE, siteDir, { recursive: true });
+    // Seit C1 liest die Editor-Sicht aus dem Entwurfs-Repo. Ohne dieses fiele
+    // `pageWhitelist` auf den Vorgabewert ["index.html"] zurück, und die Tests
+    // unten prüften einen Zustand, den es im Betrieb nicht gibt.
+    stelleEntwurfBereit(siteDir);
     if (withAuth) await createAuthFile(siteDir, ["+4915120464812"]);
     return { root, siteDir };
   }
 
-  test("repoRoot === siteDir und sitePrefix === '' (Versionen pro Site)", async () => {
+  test("repoRoot === entwurfDir und sitePrefix === '' (Versionen im Entwurfs-Repo)", async () => {
+    /**
+     * GEÄNDERT MIT „Eine Bearbeitung, zwei Modi" (C1). Vorher war
+     * `repoRoot === siteDir`: der Editor schrieb und committete direkt in die
+     * ausgelieferte Website. Jetzt liegt die Historie im Entwurfs-Repo, und der
+     * Site-Ordner ist ein reiner Abzug davon (Plan, „Wo die Historie liegt").
+     *
+     * Die erste Zusicherung ist die Beziehung, nicht der Pfad: Wer `repoRoot`
+     * irgendwohin sonst zeigen lässt, committet an einem Ort, den
+     * `veroeffentliche` nie ausrollt — der Kunde speicherte ins Leere.
+     */
     const { root, siteDir } = await siteFixture(false);
     const ctx = buildCtx(resolveSite(root, "kunde-a.test")!);
     expect(ctx.siteDir).toBe(siteDir);
-    expect(ctx.repoRoot).toBe(siteDir);
+    expect(ctx.repoRoot).toBe(ctx.entwurfDir);
     expect(ctx.sitePrefix).toBe("");
+    // Und der Ort selbst, aus der Tabelle der Contracts: haltbar wie die
+    // Website (unter `<siteDir>/.regoro/`), nicht unter `runtimeWurzel()`.
+    expect(ctx.entwurfDir).toBe(join(siteDir, AUTH_DIR_NAME, "entwurf"));
+    expect(ctx.schwebendDir).toBe(join(siteDir, AUTH_DIR_NAME, "schwebend"));
+  });
+
+  test("im Sammelbetrieb ist `basis` leer und `staging` falsch", () => {
+    /**
+     * Die Fahne hängt am PROZESS (Plan, „Zwei Betriebsformen"). Der
+     * hostbasierte Ctx ist der Produktions-Ctx — er darf `staging` nie von
+     * selbst auf `true` bringen, sonst stünde eine echte Kundenwebsite ohne
+     * Anmeldung offen. Und ein leeres `basis` ist die Bedingung dafür, dass
+     * alle erzeugten URLs bleiben, wie sie sind.
+     */
+    const root = makeRoot("regoro-basis-");
+    mkdirSync(join(root, "kunde-a.test"));
+    const ctx = buildCtx(resolveSite(root, "kunde-a.test")!);
+    expect(ctx.basis).toBe("");
+    expect(ctx.staging).toBe(false);
   });
 
   test("pageWhitelist kommt aus dem Ordner", async () => {
@@ -204,8 +238,11 @@ describe("buildCtx", () => {
   test("pageWhitelist wird erst beim Zugriff gelesen (kein readdir pro Asset)", async () => {
     const { root, siteDir } = await siteFixture(false);
     const ctx = buildCtx(resolveSite(root, "kunde-a.test")!);
-    // Nach dem Bauen des Ctx angelegt — eine EAGER ermittelte Liste kennt sie nicht.
-    writeFileSync(join(siteDir, "spaeter.html"), "<html><body><p>x</p></body></html>");
+    // Nach dem Bauen des Ctx angelegt — eine EAGER ermittelte Liste kennt sie
+    // nicht. Angelegt wird im ENTWURF: dort entstehen neue Seiten (ein Lauf des
+    // Agenten schreibt dorthin), der Site-Ordner bekommt sie erst beim
+    // Veröffentlichen.
+    writeFileSync(join(entwurfPfad(siteDir), "spaeter.html"), "<html><body><p>x</p></body></html>");
     expect(ctx.pageWhitelist).toContain("spaeter.html");
   });
 

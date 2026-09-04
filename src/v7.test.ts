@@ -16,6 +16,7 @@ import { parseHTML } from "linkedom";
 import { mkdtempSync, rmSync, mkdirSync, cpSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { schwebendPfad } from "./arbeitskopie.ts";
 
 const TEST_SECRET = "testsecret-aaaaaaaaaaaaaaaaaaaaaaaa";
 const TEST_NUMMER = "+4915120464812";
@@ -223,7 +224,19 @@ describe("host.ts — /edit/save {idx,start,end,bold:false} (v7)", () => {
     mkdirSync(siteDir, { recursive: true });
     cpSync(REAL_SITE, siteDir, { recursive: true });
     git.ensureRepo(repoRoot);
-    ctx = { repoRoot, siteDir, pageWhitelist: PAGE_WHITELIST, auth: TEST_AUTH };
+    // Drei Orte statt einem (Contract C1). Diese Vorrichtung stammt von davor:
+    // Entwurfs-Sicht und Abzug liegen hier auf demselben Ordner, damit die
+    // Zusicherungen dieses Blocks weiterhin den Router messen und nicht die Ablage.
+    ctx = {
+      repoRoot,
+      entwurfDir: siteDir,
+      schwebendDir: schwebendPfad(siteDir),
+      siteDir,
+      basis: "",
+      staging: false,
+      pageWhitelist: PAGE_WHITELIST,
+      auth: TEST_AUTH,
+    };
   });
 
   function authCookie(): string {

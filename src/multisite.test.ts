@@ -19,6 +19,7 @@ import { join } from "node:path";
 import { startServer } from "./server.ts";
 import { createAuthFile, AUTH_DIR_NAME } from "./auth.ts";
 import { SECRET_SCAN_TTL_MS } from "./sites.ts";
+import { entwurfPfad, stelleEntwurfBereit } from "./entwurf.ts";
 import { attrappenVersand, type Attrappe } from "./versand.ts";
 import { meldeAn } from "./anmeldung.testhelfer.ts";
 
@@ -54,6 +55,10 @@ async function bootMulti(): Promise<Multi> {
   writeFileSync(join(siteB, "index.html"), "<html><body><h1>SEITE B</h1></body></html>");
   // Seite, die es nur bei A gibt.
   writeFileSync(join(siteA, "nur-bei-a.html"), "<html><body><h1>NUR A</h1></body></html>");
+  // Erst der fertige Stand, dann das Entwurfs-Repo — der Editor liest seine
+  // Sicht seit C1 von dort, der öffentliche Zweig weiterhin aus dem Site-Ordner.
+  stelleEntwurfBereit(siteA);
+  stelleEntwurfBereit(siteB);
   await createAuthFile(siteA, [KENNUNG_PW_A]);
   await createAuthFile(siteB, [KENNUNG_PW_B]);
 
@@ -212,6 +217,47 @@ describe("Sammelbetrieb — Trennung", () => {
   });
 });
 
+describe("Sammelbetrieb — die Pfad-Auflösung des Staging bleibt draußen", () => {
+  /**
+   * Mit „Eine Bearbeitung, zwei Modi" bekommt der Editor eine ZWEITE
+   * Auflösungsart: `…/p/<slug>/…` löst über einen Pfadabschnitt auf statt über
+   * den Host-Header (C7). Sie gehört zum Staging-Prozess und zu keinem anderen.
+   *
+   * Diese beiden Fälle sind die Gegenrichtung zu `staging.test.ts`: Wer das
+   * Abstreifen des Präfixes versehentlich vor JEDEN Router hängt, öffnet im
+   * Produktionsbetrieb eine zweite Adresse für jede Website — und die käme,
+   * weil Staging keine Anmeldung kennt, womöglich gleich ohne Cookie.
+   *
+   * Die Zuordnung Anfrage → Website ist die erste Stütze der Kundentrennung
+   * (Invariante 10). Sie darf im Produktionsprozess nur EINE Quelle haben.
+   */
+  test("kein Präfix-Pfad ist im Produktionsprozess eine Website", async () => {
+    const { base, cookieA } = await bootMulti();
+    for (const path of [
+      "/p/kunde-a.test/edit",
+      "/p/kunde-a.test/index.html",
+      "/p/kunde-b.test/edit",
+      "/p/kunde-b.test/edit/save",
+      "/p/kunde-a.test/edit-assets/overlay.js",
+    ]) {
+      // Ohne Cookie …
+      expect(`${path} → ${await status(base, "kunde-a.test", path)}`).toBe(`${path} → 404`);
+      // … und mit gültigem Cookie derselben Website erst recht nicht.
+      expect(`${path} (angemeldet) → ${await status(base, "kunde-a.test", path, cookieA)}`).toBe(
+        `${path} (angemeldet) → 404`,
+      );
+    }
+  });
+
+  test("die hostbasierte Auflösung bleibt daneben unverändert erreichbar", async () => {
+    // Gegenprobe: Der Test darüber wäre auch grün, wenn dieser Server gar
+    // nichts mehr ausliefert.
+    const { base, cookieA } = await bootMulti();
+    expect(await status(base, "kunde-a.test", "/")).toBe(200);
+    expect(await status(base, "kunde-a.test", "/edit", cookieA)).toBe(200);
+  });
+});
+
 describe("Sammelbetrieb — Zustand ohne Neustart", () => {
   test("disable bei A wirkt sofort und lässt B unberührt", async () => {
     const { base, siteA, cookieA, cookieB } = await bootMulti();
@@ -232,10 +278,25 @@ describe("Sammelbetrieb — Zustand ohne Neustart", () => {
     const { base, siteA, cookieA } = await bootMulti();
     expect(await status(base, "kunde-a.test", "/frisch.html/edit", cookieA)).toBe(404);
 
-    writeFileSync(join(siteA, "frisch.html"), "<html><body><p>frisch</p></body></html>");
-
-    expect(await status(base, "kunde-a.test", "/frisch.html", cookieA)).toBe(200);
+    /**
+     * GEÄNDERT MIT DEN DREI ZUSTÄNDEN. Vorher lag hier EIN Schreibvorgang in den
+     * Site-Ordner und die Erwartung „öffentlich UND bearbeitbar, beides sofort".
+     * Beides zugleich gibt es nicht mehr, und das ist der Sinn des Umbaus:
+     *
+     *   im ENTWURF angelegt   → sofort bearbeitbar, aber NICHT öffentlich
+     *   im SITE-Ordner        → sofort öffentlich (so schreibt Veröffentlichen)
+     *
+     * Der Test prüft weiterhin dasselbe wie zuvor — „ohne Neustart" —, jetzt
+     * aber für beide Sichten getrennt. Die erste Zeile ist zugleich die
+     * Zusicherung, dass ein Entwurf nicht heimlich öffentlich ist.
+     */
+    writeFileSync(join(entwurfPfad(siteA), "frisch.html"), "<html><body><p>frisch</p></body></html>");
     expect(await status(base, "kunde-a.test", "/frisch.html/edit", cookieA)).toBe(200);
+    expect(await status(base, "kunde-a.test", "/frisch.html")).toBe(404);
+
+    // Und was im Site-Ordner landet, ist ohne Neustart öffentlich.
+    writeFileSync(join(siteA, "frisch.html"), "<html><body><p>frisch</p></body></html>");
+    expect(await status(base, "kunde-a.test", "/frisch.html")).toBe(200);
   });
 
   test("eine neu angelegte Website ist ohne Neustart erreichbar", async () => {
@@ -245,6 +306,7 @@ describe("Sammelbetrieb — Zustand ohne Neustart", () => {
     const siteC = join(root, "kunde-c.test");
     cpSync(REAL_SITE, siteC, { recursive: true });
     writeFileSync(join(siteC, "index.html"), "<html><body><h1>SEITE C</h1></body></html>");
+    stelleEntwurfBereit(siteC);
 
     expect(await (await req(base, "kunde-c.test", "/")).text()).toContain("SEITE C");
     // Ohne init keine Auth-Datei → Editor fail-closed.
@@ -306,6 +368,8 @@ describe("Sammelbetrieb — kopiertes Sitzungs-Geheimnis", () => {
     cpSync(REAL_SITE, siteB, { recursive: true });
     writeFileSync(join(siteA, "index.html"), "<html><body><h1>SEITE A</h1></body></html>");
     writeFileSync(join(siteB, "index.html"), "<html><body><h1>SEITE B</h1></body></html>");
+    stelleEntwurfBereit(siteA);
+    stelleEntwurfBereit(siteB);
     await createAuthFile(siteA, [KENNUNG_PW_A]);
     await createAuthFile(siteB, [KENNUNG_PW_B]);
     return { root, siteA, siteB };

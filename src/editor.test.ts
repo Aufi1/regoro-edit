@@ -302,7 +302,15 @@ describe("git.ts — Versionierung gegen tmp-Repo", () => {
     expect(content).toContain("Original-Inhalt-XYZ");
   });
 
-  test("restoreVersion stellt alten Stand her UND erzeugt neuen Commit", () => {
+  test("restoreVersion stellt den GANZEN Baum her UND erzeugt neuen Commit", () => {
+    /**
+     * GEÄNDERT mit Contract C10 — und zwar mitsamt der Zusicherung, nicht nur
+     * der Stelligkeit. Diese Fassung übergab bis zuletzt einen Seitenpfad und
+     * behauptete damit „eine Seite zurück"; sie lief trotzdem durch, weil bun
+     * TypeScript ungeprüft ausführt und das dritte Argument still verschluckte.
+     * Sie prüfte also längst den ganzen Baum, unter falschem Namen. Genau
+     * deshalb steht `tsc` vor `bun test`.
+     */
     git.ensureRepo(repoRoot);
 
     writeFileSync(join(repoRoot, pagePath), "<html><body><p>STAND-A</p></body></html>");
@@ -310,16 +318,34 @@ describe("git.ts — Versionierung gegen tmp-Repo", () => {
     const commitA = git.listVersions(repoRoot, pagePath)[0]!.commit;
 
     writeFileSync(join(repoRoot, pagePath), "<html><body><p>STAND-B</p></body></html>");
-    git.commitEdit(repoRoot, pagePath, "Stand B");
-    const countBefore = git.listVersions(repoRoot, pagePath).length;
+    // Eine ZWEITE Seite, die es in Stand A noch gar nicht gab.
+    writeFileSync(join(repoRoot, "site", "spaeter.html"), "<html><body><p>SPÄTER</p></body></html>");
+    git.commitEdit(repoRoot, [pagePath, "site/spaeter.html"], "Stand B");
+    const countBefore = git.listVersions(repoRoot).length;
 
-    git.restoreVersion(repoRoot, commitA, pagePath);
+    git.restoreVersion(repoRoot, commitA);
 
-    // Datei trägt wieder Stand A
     expect(readFileSync(join(repoRoot, pagePath), "utf8")).toContain("STAND-A");
-    // und es gibt einen zusätzlichen (Restore-)Commit
-    const countAfter = git.listVersions(repoRoot, pagePath).length;
-    expect(countAfter).toBe(countBefore + 1);
+    // Der ganze Baum: die seither hinzugekommene Seite ist weg.
+    expect(existsSync(join(repoRoot, "site", "spaeter.html"))).toBe(false);
+    // Und ein zusätzlicher (Restore-)Commit obendrauf — ohne Pfad gezählt, denn
+    // eine Version gilt jetzt für die ganze Website.
+    expect(git.listVersions(repoRoot).length).toBe(countBefore + 1);
+  });
+
+  test("listVersions ohne Pfad zählt die ganze Website, mit Pfad nur diese Seite", () => {
+    // Contract C10. Die Unterscheidung ist nicht kosmetisch: Die Auswahlliste
+    // muss dieselbe Einheit zeigen wie der Knopf, der sie wiederherstellt.
+    git.ensureRepo(repoRoot);
+    writeFileSync(join(repoRoot, "site", "nur-hier.html"), "<html><body><p>X</p></body></html>");
+    git.commitEdit(repoRoot, "site/nur-hier.html", "Nur die neue Seite");
+
+    const ganzeWebsite = git.listVersions(repoRoot);
+    const nurIndex = git.listVersions(repoRoot, pagePath);
+
+    expect(ganzeWebsite.length).toBe(nurIndex.length + 1);
+    expect(ganzeWebsite[0]!.subject).toBe("Nur die neue Seite");
+    expect(nurIndex.map((v) => v.subject)).not.toContain("Nur die neue Seite");
   });
 });
 
@@ -346,9 +372,18 @@ describe("host.ts — handleEditorRequest Integration", () => {
   beforeEach(async () => {
     const fx = makeSiteRepoFixture(git);
     versand = (await import("./versand.ts")).attrappenVersand();
+    const { AUTH_DIR_NAME } = await import("./auth.ts");
     ctx = {
       repoRoot: fx.repoRoot,
+      // Seit „Eine Bearbeitung, zwei Modi" hat der Ctx drei Orte statt einem.
+      // Diese Vorrichtung stammt von davor: Sie legt Entwurf und Abzug auf
+      // denselben Ordner, damit die Zusicherungen dieses Blocks weiterhin das
+      // messen, wofür sie geschrieben wurden — den Router, nicht die Ablage.
+      entwurfDir: fx.siteDir,
+      schwebendDir: join(fx.siteDir, AUTH_DIR_NAME, "schwebend"),
       siteDir: fx.siteDir,
+      basis: "",
+      staging: false,
       pageWhitelist: PAGE_WHITELIST,
       auth: TEST_AUTH,
       versand,
@@ -444,6 +479,41 @@ describe("host.ts — handleEditorRequest Integration", () => {
     expect(body).toContain("data-edit-idx");
     expect(body).toContain("overlay.js");
     expect(body).toContain("window.__REGORO_EDIT__");
+  });
+
+  test("CFG.zustand steht auf JEDER Edit-Antwort — auch ohne Modellzugang", async () => {
+    /**
+     * Contract C3. Der Veröffentlichen-Knopf und der unveröffentlichte Stand
+     * hängen nicht am Modellzugang: Wer eine schwebende Änderung hat, während
+     * der Betreiber die KI abschaltet, muss sie noch übernehmen oder verwerfen
+     * können — sonst sperrt das Abschalten der KI den Kunden aus seinem eigenen
+     * Editor aus.
+     *
+     * Dieser Block fährt ohne `ctx.ki`, ist also GENAU der Fall „KI aus". Die
+     * `ki:false`-Zusicherung steht ausdrücklich daneben: Ohne sie wäre der Test
+     * auch dann grün, wenn hier zufällig doch ein Modellzugang gesetzt wäre —
+     * und dann prüfte er den Normalfall statt des Ausnahmefalls.
+     */
+    const cookie = await login();
+    const res = await call("GET", "/edit", { headers: { cookie } });
+    expect(res.status).toBe(200);
+
+    const { document } = parseHTML(await res.text());
+    const skript = [...document.querySelectorAll("script")].find((s) =>
+      (s.textContent ?? "").startsWith("window.__REGORO_EDIT__"),
+    );
+    expect(skript).toBeDefined();
+    const roh = (skript!.textContent ?? "").replace(/^window\.__REGORO_EDIT__ = /, "").replace(/;$/, "");
+    const cfg = JSON.parse(roh) as { ki: boolean; zustand: Record<string, unknown> | null; basis: string; staging: boolean };
+
+    expect(cfg.ki).toBe(false); // Voraussetzung: Modellzugang ist wirklich aus
+    expect(cfg.zustand).not.toBeNull();
+    // Die Felder, an denen die Leiste den Veröffentlichen-Knopf festmacht.
+    expect(cfg.zustand).toHaveProperty("schwebend");
+    expect(cfg.zustand).toHaveProperty("unveroeffentlicht");
+    expect(cfg.zustand).toHaveProperty("veroeffentlichenMoeglich");
+    expect(cfg.basis).toBe("");
+    expect(cfg.staging).toBe(false);
   });
 
   test("GET /edit OHNE Cookie → 302 auf Login mit return (M3: Edit-View leitet zum Login)", async () => {
@@ -564,7 +634,7 @@ describe("host.ts — handleEditorRequest Integration", () => {
     expect(skeleton(after)).toBe(before); // Struktur/Markup identisch
   });
 
-  test("POST /edit/save falscher fileHash → 409 hash-mismatch", async () => {
+  test("POST /edit/save falscher fileHash → 409 mit der Kennung `konflikt`", async () => {
     const cookie = await login();
     const res = await call("POST", "/edit/save", {
       headers: { cookie, "content-type": "application/json" },
@@ -575,8 +645,16 @@ describe("host.ts — handleEditorRequest Integration", () => {
       }),
     });
     expect(res.status).toBe(409);
-    const json = (await res.json()) as { error?: string };
-    expect(json.error).toBe("hash-mismatch");
+    // Fehlerform seit Contract C2: `fehler` für die Maschine, `grund` für den
+    // Kunden — beide. Der Hash-Konflikt hat eine EIGENE Kennung, weil derselbe
+    // Statuscode inzwischen zwei Bedeutungen trägt: Auch der Riegel gegen eine
+    // offene KI-Änderung antwortet 409. Ihn nur am FEHLEN von
+    // `schwebende-aenderung` zu erkennen, wäre ein Schluss aus einer
+    // Abwesenheit — und der misst nichts.
+    const json = (await res.json()) as { fehler?: string; grund?: string };
+    expect(json.fehler).toBe("konflikt");
+    expect(typeof json.grund).toBe("string");
+    expect(json.grund!.length).toBeGreaterThan(10); // ein Satz, keine Kennung
   });
 
   test("POST /edit/save ohne Auth → 404", async () => {
@@ -656,11 +734,28 @@ describe("host.ts — handleEditorRequest Integration", () => {
     for (const p of [
       "/edit/..%2f..%2fetc%2fpasswd",
       "/edit/version/HEAD?page=../../etc/passwd",
-      "/edit/versions?page=../../../etc/passwd",
     ]) {
       const res = await call("GET", p, { headers: { cookie } });
-      expect(res.status).toBe(404);
+      // Der Pfad steht in der Zusicherung: Ein blankes `toBe(404)` sagt bei
+      // mehreren Schleifendurchläufen nicht, WELCHER durchgerutscht ist.
+      expect(`${p} → ${res.status}`).toBe(`${p} → 404`);
     }
+  });
+
+  test("/edit/versions ignoriert `?page=` — und lässt sich damit nicht nach draußen lenken", async () => {
+    // Diese Route stand bis zum Umbau in der Traversal-Schleife darüber und gab
+    // 404. Seit eine Version für die GANZE Website gilt (Plan §1), wird `page`
+    // gar nicht mehr gelesen — der Browser schickt es nur noch mit. „200" allein
+    // wäre damit aber kein Nachweis: Geprüft wird, dass wirklich DIESELBE Liste
+    // herauskommt wie ohne Parameter, der Wert also nirgends einfließt.
+    const cookie = await login();
+    const ohne = await (await call("GET", "/edit/versions", { headers: { cookie } })).json();
+    const mit = await (
+      await call("GET", "/edit/versions?page=../../../etc/passwd", { headers: { cookie } })
+    ).json();
+
+    expect(mit).toEqual(ohne);
+    expect(JSON.stringify(mit)).not.toContain("passwd");
   });
 
   test("Seite, die nicht ^[a-z0-9-]+\\.html$ matcht → 404", async () => {
@@ -716,5 +811,205 @@ describe("auth.ts — hinterlegte Kennungen + signiertes Cookie", () => {
     expect(auth.checkCookie(TEST_AUTH, token + "x")).toBe(false);
     expect(auth.checkCookie(TEST_AUTH, "garbage")).toBe(false);
     expect(auth.checkCookie(TEST_AUTH, "")).toBe(false);
+  });
+});
+
+// ===========================================================================
+// Versionen gelten für die ganze Website, nicht je Seite (Plan §1)
+// ===========================================================================
+/**
+ * Der Plan hat es an einem Wegwerf-Repo nachgemessen (v1: `index.html`;
+ * v2: `index.html` geändert + `zusatz.js` neu):
+ *
+ *   git checkout <v1> -- index.html   → `zusatz.js` bleibt
+ *   git checkout <v1> -- .            → `zusatz.js` bleibt
+ *   git read-tree -um <v1>            → `zusatz.js` ist weg
+ *
+ * Das ist die zentrale Falle: Wer „Versionen für die ganze Website" mit
+ * `checkout` baut, hat das Loch weiterhin, nur weniger sichtbar. Deshalb steht
+ * hier neben der Zusicherung die MESSUNG selbst — der Nachweis, dass die
+ * Anordnung das Problem wirklich stellt. Ohne ihn wäre „zusatz.js ist weg" auch
+ * dann grün, wenn die Datei aus einem ganz anderen Grund nie angekommen wäre.
+ */
+describe("restoreVersion — hinzugefügte Dateien verschwinden wirklich", () => {
+  let gitMod: typeof import("./git.ts");
+
+  beforeAll(async () => {
+    gitMod = await import("./git.ts");
+  });
+
+  /**
+   * `restoreVersion` nimmt keinen Seitenpfad mehr entgegen — sie stellt den
+   * ganzen Baum her. Der Helfer bleibt trotzdem stehen: Er benennt, worum es
+   * geht, und hält die Tests darunter von der Signatur frei.
+   */
+  function stelleWiederHer(repoRoot: string, commit: string): void {
+    gitMod.restoreVersion(repoRoot, commit);
+  }
+
+  /** v1: nur `index.html`. v2: `index.html` geändert + `zusatz.js` neu. */
+  function zweiStaende(): { repoRoot: string; v1: string } {
+    const repoRoot = makeTmpDir("regoro-restore-");
+    writeFileSync(join(repoRoot, "index.html"), "<html><body><p>STAND-1</p></body></html>");
+    gitMod.ensureRepo(repoRoot);
+    const v1 = gitMod.listVersions(repoRoot, "index.html")[0]!.commit;
+
+    writeFileSync(join(repoRoot, "index.html"), "<html><body><p>STAND-2</p></body></html>");
+    writeFileSync(join(repoRoot, "zusatz.js"), "console.log('vom Agenten angelegt')");
+    gitMod.commitEdit(repoRoot, ["index.html", "zusatz.js"], "Lauf: Seite plus Skript");
+    return { repoRoot, v1 };
+  }
+
+  test("MESSUNG: der ganze Baum per checkout lässt die neue Datei stehen", () => {
+    // Der Messapparat selbst. Bliebe `zusatz.js` hier NICHT stehen, stellte die
+    // Anordnung das Problem gar nicht, und die Tests darunter bewiesen nichts.
+    const { repoRoot, v1 } = zweiStaende();
+    expect(existsSync(join(repoRoot, "zusatz.js"))).toBe(true);
+
+    gitMod.git(repoRoot, "checkout", v1, "--", ".");
+
+    expect(readFileSync(join(repoRoot, "index.html"), "utf8")).toContain("STAND-1");
+    expect(existsSync(join(repoRoot, "zusatz.js"))).toBe(true); // genau das Loch
+  });
+
+  test("MESSUNG: der einzelne Seitenpfad erst recht nicht", () => {
+    const { repoRoot, v1 } = zweiStaende();
+    gitMod.git(repoRoot, "checkout", v1, "--", "index.html");
+    expect(existsSync(join(repoRoot, "zusatz.js"))).toBe(true);
+  });
+
+  test("restoreVersion entfernt die hinzugefügte Datei", () => {
+    const { repoRoot, v1 } = zweiStaende();
+    expect(existsSync(join(repoRoot, "zusatz.js"))).toBe(true); // Messapparat
+
+    stelleWiederHer(repoRoot, v1);
+
+    expect(readFileSync(join(repoRoot, "index.html"), "utf8")).toContain("STAND-1");
+    expect(existsSync(join(repoRoot, "zusatz.js"))).toBe(false);
+  });
+
+  test("und zwar auch im Unterordner", () => {
+    const { repoRoot, v1 } = zweiStaende();
+    mkdirSync(join(repoRoot, "assets"), { recursive: true });
+    writeFileSync(join(repoRoot, "assets", "neu.css"), "p{}");
+    gitMod.commitEdit(repoRoot, ["assets/neu.css"], "noch eine Datei");
+
+    stelleWiederHer(repoRoot, v1);
+
+    expect(existsSync(join(repoRoot, "assets", "neu.css"))).toBe(false);
+  });
+
+  test("eine in der neuen Version GELÖSCHTE Datei kommt zurück", () => {
+    // Die andere Richtung derselben Aussage: der Baum wird hergestellt, nicht
+    // nur überschrieben.
+    const repoRoot = makeTmpDir("regoro-restore-");
+    writeFileSync(join(repoRoot, "index.html"), "<html><body><p>STAND-1</p></body></html>");
+    writeFileSync(join(repoRoot, "alt.html"), "<html><body><p>ALTE-SEITE</p></body></html>");
+    gitMod.ensureRepo(repoRoot);
+    const v1 = gitMod.listVersions(repoRoot, "index.html")[0]!.commit;
+
+    rmSync(join(repoRoot, "alt.html"));
+    gitMod.git(repoRoot, "add", "-A");
+    gitMod.git(repoRoot, "commit", "-m", "Seite entfernt");
+    expect(existsSync(join(repoRoot, "alt.html"))).toBe(false); // Messapparat
+
+    stelleWiederHer(repoRoot, v1);
+
+    expect(existsSync(join(repoRoot, "alt.html"))).toBe(true);
+    expect(readFileSync(join(repoRoot, "alt.html"), "utf8")).toContain("ALTE-SEITE");
+  });
+
+  test("die Historie wächst nur nach vorn: neuer Commit obendrauf, alte bleiben", () => {
+    const { repoRoot, v1 } = zweiStaende();
+    const vorher = gitMod.countCommits(repoRoot);
+    const kopfVorher = gitMod.git(repoRoot, "rev-parse", "HEAD").trim();
+
+    stelleWiederHer(repoRoot, v1);
+
+    expect(gitMod.countCommits(repoRoot)).toBe((vorher ?? 0) + 1);
+    const kopfNachher = gitMod.git(repoRoot, "rev-parse", "HEAD").trim();
+    expect(kopfNachher).not.toBe(kopfVorher);
+    expect(kopfNachher).not.toBe(v1); // NICHT auf die alte Version zurückgesetzt
+
+    // Beide alten Stände bleiben erreichbar — nichts wurde umgeschrieben.
+    const erreichbar = gitMod.git(repoRoot, "rev-list", "HEAD").trim().split("\n");
+    expect(erreichbar).toContain(v1);
+    expect(erreichbar).toContain(kopfVorher);
+  });
+
+  test("der wiederhergestellte Stand ist committet, nicht nur im Arbeitsbaum", () => {
+    /**
+     * Die Zusicherung lautet: **es entsteht eine Version.**
+     *
+     * Nicht (wie eine frühere Fassung dieser Begründung behauptete) „sonst
+     * bleibt der Baum schmutzig und das nächste Wiederherstellen ist blockiert"
+     * — das ist nachgemessen falsch (Contract C10, „Zwei GETRENNTE Fallen"):
+     * Nach einem Commit, der nichts committet, weicht der INDEX von HEAD ab,
+     * der Arbeitsbaum stimmt mit dem Index aber überein, und `read-tree` läuft
+     * durch. Der Schaden ist ein anderer und schlimm genug: Das
+     * Wiederherstellen hinterließe keine Spur in der Historie — bei einer
+     * Funktion, deren einziger Zweck das Sicherheitsnetz ist.
+     */
+    const { repoRoot, v1 } = zweiStaende();
+    const vorher = gitMod.listVersions(repoRoot).length;
+
+    stelleWiederHer(repoRoot, v1);
+
+    expect(gitMod.listVersions(repoRoot).length).toBe(vorher + 1);
+    expect(gitMod.listVersions(repoRoot)[0]!.subject).toContain("Wiederhergestellt");
+    expect(gitMod.git(repoRoot, "status", "--porcelain").trim()).toBe("");
+  });
+
+  test("ein SCHMUTZIGER Arbeitsbaum blockiert das Wiederherstellen nicht", () => {
+    /**
+     * Gemessen von Repo-Dev, im Plan nicht erwähnt (Contract C10):
+     * `git read-tree -um` bricht bei schmutzigem Arbeitsbaum hart ab
+     * („Entry 'index.html' not uptodate. Cannot merge.", rc=128). Eine einzige
+     * nicht committete Datei machte das Wiederherstellen damit **dauerhaft**
+     * unmöglich — das Sicherheitsnetz wäre tot, genau wenn man es braucht.
+     * Deshalb `--reset -u`.
+     *
+     * Und genau so tritt der Fall auf: Der Kunde tippt im Editor herum, klickt
+     * nicht auf Speichern und will dann „zurück auf gestern".
+     */
+    const { repoRoot, v1 } = zweiStaende();
+    writeFileSync(join(repoRoot, "index.html"), "<html><body><p>NICHT COMMITTET</p></body></html>");
+    // Messapparat: Der Baum ist wirklich schmutzig — sonst prüft der Test nichts.
+    expect(gitMod.git(repoRoot, "status", "--porcelain").trim()).not.toBe("");
+
+    expect(() => stelleWiederHer(repoRoot, v1)).not.toThrow();
+
+    expect(readFileSync(join(repoRoot, "index.html"), "utf8")).toContain("STAND-1");
+    expect(gitMod.git(repoRoot, "status", "--porcelain").trim()).toBe("");
+  });
+
+  test("Punkt-Segmente überleben — und die Gegenprobe, dass überhaupt geräumt wird", () => {
+    /**
+     * `git clean -fd -e '.*'` räumt auf, was `read-tree` nie anfasst:
+     * unversionierte Dateien. Das `-e '.*'` ist das EINZIGE, was `.regoro/`
+     * schützt — Repo-Dev hat nachgemessen, dass ein `clean -fd` ohne den Filter
+     * `.regoro/auth.json` wirklich löscht. Fällt er weg (oder wird jemand
+     * `-fdx` daraus), kostet ein Wiederherstellen dem Kunden Auth-Secret,
+     * Entwurfs-Repo und schwebende Änderung auf einmal — ein stiller
+     * Totalverlust, den kein Aufrufer abfangen kann.
+     *
+     * `.well-known/` steht als zweiter Fall daneben: ein Punkt-Ordner, der
+     * echter Website-Inhalt ist.
+     */
+    const { repoRoot, v1 } = zweiStaende();
+    mkdirSync(join(repoRoot, ".regoro"), { recursive: true });
+    writeFileSync(join(repoRoot, ".regoro", "auth.json"), '{"v":2,"secret":"GEHEIM"}');
+    mkdirSync(join(repoRoot, ".well-known"), { recursive: true });
+    writeFileSync(join(repoRoot, ".well-known", "security.txt"), "Contact: mailto:x@y");
+    writeFileSync(join(repoRoot, "streuner.js"), "nie committet");
+
+    stelleWiederHer(repoRoot, v1);
+
+    // Inhaltlich, nicht nur `existsSync`: eine leere Hülle wäre derselbe Verlust.
+    expect(readFileSync(join(repoRoot, ".regoro", "auth.json"), "utf8")).toContain("GEHEIM");
+    expect(readFileSync(join(repoRoot, ".well-known", "security.txt"), "utf8")).toContain("mailto");
+    // GEGENPROBE: Ohne sie wäre das oben auch grün, wenn `clean` nie liefe —
+    // und dann bliebe genau das Loch offen, das dieser Umbau schließen soll.
+    expect(existsSync(join(repoRoot, "streuner.js"))).toBe(false);
   });
 });

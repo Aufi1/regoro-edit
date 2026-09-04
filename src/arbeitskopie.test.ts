@@ -470,3 +470,113 @@ describe("die letzte Prüfung vor dem Schreiben (ersteKollision)", () => {
     expect(ersteKollision(feld(site, "index.html"), null)).toBe("fremd-geaendert:index.html");
   });
 });
+
+// ===========================================================================
+// Zwei Ablagen, zwei Haltbarkeiten (Contract C6)
+// ===========================================================================
+/**
+ * Die Arbeitskopie ist ein Wegwerfstück: Sie lebt unter `runtimeWurzel()` und
+ * verschwindet mit dem Lauf. Die schwebende Änderung ist das Gegenteil — sie
+ * gehört der WEBSITE, überlebt den Neustart und wartet auf die Entscheidung des
+ * Kunden (Plan §2). Beide zu verwechseln hieße, die offene Änderung beim
+ * nächsten Dienststart wegzuräumen; systemd leert `RuntimeDirectory=` selbst.
+ *
+ * Die sechs Funktionen aus C6 werden dynamisch geholt: Ein statischer Import
+ * ließe diese Datei mit allen ~45 bestehenden Tests beim Laden wegbrechen,
+ * solange sie fehlen.
+ */
+describe("die schwebende Änderung liegt anderswo als die Arbeitskopie", () => {
+  type SchwebendApi = {
+    schwebendPfad(siteDir: string): string;
+    schwebendVorhanden(siteDir: string): boolean;
+    schwebendDateien(siteDir: string): string[];
+    legeSchwebendAn(
+      siteDir: string,
+      dateien: Map<string, Buffer>,
+      basis: Map<string, string | null>,
+    ): void;
+  };
+  const api = async (): Promise<SchwebendApi> =>
+    (await import("./arbeitskopie.ts")) as unknown as SchwebendApi;
+
+  test("die eine unter der Runtime-Wurzel, die andere im Kundenordner", async () => {
+    const { schwebendPfad } = await api();
+    const wurzel = mitRuntimeWurzel();
+    const siteDir = makeSite();
+
+    expect(legeArbeitskopieAn(siteDir).startsWith(wurzel)).toBe(true);
+    expect(schwebendPfad(siteDir).startsWith(siteDir)).toBe(true);
+    expect(schwebendPfad(siteDir).startsWith(wurzel)).toBe(false);
+  });
+
+  test("raeumeVerwaisteAuf räumt die Arbeitskopie weg — die offene Änderung nicht", async () => {
+    const { legeSchwebendAn, schwebendDateien, schwebendVorhanden } = await api();
+    mitRuntimeWurzel();
+    const siteDir = makeSite();
+    const kopie = legeArbeitskopieAn(siteDir);
+    legeSchwebendAn(
+      siteDir,
+      new Map([["leistungen.html", Buffer.from("<p>Badsanierung</p>")]]),
+      // Bezugspunkt: Die Seite gibt es in dieser Website noch nicht (C6).
+      new Map([["leistungen.html", null]]),
+    );
+
+    raeumeVerwaisteAuf();
+
+    // Gegenprobe im selben Test: Der Aufräumer hat wirklich gearbeitet …
+    expect(existsSync(kopie)).toBe(false);
+    // … und die offene Änderung des Kunden trotzdem nicht angefasst.
+    expect(schwebendVorhanden(siteDir)).toBe(true);
+    expect(schwebendDateien(siteDir)).toEqual(["leistungen.html"]);
+  });
+
+  test("siteDateien ist die EINE Definition — Kopie und Entwurf sehen dasselbe", async () => {
+    /**
+     * Contract C6: `siteDateien()` war privat und ist jetzt exportiert, damit
+     * „welche Dateien gehören zur Website" genau eine Antwort hat. Drei Stellen
+     * fragen danach — die Arbeitskopie des Agenten, das Bestücken des Entwurfs
+     * und das Veröffentlichen. Sähe auch nur eine eine andere Menge, wäre der
+     * Schaden sofort da: Die erste Veröffentlichung sähe wie eine
+     * Massenänderung aus, oder eine Datei meldete sich als gelöscht und ließe
+     * den ganzen Lauf scheitern.
+     *
+     * Geprüft wird deshalb nicht die Funktion gegen eine erwartete Liste,
+     * sondern die drei Ergebnisse gegeneinander.
+     */
+    const { siteDateien } = await import("./arbeitskopie.ts");
+    const { entwurfPfad, stelleEntwurfBereit } = await import("./entwurf.ts");
+    mitRuntimeWurzel();
+    const siteDir = makeSite();
+
+    const erwartet = siteDateien(siteDir);
+    expect(erwartet).toContain("index.html");
+    // Der Ordner trägt `.regoro`, `.git`, `.pi` und `assets/.versteckt` —
+    // Messapparat dafür, dass hier überhaupt etwas auszuschließen war.
+    expect(erwartet.some((p) => p.split("/").some((s) => s.startsWith(".")))).toBe(false);
+
+    expect(alleDateien(legeArbeitskopieAn(siteDir))).toEqual(erwartet);
+
+    stelleEntwurfBereit(siteDir);
+    expect(siteDateien(entwurfPfad(siteDir))).toEqual(erwartet);
+  });
+
+  test("und die Arbeitskopie des nächsten Laufs enthält sie nicht", async () => {
+    // Sie liegt unter `.regoro/` und fällt damit unter die Punkt-Regel von
+    // `siteDateien`. Stünde sie in der Kopie, sähe der Agent seinen eigenen
+    // ungeprüften Zwischenstand als Bestand der Website an.
+    const { legeSchwebendAn } = await api();
+    mitRuntimeWurzel();
+    const siteDir = makeSite();
+    legeSchwebendAn(
+      siteDir,
+      new Map([["leistungen.html", Buffer.from("<p>Badsanierung</p>")]]),
+      // Bezugspunkt: Die Seite gibt es in dieser Website noch nicht (C6).
+      new Map([["leistungen.html", null]]),
+    );
+
+    const kopie = legeArbeitskopieAn(siteDir);
+
+    expect(alleDateien(kopie)).not.toContain("leistungen.html");
+    expect(alleDateien(kopie).filter((p) => p.includes("schwebend"))).toEqual([]);
+  });
+});

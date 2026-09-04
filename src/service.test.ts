@@ -20,6 +20,14 @@ import {
   CADDY_HOST_RE,
 } from "./service.ts";
 
+/**
+ * Die `@editor`-Zeile eines Blocks oder einer Vorlage — über den NAMEN des
+ * Matchers, nicht über seine Art. Sie steht an vier Stellen (Generator einzeln,
+ * Generator Sammelbetrieb, beide Vorlagen) und muss überall dieselbe sein.
+ */
+const EDITOR_RE = /^\s*@editor .*$/m;
+const editorZeile = (text: string): string => (text.match(EDITOR_RE)?.[0] ?? "").trim();
+
 const base = {
   siteDir: "/srv/sites/mueller",
   execPath: "/home/aufi/.local/bin/regoro",
@@ -218,9 +226,53 @@ describe("activationSteps", () => {
 // öffentliche Seiten wie `/edit-preise.html` ein.
 describe("Caddy-Matcher deckt alle Editor-Routen ab", () => {
   test("Suffix-Routen und Editor-Assets sind im Matcher", () => {
-    const c = caddyBlock(base);
-    expect(c).toContain("@editor path /edit /edit/* /edit-assets/* */edit");
-    expect(c).not.toContain("@editor path /edit*\n");
+    // Auf die FORMEN festgenagelt, nicht auf die ganze Zeile: Die Liste wächst
+    // (zuletzt `/edit-vorschau/*` für die Vorschau), und ein Exakt-Vergleich
+    // wird dann rot, ohne dass etwas kaputt ist. Was NICHT wachsen darf, steht
+    // in der letzten Zeile.
+    const zeile = editorZeile(caddyBlock(base));
+    for (const form of ["/edit", "/edit/*", "/edit-assets/*", "*/edit"]) {
+      expect(`${form}: ${zeile.split(" ").includes(form)}`).toBe(`${form}: true`);
+    }
+    // `/edit*` allein verfehlt die Suffix-Route und fängt `/edit-preise.html`.
+    expect(zeile.split(" ")).not.toContain("/edit*");
+  });
+
+  /**
+   * Und dieselbe Frage für die PREVIEW-Adressen (`/p/<slug>/…`) — die aber in
+   * einem EIGENEN Block wohnen, nicht im Produktionsblock.
+   *
+   * GEMESSEN mit caddy 2.11.4, weil die naheliegende Lösung nicht funktioniert:
+   * In einem `path`-Glob überspringt ein Stern KEINE Schrägstriche — außer in
+   * den drei Sonderformen, die caddy abkürzt (Stern vorn = Endet-auf, Stern
+   * hinten = Beginnt-mit, beides = Enthält). Das Präfix erzwingt einen zweiten
+   * Stern, und ab dem gilt Segment-Semantik. Deshalb der Regexp.
+   *
+   * Der heutige Produktions-Matcher trifft unter dem Präfix genau zwei von vier
+   * Formen, und die zufällig über die Endet-auf-Regel:
+   *
+   *   /p/kunde-a/edit                    trifft   (Endet-auf)
+   *   /p/kunde-a/impressum.html/edit     trifft   (Endet-auf)
+   *   /p/kunde-a/edit/agent/status       fällt durch  ← die halbe Seitenleiste
+   *   /p/kunde-a/edit-assets/overlay.js  fällt durch  ← das ganze Overlay
+   *
+   * Was zählt, ist die Aufteilung: Der PRODUKTIONSBLOCK darf die
+   * Preview-Adressen NICHT kennen (sein Prozess löst sie nicht auf — er würde
+   * eine zweite Adresse öffnen, die es nirgends gibt), der STAGING-BLOCK muss.
+   * Den Beweis auf der Leitung führt `csp.test.ts`.
+   */
+  test("der Staging-Block kennt die Preview-Adressen", () => {
+    expect(editorZeile(caddyBlock(baseStaging))).toContain("/p/");
+  });
+
+  test("GEGENPROBE: die Produktionsblöcke kennen sie NICHT", () => {
+    // Ein Produktionsprozess beantwortet `/p/<slug>/edit` mit 404 (siehe
+    // multisite.test.ts). Stünde die Form trotzdem im Proxy, ginge die Anfrage
+    // an den Bun-Host — und wer dort etwas ändert, hätte sofort zwei Adressen
+    // für dieselbe Website, eine davon ohne die Extension-Allowlist.
+    for (const [name, opts] of [["Einzelbetrieb", base], ["Sammelbetrieb", baseMulti]] as const) {
+      expect(`${name}: ${editorZeile(caddyBlock(opts)).includes("/p/")}`).toBe(`${name}: false`);
+    }
   });
 });
 
@@ -360,6 +412,22 @@ describe("die erzeugte Unit ist für systemd gültig", () => {
     expect(code).toBe(0);
   });
 
+  test.skipIf(!haveSystemdAnalyze())("Staging: keine fatale Konfiguration", () => {
+    /**
+     * Der dritte Dienst, und bisher prüfte ihn niemand. Genau so ist die
+     * `WorkingDirectory=`-Falle jahrelang unbemerkt geblieben: Ein
+     * Textvergleich winkt eine Unit durch, die nie startet. Hier steht deshalb
+     * dieselbe Prüfung wie für die anderen beiden — mit echtem systemd.
+     */
+    const wurzel = mkdtempSync(join(tmpdir(), "regoro-unitstaging-"));
+    const { code, ausgabe } = verify(
+      systemdUnit({ ...baseStaging, siteDir: wurzel, execPath: "/bin/true" }),
+    );
+    expect(ausgabe).not.toContain("fatal error");
+    expect(ausgabe).not.toContain("bad unit file setting");
+    expect(code).toBe(0);
+  });
+
   test.skipIf(!haveSystemdAnalyze())("GEGENPROBE: ein gequotetes WorkingDirectory würde auffallen", () => {
     // Ohne diese Zeile wüsste niemand, ob `verify` den Fehler überhaupt sieht —
     // ein Test, der nur „keine fatale Konfiguration" prüft, ist auch grün, wenn
@@ -407,6 +475,20 @@ const baseMulti = {
   multi: true,
 };
 
+/**
+ * Der Staging-Betrieb (`regoro serve --staging`): ein Hostname, viele Previews
+ * unter `/p/<slug>/`, KEINE Anmeldung. Eigener Block, eigener Matcher.
+ */
+const baseStaging = {
+  siteDir: "/srv/previews",
+  execPath: "/home/aufi/.local/bin/regoro",
+  slug: "previews",
+  port: 8790,
+  user: "www-data",
+  staging: true,
+  domain: "intern.example.com",
+};
+
 describe("systemdUnit --multi", () => {
   test("ExecStart ruft `serve` auf das Sammelverzeichnis", () => {
     const unit = systemdUnit(baseMulti);
@@ -419,6 +501,37 @@ describe("systemdUnit --multi", () => {
   test("ProtectHome-Regel gilt auch für das Sammelverzeichnis", () => {
     expect(systemdUnit({ ...baseMulti, siteDir: "/home/aufi/sites" })).not.toContain("ProtectHome=yes");
     expect(systemdUnit(baseMulti)).toContain("ProtectHome=yes");
+  });
+});
+
+describe("systemdUnit --staging", () => {
+  test("ExecStart ruft `serve --staging` — nicht `serve` und nicht `run`", () => {
+    /**
+     * DIE GEFÄHRLICHE VERWECHSLUNG GEHT IN BEIDE RICHTUNGEN, aber nur eine
+     * davon ist still: Fehlte `--staging`, liefe hinter der Preview-Adresse ein
+     * Produktionsprozess — die Previews wären schlicht 404, das fällt sofort
+     * auf. Stünde `--staging` umgekehrt in der Unit einer Kundendomain, stünde
+     * deren Editor OHNE ANMELDUNG offen, und niemandem fiele etwas auf.
+     *
+     * Deshalb wird hier nicht nur die Anwesenheit der Fahne geprüft, sondern
+     * auch, dass die beiden anderen Betriebsformen sie NICHT tragen.
+     */
+    const unit = systemdUnit(baseStaging);
+    expect(unit).toContain('ExecStart="/home/aufi/.local/bin/regoro" serve --staging "/srv/previews"');
+    expect(unit).toContain("WorkingDirectory=/srv/previews"); // ohne Quoting, siehe oben
+    expect(unit).toContain('ReadWritePaths="/srv/previews"');
+  });
+
+  test("GEGENPROBE: Einzel- und Sammelbetrieb tragen die Fahne NICHT", () => {
+    expect(systemdUnit(base)).not.toContain("--staging");
+    expect(systemdUnit(baseMulti)).not.toContain("--staging");
+  });
+
+  test("die Beschreibung sagt, dass hier keine Anmeldung nötig ist", () => {
+    // Ein Betreiber, der `systemctl status` liest, soll es dort sehen — das ist
+    // die Stelle, an der er es sieht, bevor er den Dienst vor eine Kundenseite
+    // hängt.
+    expect(systemdUnit(baseStaging)).toMatch(/Description=.*STAGING/);
   });
 });
 
@@ -488,7 +601,10 @@ describe("caddyBlock --multi", () => {
   });
 
   test("Editor-Matcher spiegelt weiterhin isEditorPath()", () => {
-    expect(block).toContain("path /edit /edit/* /edit-assets/* */edit");
+    const zeile = editorZeile(block);
+    for (const form of ["/edit", "/edit/*", "/edit-assets/*", "*/edit"]) {
+      expect(`${form}: ${zeile.split(" ").includes(form)}`).toBe(`${form}: true`);
+    }
     expect(block).toContain("reverse_proxy 127.0.0.1:8788");
   });
 
@@ -547,4 +663,63 @@ describe("Caddyfile-Vorlagen spiegeln den Generator", () => {
     expect(text).toContain(CADDY_HOST_RE);
     expect(text).toContain("on_demand_tls");
   });
+
+  /**
+   * Dieselbe Klammer wie für `@allowed`, jetzt für den Editor-Matcher — und aus
+   * demselben Grund: Der dokumentierte Weg ist „Block aus der Vorlage
+   * kopieren". Eine Vorlage, die die Preview-Adressen nicht kennt, liefert
+   * genau dort ein 404, wo der Interessent den Editor sehen soll — und niemand
+   * merkt es, weil der Generator es richtig macht.
+   *
+   * Absichtlich über den NAMEN des Matchers extrahiert und nicht über `path`:
+   * Ob die Umsetzung bei `path` bleibt oder auf `path_regexp` wechselt, ist
+   * ihre Sache. Verlangt wird, dass alle vier Stellen dasselbe sagen.
+   */
+  test("alle vier Stellen führen dieselbe @editor-Zeile", () => {
+    const erwartet = editorZeile(caddyBlock(base));
+    expect(erwartet).not.toBe("");
+    expect(editorZeile(caddyBlock(baseMulti))).toBe(erwartet);
+    for (const file of ["Caddyfile.example", "Caddyfile.multi.example"]) {
+      const text = readFileSync(join(import.meta.dir, "..", file), "utf8");
+      expect(`${file}: ${editorZeile(text)}`).toBe(`${file}: ${erwartet}`);
+    }
+  });
+
+  test("und die Staging-Vorlage spiegelt den Staging-Matcher", () => {
+    // Dieselbe Klammer wie oben, nur für die dritte Vorlage. Sie ist die
+    // gefährlichste von allen: Hinter dem Staging-Block steht ein Editor OHNE
+    // Anmeldung. Läuft sie dem Generator davon, merkt es niemand — bis eine
+    // Preview stumm kaputt ist oder etwas Falsches durchreicht.
+    const erwartet = editorZeile(caddyBlock(baseStaging));
+    expect(erwartet).not.toBe("");
+    const text = readFileSync(join(import.meta.dir, "..", "Caddyfile.staging.example"), "utf8");
+    expect(`Caddyfile.staging.example: ${editorZeile(text)}`).toBe(`Caddyfile.staging.example: ${erwartet}`);
+  });
+});
+
+// ===========================================================================
+// Ein übersprungener Test darf nicht wie ein bestandener aussehen
+// ===========================================================================
+describe("die Werkzeuge dieser Datei sind da", () => {
+  /**
+   * `test.skipIf` wertet beim EINSAMMELN aus, vor jedem `beforeAll`. In diesem
+   * Repo hat das schon vier Tests dauerhaft stillgelegt, die dabei grün
+   * meldeten — die teuerste Fehlerklasse, die CLAUDE.md kennt: ein Nachweis,
+   * der nicht anschlagen kann, beweist durch sein Ausbleiben nichts.
+   *
+   * Dieser Fall ist die Gegenmaßnahme und mit Absicht KEIN `skipIf`: Fehlt das
+   * Werkzeug, wird genau eine Zeile rot und nennt es beim Namen, statt dass
+   * eine Handvoll Prüfungen lautlos verschwindet. Wer hier bewusst ohne das
+   * Werkzeug arbeitet, sieht die eine rote Zeile und weiß, was ihm fehlt.
+   */
+  test("caddy ist installiert — sonst laufen die Prüfungen auf der Leitung ins Leere", () => {
+    expect(`caddy vorhanden: ${haveCaddy()}`).toBe("caddy vorhanden: true");
+  });
+
+  test("systemd-analyze ist installiert — sonst prüft die Unit niemand", () => {
+    expect(`systemd-analyze vorhanden: ${haveSystemdAnalyze()}`).toBe(
+      "systemd-analyze vorhanden: true",
+    );
+  });
+
 });

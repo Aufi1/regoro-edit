@@ -18,12 +18,16 @@ import {
   rmSync,
   mkdirSync,
   cpSync,
+  existsSync,
   readFileSync,
   readdirSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+import { entwurfPfad, stelleEntwurfBereit } from "./entwurf.ts";
+import { schwebendPfad } from "./arbeitskopie.ts";
 
 const TEST_SECRET = "testsecret-aaaaaaaaaaaaaaaaaaaaaaaa";
 const TEST_NUMMER = "+4915120464812";
@@ -97,12 +101,30 @@ describe("host.ts — Schreib-Routen-Auth, Traversal, commit-Guard, Header", () 
   });
 
   beforeEach(() => {
-    const repoRoot = makeTmpDir("regoro-sec-");
-    const siteDir = join(repoRoot, "site");
-    mkdirSync(siteDir, { recursive: true });
+    const siteDir = makeTmpDir("regoro-sec-");
     cpSync(REAL_SITE, siteDir, { recursive: true });
-    git.ensureRepo(repoRoot);
-    ctx = { repoRoot, siteDir, pageWhitelist: PAGE_WHITELIST, auth: TEST_AUTH };
+    /**
+     * KEIN `ensureRepo(siteDir)` mehr. Ein Repo IM Site-Ordner ist seit dem
+     * Umbau genau die Lage, die `istNichtMigriert()` als alte, nicht migrierte
+     * Installation erkennt — der Editor schaltet dann fail-closed ab und JEDE
+     * Route gibt 404. Eine Fixture, die das erzeugt, prüft einen Zustand, den
+     * der Produktivcode absichtlich verweigert.
+     *
+     * Die Historie wohnt im Entwurfs-Repo, sein Arbeitsbaum IST die Website —
+     * deshalb `repoRoot === entwurfDir` und `sitePrefix === ""` (C1).
+     */
+    stelleEntwurfBereit(siteDir);
+    ctx = {
+      repoRoot: entwurfPfad(siteDir),
+      entwurfDir: entwurfPfad(siteDir),
+      schwebendDir: schwebendPfad(siteDir),
+      siteDir,
+      basis: "",
+      staging: false,
+      sitePrefix: "",
+      pageWhitelist: PAGE_WHITELIST,
+      auth: TEST_AUTH,
+    };
   });
 
   function call(method: string, path: string, init?: RequestInit): Promise<Response> {
@@ -125,7 +147,7 @@ describe("host.ts — Schreib-Routen-Auth, Traversal, commit-Guard, Header", () 
   test("POST /edit/restore OHNE Auth → 404", async () => {
     const res = await call("POST", "/edit/restore", {
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ commit: "HEAD", pagePath: "site/index.html" }),
+      body: JSON.stringify({ commit: "HEAD", pagePath: "index.html" }),
     });
     expect(res.status).toBe(404);
   });
@@ -166,14 +188,14 @@ describe("host.ts — Schreib-Routen-Auth, Traversal, commit-Guard, Header", () 
     const cookie = authCookie();
     const res = await call("POST", "/edit/save", {
       headers: { cookie, "content-type": "application/json" },
-      body: JSON.stringify({ pagePath: "site/geheim.html", fileHash: "x", edits: [] }),
+      body: JSON.stringify({ pagePath: "geheim.html", fileHash: "x", edits: [] }),
     });
     expect(res.status).toBe(404);
   });
 
   test("POST /edit/save mit pagePath, der nicht Regex matcht → 404", async () => {
     const cookie = authCookie();
-    for (const bad of ["site/Index.html", "site/foo.php", "site/INDEX.HTML"]) {
+    for (const bad of ["Index.html", "foo.php", "INDEX.HTML"]) {
       const res = await call("POST", "/edit/save", {
         headers: { cookie, "content-type": "application/json" },
         body: JSON.stringify({ pagePath: bad, fileHash: "x", edits: [] }),
@@ -182,16 +204,32 @@ describe("host.ts — Schreib-Routen-Auth, Traversal, commit-Guard, Header", () 
     }
   });
 
-  // --- pagePath-Traversal auf der restore-Route ---
-  test("POST /edit/restore mit pagePath-Traversal → 404", async () => {
+  // --- die restore-Route nimmt gar keinen Pfad mehr entgegen ---
+  test("POST /edit/restore ignoriert einen mitgeschickten pagePath vollständig", async () => {
+    /**
+     * HIER STAND EIN TEST, DER NICHTS MEHR MASS. Er schickte
+     * `{commit: "HEAD", pagePath: "site/../etc/passwd"}` und erwartete 404 —
+     * bekam ihn aber wegen `"HEAD"`, das die Commit-Regex nicht besteht. Der
+     * Pfad wurde nie angesehen; die Zusicherung war seit dem Umbau leer.
+     *
+     * Wiederherstellen gilt jetzt für die GANZE Website, es gibt also keinen
+     * Pfad mehr zu prüfen. Die Zusicherung ist deshalb eine andere: Ein
+     * mitgeschicktes Feld darf weder wirken noch stören — und zwar mit
+     * GÜLTIGEM Commit, sonst misst der Fall wieder nur die Commit-Regex.
+     */
     const cookie = authCookie();
-    for (const bad of ["site/../etc/passwd", "/etc/passwd", "site/geheim.html"]) {
+    const commit = git.listVersions(ctx.repoRoot)[0]!.commit;
+    const draussen = join(ctx.siteDir, "..", "beute.txt");
+
+    for (const bad of ["../beute.txt", "/etc/passwd", "geheim.html", "site/../etc/passwd"]) {
       const res = await call("POST", "/edit/restore", {
         headers: { cookie, "content-type": "application/json" },
-        body: JSON.stringify({ commit: "HEAD", pagePath: bad }),
+        body: JSON.stringify({ commit, pagePath: bad }),
       });
-      expect(res.status).toBe(404);
+      // Kein 404 und kein 400: Die Wiederherstellung läuft, das Feld ist egal.
+      expect(`${bad} → ${res.status}`).toBe(`${bad} → 200`);
     }
+    expect(existsSync(draussen)).toBe(false);
   });
 
   // --- commit-Injection-Guard (restore + version) ---
@@ -200,7 +238,7 @@ describe("host.ts — Schreib-Routen-Auth, Traversal, commit-Guard, Header", () 
     for (const bad of ["HEAD; rm -rf /", "../../evil", "a b", "with/slash", "$(whoami)"]) {
       const res = await call("POST", "/edit/restore", {
         headers: { cookie, "content-type": "application/json" },
-        body: JSON.stringify({ commit: bad, pagePath: "site/index.html" }),
+        body: JSON.stringify({ commit: bad, pagePath: "index.html" }),
       });
       expect(res.status).toBe(404);
     }
@@ -217,7 +255,7 @@ describe("host.ts — Schreib-Routen-Auth, Traversal, commit-Guard, Header", () 
   // --- noindex/no-store auf ALLEN Routen, inkl. schreibend, JSON, 404 ---
   test("noindex + no-store auf save (409), restore, version, und 404-Antworten", async () => {
     const cookie = authCookie();
-    const pagePath = "site/index.html";
+    const pagePath = "index.html";
     const filePath = join(ctx.repoRoot, pagePath);
     const fileHash = apply.fileSha256(readFileSync(filePath, "utf8"));
 
@@ -280,7 +318,7 @@ describe("host.ts — Schreib-Routen-Auth, Traversal, commit-Guard, Header", () 
     for (const bad of BAD_COMMITS) {
       const res = await call("POST", "/edit/restore", {
         headers: { cookie, "content-type": "application/json" },
-        body: JSON.stringify({ commit: bad, pagePath: "site/index.html" }),
+        body: JSON.stringify({ commit: bad, pagePath: "index.html" }),
       });
       expect(res.status).toBe(404);
     }
@@ -298,7 +336,7 @@ describe("host.ts — Schreib-Routen-Auth, Traversal, commit-Guard, Header", () 
 
   test("Gültiger 7–40-Hex-Hash aus listVersions funktioniert weiterhin (200)", async () => {
     const cookie = authCookie();
-    const pagePath = "site/index.html";
+    const pagePath = "index.html";
     const versions = git.listVersions(ctx.repoRoot, pagePath);
     const commit = versions[0]!.commit;
     // Vorbedingung: echter Hash matcht die neue Regex.
@@ -318,7 +356,7 @@ describe("host.ts — Schreib-Routen-Auth, Traversal, commit-Guard, Header", () 
 
   test("abgekürzter (7-stelliger) gültiger Hash wird akzeptiert", async () => {
     const cookie = authCookie();
-    const full = git.listVersions(ctx.repoRoot, "site/index.html")[0]!.commit;
+    const full = git.listVersions(ctx.repoRoot, "index.html")[0]!.commit;
     const short = full.slice(0, 7);
     expect(short).toMatch(/^[0-9a-f]{7}$/);
     const res = await call("GET", `/edit/version/${short}?page=index.html`, { headers: { cookie } });
@@ -348,18 +386,30 @@ describe("host.ts — Schreib-Routen-Auth, Traversal, commit-Guard, Header", () 
     pagePath: string,
     fileHash: string,
     edits: { idx: number; text: string }[],
-  ): Promise<{ status: number; json: { ok?: boolean; fileHash?: string; error?: string } }> {
+  ): Promise<{
+    status: number;
+    json: { ok?: boolean; fileHash?: string; error?: string; fehler?: string; grund?: string };
+  }> {
     const res = await call("POST", "/edit/save", {
       headers: { cookie, "content-type": "application/json" },
       body: JSON.stringify({ pagePath, fileHash, edits }),
     });
-    return { status: res.status, json: (await res.json()) as { ok?: boolean; fileHash?: string; error?: string } };
+    return {
+      status: res.status,
+      json: (await res.json()) as {
+        ok?: boolean;
+        fileHash?: string;
+        error?: string;
+        fehler?: string;
+        grund?: string;
+      },
+    };
   }
 
   // 1. fileHash-Roundtrip same-session: zurückgegebener Hash passt für den nächsten Save.
   test("fileHash-Roundtrip: zweiter Save mit dem zurückgegebenen Hash → 200 (nicht 409)", async () => {
     const cookie = authCookie();
-    const pagePath = "site/index.html";
+    const pagePath = "index.html";
     const filePath = join(ctx.repoRoot, pagePath);
 
     const h0 = apply.fileSha256(readFileSync(filePath, "utf8"));
@@ -379,7 +429,7 @@ describe("host.ts — Schreib-Routen-Auth, Traversal, commit-Guard, Header", () 
   // 2. Struktur-Invarianz: nur Textinhalt ändert sich, Tag-/Attribut-Skeleton bleibt.
   test("Struktur-Invarianz: Save ändert nur Text, Tag-/Attribut-Skeleton identisch", async () => {
     const cookie = authCookie();
-    const pagePath = "site/index.html";
+    const pagePath = "index.html";
     const filePath = join(ctx.repoRoot, pagePath);
 
     const before = readFileSync(filePath, "utf8");
@@ -397,9 +447,9 @@ describe("host.ts — Schreib-Routen-Auth, Traversal, commit-Guard, Header", () 
   });
 
   // 3. Restore-Roundtrip auf HTTP-Ebene: nach 2 Saves → restore auf Baseline.
-  test("Restore-Roundtrip: HTTP-restore stellt Baseline her + neuer Restore-Commit", async () => {
+  test("Restore-Roundtrip: der GANZE Baum geht zurück, eine neue Datei verschwindet dabei", async () => {
     const cookie = authCookie();
-    const pagePath = "site/index.html";
+    const pagePath = "index.html";
     const filePath = join(ctx.repoRoot, pagePath);
 
     // Baseline-Commit (ältester) + sein Original-Inhalt.
@@ -414,6 +464,13 @@ describe("host.ts — Schreib-Routen-Auth, Traversal, commit-Guard, Header", () 
     await saveOnce(cookie, pagePath, h, [{ idx: 0, text: "Stand 2" }]);
     expect(readFileSync(filePath, "utf8")).toContain("Stand 2");
 
+    // Eine Datei, die es zur Baseline noch NICHT gab — so legt ein KI-Lauf eine
+    // neue Seite an. Sie darf die Wiederherstellung nicht überleben.
+    const zusatz = join(ctx.repoRoot, "zusatz.js");
+    writeFileSync(zusatz, "console.log('neu')");
+    git.commitEdit(ctx.repoRoot, "zusatz.js", "Datei angelegt");
+    expect(existsSync(zusatz)).toBe(true);
+
     const countBeforeRestore = git.listVersions(ctx.repoRoot, pagePath).length;
 
     // HTTP-Restore auf Baseline.
@@ -427,6 +484,38 @@ describe("host.ts — Schreib-Routen-Auth, Traversal, commit-Guard, Header", () 
     // Datei == Baseline-Inhalt; ein zusätzlicher Restore-Commit existiert.
     expect(readFileSync(filePath, "utf8")).toBe(baselineContent);
     expect(git.listVersions(ctx.repoRoot, pagePath).length).toBe(countBeforeRestore + 1);
+
+    /**
+     * UND DAS IST DER PUNKT DES UMBAUS: Die hinzugekommene Datei ist WEG.
+     *
+     * Früher nahm das Wiederherstellen einen Pfad und stellte genau den her.
+     * Gemessen entfernt das eine seither angelegte Datei NICHT — auch nicht
+     * über den ganzen Baum. Ein KI-Lauf, der Dateien anlegt, ließ sich damit
+     * nicht zurücknehmen, und bei einem Service Worker überlebt die
+     * Registrierung im Browser die Wiederherstellung sogar.
+     *
+     * Die Zusicherung steht ausdrücklich hier und nicht nur im Namen des Tests:
+     * Wer wieder auf einen pfadweisen Checkout umstellt, wird an dieser Zeile rot.
+     */
+    expect(existsSync(zusatz)).toBe(false);
+  });
+
+  test("Save mit falschem fileHash: 409 mit der Kennung `konflikt`", async () => {
+    /**
+     * Das Optimistic Locking ist der Schutz davor, dass zwei Geräte einander
+     * überschreiben. Seit C2 trägt auch dieser Fall die gemeinsame Fehlerform
+     * `{"fehler":"<kennung>","grund":"<Satz>"}` — die Kennung ist das, was die
+     * Oberfläche auswertet (sie bietet ein Neuladen an), der Satz das, was der
+     * Kunde liest. Ein nacktes 409 ohne Kennung zwänge den Client, auf den
+     * deutschen Wortlaut zu prüfen.
+     */
+    const cookie = authCookie();
+    const res = await saveOnce(cookie, "index.html", "nicht-der-echte-hash", [
+      { idx: 0, text: "egal" },
+    ]);
+    expect(res.status).toBe(409);
+    expect(res.json.fehler).toBe("konflikt");
+    expect(typeof res.json.grund).toBe("string");
   });
 
   // 4. Header auf 404-Antworten: notFound() trägt X-Robots-Tag + no-store.
@@ -496,12 +585,30 @@ describe("host.ts — statisches Asset-Serving (Task 7)", () => {
   });
 
   beforeEach(() => {
-    const repoRoot = makeTmpDir("regoro-asset-");
-    const siteDir = join(repoRoot, "site");
-    mkdirSync(siteDir, { recursive: true });
+    const siteDir = makeTmpDir("regoro-asset-");
     cpSync(REAL_SITE, siteDir, { recursive: true });
-    git.ensureRepo(repoRoot);
-    ctx = { repoRoot, siteDir, pageWhitelist: PAGE_WHITELIST, auth: TEST_AUTH };
+    /**
+     * KEIN `ensureRepo(siteDir)` mehr. Ein Repo IM Site-Ordner ist seit dem
+     * Umbau genau die Lage, die `istNichtMigriert()` als alte, nicht migrierte
+     * Installation erkennt — der Editor schaltet dann fail-closed ab und JEDE
+     * Route gibt 404. Eine Fixture, die das erzeugt, prüft einen Zustand, den
+     * der Produktivcode absichtlich verweigert.
+     *
+     * Die Historie wohnt im Entwurfs-Repo, sein Arbeitsbaum IST die Website —
+     * deshalb `repoRoot === entwurfDir` und `sitePrefix === ""` (C1).
+     */
+    stelleEntwurfBereit(siteDir);
+    ctx = {
+      repoRoot: entwurfPfad(siteDir),
+      entwurfDir: entwurfPfad(siteDir),
+      schwebendDir: schwebendPfad(siteDir),
+      siteDir,
+      basis: "",
+      staging: false,
+      sitePrefix: "",
+      pageWhitelist: PAGE_WHITELIST,
+      auth: TEST_AUTH,
+    };
   });
 
   function call(method: string, path: string): Promise<Response> {
@@ -600,12 +707,30 @@ describe("host.ts — /edit/agent* ist eine API-Route, keine View-Route", () => 
   });
 
   beforeEach(() => {
-    const repoRoot = makeTmpDir("regoro-agentsec-");
-    const siteDir = join(repoRoot, "site");
-    mkdirSync(siteDir, { recursive: true });
+    const siteDir = makeTmpDir("regoro-agentsec-");
     cpSync(REAL_SITE, siteDir, { recursive: true });
-    git.ensureRepo(repoRoot);
-    ctx = { repoRoot, siteDir, pageWhitelist: PAGE_WHITELIST, auth: TEST_AUTH };
+    /**
+     * KEIN `ensureRepo(siteDir)` mehr. Ein Repo IM Site-Ordner ist seit dem
+     * Umbau genau die Lage, die `istNichtMigriert()` als alte, nicht migrierte
+     * Installation erkennt — der Editor schaltet dann fail-closed ab und JEDE
+     * Route gibt 404. Eine Fixture, die das erzeugt, prüft einen Zustand, den
+     * der Produktivcode absichtlich verweigert.
+     *
+     * Die Historie wohnt im Entwurfs-Repo, sein Arbeitsbaum IST die Website —
+     * deshalb `repoRoot === entwurfDir` und `sitePrefix === ""` (C1).
+     */
+    stelleEntwurfBereit(siteDir);
+    ctx = {
+      repoRoot: entwurfPfad(siteDir),
+      entwurfDir: entwurfPfad(siteDir),
+      schwebendDir: schwebendPfad(siteDir),
+      siteDir,
+      basis: "",
+      staging: false,
+      sitePrefix: "",
+      pageWhitelist: PAGE_WHITELIST,
+      auth: TEST_AUTH,
+    };
   });
 
   function call(method: string, path: string): Promise<Response> {
@@ -658,4 +783,251 @@ afterAll(() => {
       /* best effort */
     }
   }
+});
+
+// ===========================================================================
+// Die zwei NEUEN Ablageorte im Kundenordner — beide unerreichbar (Invariante 3)
+// ===========================================================================
+describe("host.ts — Entwurfs-Repo und schwebende Änderung sind nicht auslieferbar", () => {
+  /**
+   * WAS HIER AUF DEM SPIEL STEHT.
+   *
+   * Mit dem Umbau liegen zwei neue Dinge im Kundenordner:
+   *   `.regoro/entwurf/`   — ein vollständiges Repo, sein Arbeitsbaum IST die
+   *                          ganze Website, einschließlich alles noch nicht
+   *                          Veröffentlichten und der kompletten Historie.
+   *   `.regoro/schwebend/` — das geprüfte Ergebnis eines KI-Laufs, das der
+   *                          Kunde noch nicht angesehen hat.
+   *
+   * Ein Entwurfs-Repo, das sich ausliefern lässt, gibt die unveröffentlichte
+   * Website heraus — und über `.git/` sogar jeden früheren Stand. Das ist
+   * schlimmer als jedes Build-Artefakt, gegen das Invariante 3 ursprünglich
+   * geschrieben wurde.
+   *
+   * Zwei Schranken tragen das, und der Test prüft beide getrennt:
+   *   1. der Dotfile-Block (jedes Pfad-Segment mit führendem Punkt → 404),
+   *   2. die Extension-Allowlist (alles ohne bekannte Endung → 404).
+   * Die erste ist die entscheidende: Im Entwurf liegen `.css`, `.js` und
+   * `.png` — lauter ERLAUBTE Endungen. Fiele der Dotfile-Block weg, käme der
+   * halbe Entwurf durch die Allowlist spazieren.
+   */
+  let host: typeof import("./host.ts");
+  let auth: typeof import("./auth.ts");
+  let ctx: import("./host.ts").HostCtx;
+  let siteDir: string;
+
+  const PAGE_WHITELIST = ["index.html", "impressum.html", "datenschutz.html", "agb.html"];
+
+  beforeAll(async () => {
+    host = await import("./host.ts");
+    auth = await import("./auth.ts");
+  });
+
+  beforeEach(() => {
+    siteDir = makeTmpDir("regoro-entwurf-sec-");
+    cpSync(REAL_SITE, siteDir, { recursive: true });
+    stelleEntwurfBereit(siteDir);
+    // Eine schwebende Änderung, wie sie nach einem KI-Lauf liegen bleibt.
+    mkdirSync(join(schwebendPfad(siteDir), "assets"), { recursive: true });
+    writeFileSync(join(schwebendPfad(siteDir), "index.html"), "<html><body>SCHWEBEND</body></html>");
+    writeFileSync(join(schwebendPfad(siteDir), "assets", "neu.png"), "PNGDATEN");
+    // Und ein unveröffentlichter Stand im Entwurf — einmal als Seite, einmal
+    // als Asset (nur Letzteres liefert die Vorschau-Route aus).
+    writeFileSync(join(entwurfPfad(siteDir), "index.html"), "<html><body>UNVEROEFFENTLICHT</body></html>");
+    writeFileSync(join(entwurfPfad(siteDir), "styles.css"), "/* ENTWURFS-CSS */");
+    // Die Auth-Datei liegt real daneben — der älteste Fall dieser Sorte, und
+    // der einzige, dessen Inhalt eine Sitzung fälschen ließe.
+    writeFileSync(join(siteDir, ".regoro", "auth.json"), JSON.stringify({ v: 2, ...TEST_AUTH }));
+    ctx = {
+      repoRoot: entwurfPfad(siteDir),
+      entwurfDir: entwurfPfad(siteDir),
+      schwebendDir: schwebendPfad(siteDir),
+      siteDir,
+      basis: "",
+      staging: false,
+      sitePrefix: "",
+      pageWhitelist: PAGE_WHITELIST,
+      auth: TEST_AUTH,
+    };
+  });
+
+  function call(path: string, cookie?: string): Promise<Response> {
+    const url = new URL("http://localhost:8788" + path);
+    const kopf: Record<string, string> = {};
+    if (cookie) kopf.cookie = cookie;
+    return Promise.resolve(host.handleEditorRequest(new Request(url, { headers: kopf }), url, ctx));
+  }
+
+  test("GEGENPROBE ZUERST: die Dateien liegen wirklich da", () => {
+    /**
+     * Ohne diesen Fall prüfte alles Folgende nur, dass ein nicht existierender
+     * Pfad 404 gibt — die Falle, die CLAUDE.md als abschreckendes Beispiel
+     * führt. Und die zweite Hälfte ist genauso nötig: Der Ausliefer-Weg muss
+     * überhaupt funktionieren, sonst ist jede 404 unten trivial.
+     */
+    for (const rel of [
+      ".regoro/entwurf/index.html",
+      ".regoro/entwurf/styles.css",
+      ".regoro/entwurf/.git/config",
+      ".regoro/schwebend/index.html",
+      ".regoro/schwebend/assets/neu.png",
+      ".regoro/auth.json",
+    ]) {
+      expect(`${rel}: ${existsSync(join(siteDir, rel))}`).toBe(`${rel}: true`);
+    }
+  });
+
+  test("GEGENPROBE: dieselbe Sorte Datei wird aus dem Site-Ordner sehr wohl ausgeliefert", async () => {
+    // Damit steht fest, dass die 404 unten am ORT liegen und nicht daran, dass
+    // dieser Server gerade gar nichts ausliefert.
+    expect((await call("/styles.css")).status).toBe(200);
+    expect((await call("/index.html")).status).toBe(200);
+  });
+
+  test("der Entwurf ist über HTTP nicht erreichbar — in keiner Tiefe", async () => {
+    for (const pfad of [
+      "/.regoro/entwurf/index.html",
+      "/.regoro/entwurf/styles.css",
+      "/.regoro/entwurf/assets/hero.png",
+      "/.regoro/entwurf/.git/config",
+      "/.regoro/entwurf/.git/HEAD",
+      "/.regoro/entwurf/",
+      "/.regoro/",
+      "/.regoro/auth.json",
+    ]) {
+      const res = await call(pfad);
+      expect(`${pfad} → ${res.status}`).toBe(`${pfad} → 404`);
+      expect(await res.text()).not.toContain("UNVEROEFFENTLICHT");
+    }
+  });
+
+  test("die schwebende Änderung ebenso wenig", async () => {
+    for (const pfad of [
+      "/.regoro/schwebend/index.html",
+      "/.regoro/schwebend/assets/neu.png",
+      "/.regoro/schwebend/",
+    ]) {
+      const res = await call(pfad);
+      expect(`${pfad} → ${res.status}`).toBe(`${pfad} → 404`);
+      expect(await res.text()).not.toContain("SCHWEBEND");
+    }
+  });
+
+  test("auch nicht prozentkodiert und auch nicht angemeldet", async () => {
+    // Der Block arbeitet auf dem DEKODIERTEN Pfad. Ein `%2e` als führendes
+    // Zeichen wäre sonst der ganze Umweg — und ein gültiges Cookie ändert an
+    // der Sache nichts: Diese Pfade gehören zu keiner Rolle.
+    const cookie = auth.issueCookie(TEST_AUTH).split(";")[0]!;
+    for (const pfad of [
+      "/%2eregoro/entwurf/index.html",
+      "/%2Eregoro/schwebend/index.html",
+      "/.regoro%2fentwurf/index.html",
+      "/assets/../.regoro/entwurf/index.html",
+    ]) {
+      expect(`${pfad} → ${(await call(pfad)).status}`).toBe(`${pfad} → 404`);
+      expect(`${pfad} (angemeldet) → ${(await call(pfad, cookie)).status}`).toBe(`${pfad} (angemeldet) → 404`);
+    }
+  });
+
+  test("die erlaubte Endung rettet den Entwurf NICHT — der Dotfile-Block sitzt davor", async () => {
+    /**
+     * Die schärfste Form: `.regoro/entwurf/styles.css` trägt eine Endung, die
+     * `ASSET_TYPES` ausdrücklich erlaubt. Nur der Dotfile-Block hält sie auf.
+     * Wer ihn für redundant hält („die Allowlist reicht doch"), macht mit
+     * diesem einen Handgriff die gesamte unveröffentlichte Website öffentlich.
+     */
+    expect((await call("/.regoro/entwurf/styles.css")).status).toBe(404);
+    expect((await call("/.regoro/schwebend/assets/neu.png")).status).toBe(404);
+    // Gegenprobe: Dieselbe Endung, außerhalb von `.regoro/`, wird geliefert.
+    expect((await call("/styles.css")).status).toBe(200);
+    expect((await call(`/assets/${readdirSync(join(siteDir, "assets"))[0]}`)).status).toBe(200);
+  });
+
+  // -------------------------------------------------------------------------
+  // Die Entwurfs-Sicht `/edit-vorschau/<pfad>` (C11) ist AUTH-BEWACHT
+  // -------------------------------------------------------------------------
+  test("unangemeldet gibt es die Entwurfs-Sicht nicht — sie ist die unveröffentlichte Website", async () => {
+    /**
+     * `/edit-vorschau/` liefert Dateien aus dem ENTWURF (und aus einer
+     * schwebenden Änderung, falls eine daliegt). Das ist genau der Stand, den
+     * der Kunde noch nicht veröffentlicht hat — Preise, die noch nicht gelten,
+     * Texte, die noch nicht abgestimmt sind. Ohne Auth-Wand wäre dieser Pfad
+     * die bequemste Art, das alles abzuholen.
+     */
+    for (const pfad of ["/edit-vorschau/styles.css", "/edit-vorschau/assets/neu.png"]) {
+      const res = await call(pfad);
+      expect(`${pfad} → ${res.status}`).toBe(`${pfad} → 404`);
+      expect(await res.text()).not.toContain("ENTWURFS-CSS");
+    }
+  });
+
+  test("GEGENPROBE: angemeldet liefert sie den ENTWURF, nicht den Site-Ordner", async () => {
+    /**
+     * Ohne diese Hälfte wäre der Fall darüber auch grün, wenn es die Route gar
+     * nicht gäbe — und niemand merkte, dass die Vorschau nie funktioniert hat.
+     * Zugleich der Nachweis, dass sie wirklich aus dem ENTWURF liest: Dieselbe
+     * Adresse trägt im Site-Ordner etwas anderes.
+     *
+     * `.html` ist hier mit Absicht NICHT abgedeckt: Seiten laufen über die
+     * Edit-Ansicht, die Vorschau-Route führt nur die Asset-Allowlist. Ein Test
+     * mit `index.html` prüfte deshalb nicht die Auth-Wand, sondern die
+     * Allowlist — und wäre aus dem falschen Grund grün.
+     */
+    const cookie = auth.issueCookie(TEST_AUTH).split(";")[0]!;
+    const res = await call("/edit-vorschau/styles.css", cookie);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("ENTWURFS-CSS");
+    // Dieselbe Datei öffentlich: der veröffentlichte Stand, nicht der Entwurf.
+    const oeffentlich = await call("/styles.css");
+    expect(oeffentlich.status).toBe(200);
+    expect(await oeffentlich.text()).not.toContain("ENTWURFS-CSS");
+  });
+
+  test("eine schwebende Änderung geht dem Entwurf vor", async () => {
+    // Sonst zeigte die Vorschau den Stand VOR dem KI-Lauf — also genau nicht
+    // das, was der Kunde begutachten soll, bevor er übernimmt.
+    const cookie = auth.issueCookie(TEST_AUTH).split(";")[0]!;
+    writeFileSync(join(schwebendPfad(siteDir), "styles.css"), "/* SCHWEBENDES-CSS */");
+    const res = await call("/edit-vorschau/styles.css", cookie);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("SCHWEBENDES-CSS");
+  });
+
+  test("und sie führt nicht aus dem Entwurf hinaus", async () => {
+    /**
+     * Der Pfad hinter dem Präfix ist Nutzereingabe, und der Handler DEKODIERT
+     * ihn — ein `%2f` wird also erst danach zum Trenner.
+     *
+     * Die schlichte Form `../auth.json` steht hier NICHT: `new URL()` räumt
+     * Punkt-Segmente weg, bevor irgendein Code sie sieht, sie käme also nie
+     * beim Handler an (gemessen). Ein Test damit prüfte den URL-Parser, nicht
+     * die Schranke. Was wirklich ankommt, ist die kodierte Form — und genau
+     * die steht hier.
+     */
+    const cookie = auth.issueCookie(TEST_AUTH).split(";")[0]!;
+    for (const pfad of [
+      "/edit-vorschau/..%2fauth.json",
+      "/edit-vorschau/%2e%2e%2fauth.json",
+      "/edit-vorschau/%2e%2e%2f%2e%2e%2fstyles.css",
+      "/edit-vorschau/..%2fschwebend%2fstyles.css",
+      "/edit-vorschau/.git/config",
+      "/edit-vorschau/%2egit/config",
+    ]) {
+      const res = await call(pfad, cookie);
+      const koerper = await res.text();
+      expect(`${pfad} → ${res.status}`).toBe(`${pfad} → 404`);
+      expect(koerper).not.toContain(TEST_SECRET);
+    }
+  });
+
+  test("eine öffentliche Seite namens edit-vorschau-preise.html bleibt öffentlich", async () => {
+    // Dieselbe Falle wie bei `/edit`: `startsWith("/edit-vorschau")` wäre zu
+    // grob und schluckte eine ganz normale Kundenseite — die dann hinter der
+    // Auth-Wand verschwände.
+    writeFileSync(join(siteDir, "edit-vorschau-preise.html"), "<html><body>OEFFENTLICH</body></html>");
+    ctx = { ...ctx, pageWhitelist: [...PAGE_WHITELIST, "edit-vorschau-preise.html"] };
+    const res = await call("/edit-vorschau-preise.html");
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("OEFFENTLICH");
+  });
 });

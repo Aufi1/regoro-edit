@@ -34,9 +34,12 @@ import {
   schreibeKennungen,
 } from "./auth.ts";
 import { maskiereKennung, normalisiereKennung } from "./kennung.ts";
-import { countCommits, ensureRepo, shellQuote } from "./git.ts";
+import { countCommits, shellQuote } from "./git.ts";
+import { entwurfPfad, stelleEntwurfBereit } from "./entwurf.ts";
+import { schwebendPfad, schwebendVorhanden } from "./arbeitskopie.ts";
+import { veroeffentlichtPfad } from "./veroeffentlichen.ts";
 import { startServer } from "./server.ts";
-import { listPageFiles, listSites } from "./sites.ts";
+import { listPageFiles, listSites, SLUG_RE } from "./sites.ts";
 import { verlaufDir } from "./verlauf.ts";
 import {
   activationSteps,
@@ -89,12 +92,22 @@ Verwendung:
                                   Sammelbetrieb: alle Websites unter <sitesRoot>
                                   in EINEM Prozess. Jeder Unterordner heißt wie
                                   seine Domain; der Host-Header entscheidet.
+  regoro serve <sitesRoot> --staging [--port n]
+                                  Staging (Vorschau für Interessenten): erreichbar
+                                  unter /p/<slug>/, wobei <slug> der Ordnername
+                                  ist. OHNE ANMELDUNG — wer den Link hat, kann
+                                  bearbeiten. Veröffentlichen gibt es dort nicht.
+                                  Niemals auf ein Produktions-Sammelverzeichnis
+                                  richten.
   regoro disable [siteDir] [--purge]
                                   Editor abschalten (entfernt .regoro/)
   regoro service [siteDir] [--domain d] [--port n] [--systemd|--caddy]
                                   systemd-Unit + Caddy-Block ausgeben
   regoro service <sitesRoot> --multi [--port n] [--systemd|--caddy]
                                   dasselbe für den Sammelbetrieb
+  regoro service <sitesRoot> --staging --domain d [--port n] [--systemd|--caddy]
+                                  dasselbe für den Staging-Betrieb (ein Hostname,
+                                  Previews unter /p/<slug>/)
   regoro service --apparmor       AppArmor-Profil für bwrap ausgeben (nötig für
                                   die KI-Seitenleiste, siehe README)
   regoro ki --stdin | --key-from-proxy [--model m] [--base-url u]
@@ -289,11 +302,12 @@ async function cmdInit(args: string[]): Promise<void> {
   // Reihenfolge (in dieser Folge, nicht umstellen):
   //
   //   1. .gitignore  — ".regoro/" muss drinstehen, BEVOR irgendetwas committet wird.
-  //   2. ensureRepo  — git init + pristine Baseline-Commit. Hält den UNBERÜHRTEN
-  //      Stand als erste Version fest; sonst würde host.ts' lazy ensureRepo erst
-  //      beim ersten Save committen und den bereits editierten Stand als
-  //      "Baseline" ausgeben. Zu diesem Zeitpunkt existiert auth.json noch NICHT,
-  //      das Secret kann also gar nicht in den Commit geraten.
+  //   2. stelleEntwurfBereit — legt <siteDir>/.regoro/entwurf an: erst die
+  //      Website hineinkopieren, dann git init + Baseline-Commit. Hält den
+  //      UNBERÜHRTEN Stand als erste Version fest; sonst würde host.ts' lazy
+  //      ensureRepo erst beim ersten Save committen und den bereits editierten
+  //      Stand als "Baseline" ausgeben. Zu diesem Zeitpunkt existiert auth.json
+  //      noch NICHT, das Secret kann also gar nicht in den Commit geraten.
   //   3. auth.json schreiben — als LETZTES.
   //
   // Der Grund für 3 zuletzt: git kann fehlschlagen (z.B. "dubious ownership",
@@ -301,6 +315,13 @@ async function cmdInit(args: string[]): Promise<void> {
   // zuerst — dann lag eine nutzlose Auth-Datei im Ordner, und der "bereits
   // initialisiert"-Guard blockierte den Wiederholungsversuch. Jetzt scheitert
   // init, bevor der Nutzer überhaupt tippt, und ein zweiter Anlauf funktioniert.
+  //
+  // **KEIN `ensureRepo(siteDir)` mehr.** Ein `.git` IM Site-Ordner ist seit dem
+  // Entwurfs-Umbau das Kennzeichen einer alten, nicht migrierten Installation —
+  // `istNichtMigriert()` schaltet den Editor dafür fail-closed ab (Invariante 9).
+  // `regoro init` legte damit genau den Zustand an, der den Editor tötet: init
+  // meldete Erfolg, und /edit gab 404. Genau das hat der Test „init legt das
+  // Entwurfs-Repo an" gefangen.
   if (kennungen.length === 0) {
     fail(
       "kein Kontaktweg angegeben.\n" +
@@ -311,7 +332,7 @@ async function cmdInit(args: string[]): Promise<void> {
   }
 
   ensureGitignore(siteDir);
-  ensureRepo(siteDir);
+  stelleEntwurfBereit(siteDir);
 
   const { path } = await createAuthFile(siteDir, kennungen);
 
@@ -436,9 +457,40 @@ function cmdDisable(args: string[]): void {
     fail(`nicht initialisiert: ${authDir} existiert nicht.\n  Es gibt nichts abzuschalten.`);
   }
 
-  // null = git konnte die Historie nicht lesen. Dann NIEMALS löschen (fail-closed):
-  // ein Repo voller Kundenarbeit sähe sonst aus wie ein leeres.
-  const commits = countCommits(siteDir);
+  /**
+   * SEIT DEM ENTWURFS-UMBAU LIEGT DIE HISTORIE IN `.regoro/entwurf` — also
+   * INNERHALB dessen, was `disable` löscht.
+   *
+   * Vorher war die Aufteilung bequem: `.regoro/` war Editor-Zubehör, `.git` im
+   * Site-Ordner war die Kundenarbeit, und `disable` ohne `--purge` konnte das
+   * eine wegnehmen und das andere stehen lassen. Jetzt liegt beides im selben
+   * Verzeichnis, und ein unverändertes `rmSync(authDir)` löschte die gesamte
+   * Versionshistorie und jede noch nicht veröffentlichte Änderung — bei einem
+   * Befehl, dessen Meldung „die Website läuft weiter" sagt.
+   *
+   * Die Regel aus Invariante 9 gilt unverändert, sie zeigt nur auf einen
+   * anderen Ordner: Ohne `--purge` bleibt die Historie unberührt, mit `--purge`
+   * nur dann, wenn nicht mehr als der Baseline-Commit darin steht.
+   */
+  const entwurfDir = entwurfPfad(siteDir);
+  /**
+   * **Am ENTWURFS-Repo zählen, nicht am Site-Ordner.**
+   *
+   * `countCommits` beginnt mit „kein `.git` → 0". Im alten Weltbild war das
+   * ehrlich: kein Repo, nichts zu verlieren. Fragt man aber mit `siteDir`, ist
+   * dort seit dem Umbau NIE mehr ein `.git` — die Antwort war also immer 0, und
+   * der Guard konnte gar nicht mehr anschlagen. Gemessen an einer echten Site:
+   * `countCommits(siteDir)` = 0, während `countCommits(entwurfDir)` = 4 lieferte.
+   *
+   * Das ist die Fehlerklasse aus CLAUDE.md — eine Zusicherung, die nicht mehr
+   * anschlagen kann, und ihr Ausbleiben beweist nichts. Der Kommentar an
+   * `countCommits` versprach weiterhin „fail-closed"; die Wirkung war weg, weil
+   * die Frage am falschen Ordner gestellt wurde.
+   *
+   * `null` = git verweigert die Auskunft → Abbruch. 0 = es gibt wirklich nichts,
+   * auch wenn der Entwurf gar nicht angelegt wurde; das ist ehrlich.
+   */
+  const commits = countCommits(entwurfDir);
   const disableCmd = siteDirArg === "." ? "regoro disable" : `regoro disable ${siteDirArg}`;
 
   if (purge && commits === null) {
@@ -447,36 +499,31 @@ function cmdDisable(args: string[]): void {
         "  Ob darin gespeicherte Bearbeitungen stecken, ist damit unbekannt, und\n" +
         "  --purge würde sie unwiederbringlich löschen. Abgebrochen.\n\n" +
         "  Nachsehen, woran es liegt:\n" +
-        `    git -C ${shellQuote(siteDir)} log --oneline\n\n` +
-        "  Nur den Editor abschalten (rührt .git nicht an):\n" +
+        `    git -C ${shellQuote(entwurfDir)} log --oneline\n\n` +
+        "  Nur den Editor abschalten (rührt den Entwurf nicht an):\n" +
         `    ${disableCmd}`,
     );
   }
 
   if (purge && commits !== null && commits > 1) {
     fail(
-      `${commits} Commits im Site-Repo — darin stecken gespeicherte Bearbeitungen.\n` +
+      `${commits} Commits im Entwurfs-Repo — darin stecken gespeicherte Bearbeitungen.\n` +
         "  Der Editor ist die einzige Quelle dieser Änderungen; --purge würde sie\n" +
         "  unwiederbringlich löschen. Abgebrochen.\n\n" +
         "  Nur den Editor abschalten (Historie bleibt):\n" +
         `    ${disableCmd}\n\n` +
         "  Historie ansehen:\n" +
-        `    git -C ${shellQuote(siteDir)} log --oneline`,
+        `    git -C ${shellQuote(entwurfDir)} log --oneline`,
     );
   }
 
   /**
    * VOR dem Löschen zählen, was mit verschwindet.
    *
-   * `rmSync(authDir)` nimmt das GANZE `.regoro/` mit, nicht nur `auth.json` —
-   * seit der KI-Seitenleiste liegen dort auch die Gesprächsverläufe, und die
-   * enthalten wörtlich, was der Kunde geschrieben hat. Die Meldung darunter
-   * sprach von „Auth-Datei entfernt" und „die Website läuft weiter"; wer das
-   * las, hatte keinen Anlass zu vermuten, dass er gerade Kundentext löscht.
-   *
-   * Hier wird NICHTS am Löschen geändert — nur daran, dass es unausgesprochen
-   * blieb. Ob Verläufe ein Abschalten überdauern sollen, ist eine Frage der
-   * Aufbewahrung und gehört entschieden, nicht nebenbei hier entschieden.
+   * Die Gesprächsverläufe enthalten wörtlich, was der Kunde geschrieben hat.
+   * Solange die Meldung von „Auth-Datei entfernt" und „die Website läuft
+   * weiter" spricht, hat niemand Anlass zu vermuten, dass dabei Kundentext
+   * gelöscht wird — also muss es dastehen.
    */
   let verlaeufeWeg = 0;
   try {
@@ -485,7 +532,61 @@ function cmdDisable(args: string[]): void {
     // Kein Verlaufsverzeichnis — der Normalfall ohne KI-Seitenleiste.
   }
 
-  rmSync(authDir, { recursive: true, force: true });
+  /**
+   * WAS `disable` STEHEN LÄSST — eine BEHALTEN-Liste, keine Entfernungs-Liste.
+   *
+   * Bis zum Entwurfs-Umbau nahm `rmSync(authDir)` das ganze `.regoro/` mit, und
+   * das war vertretbar, solange dort nur Editor-Zubehör lag: Die Kundenarbeit
+   * lebte im `.git` des Site-Ordners, und das blieb stehen. Jetzt liegt sie
+   * unter `.regoro/entwurf/` — dasselbe `rmSync` löschte also die komplette
+   * Versionshistorie und jede noch nicht veröffentlichte Änderung, bei einem
+   * Befehl, dessen Meldung „die Website wird weiter ausgeliefert" sagt. Der
+   * schonende Weg wäre damit das schärfere Kommando gewesen.
+   *
+   * **Die Richtung der Regel ist die eigentliche Entscheidung.** Naheliegend
+   * wäre „entferne, was Zugang gewährt" — dann überlebt aber ALLES Neue, was
+   * künftig jemand in `.regoro/` ablegt, auch eine Datei mit Zugangsdaten, an
+   * die beim Schreiben der Regel niemand gedacht hat. Umgekehrt verschwindet
+   * Unbekanntes von selbst. Für einen Befehl, dessen Zweck das Abschalten ist,
+   * ist das die richtige Voreinstellung. Drei Ausnahmen, und sie stehen damit
+   * an genau einer Stelle:
+   *
+   *   entwurf/              die Historie und jede unveröffentlichte Änderung
+   *   schwebend/            ein fertiger KI-Lauf, den der Kunde noch übernehmen
+   *                         oder verwerfen wollte — also BEZAHLTE Arbeit, die
+   *                         Kontingent verbraucht hat. Sie liegen zu lassen ist
+   *                         gefahrlos: `legeSchwebendAn` hält die
+   *                         Entwurfs-Hashes fest, ein späteres Übernehmen auf
+   *                         verändertem Unterbau fällt sauber auf
+   *                         `fremd-geaendert`, statt etwas zu überschreiben.
+   *   veroeffentlicht.json  die Notbremse gegen einen fremden Schreiber (C5).
+   *                         Sie zu löschen zerstört keine Arbeit, ENTWAFFNET
+   *                         ABER BEIM WIEDEREINSCHALTEN STILLSCHWEIGEND DIE
+   *                         BREMSE — genau die Sorte Folge, die niemand beim
+   *                         Löschen mitdenkt, weil die Datei wertlos aussieht.
+   *
+   * Verläufe und Kontingent gehen mit: Ein `disable` ist eine Entscheidung des
+   * BETREIBERS, kein Weg, den ein Kunde beschreiten könnte — ein zurückgesetzter
+   * Monatszähler ist dort Betrieb, nicht Missbrauch.
+   *
+   * Fail-closed bleibt vollständig gewahrt: Ohne `auth.json` ist `/edit*` 404,
+   * und mehr will `disable` nicht.
+   */
+  if (purge) {
+    // Der Guard oben hat bestätigt: höchstens der Baseline-Commit. Dann darf
+    // alles weg, Entwurfs-Repo eingeschlossen.
+    rmSync(authDir, { recursive: true, force: true });
+  } else {
+    const behalten = new Set([
+      basename(entwurfDir),
+      basename(schwebendPfad(siteDir)),
+      basename(veroeffentlichtPfad(siteDir)),
+    ]);
+    for (const eintrag of readdirSync(authDir)) {
+      if (behalten.has(eintrag)) continue;
+      rmSync(join(authDir, eintrag), { recursive: true, force: true });
+    }
+  }
   console.log("");
   console.log("Auth-Datei entfernt — der Editor ist für diese Site aus.");
   console.log("  Die Website wird weiter ausgeliefert; /edit* antwortet mit 404.");
@@ -499,12 +600,29 @@ function cmdDisable(args: string[]): void {
   }
 
   if (purge) {
-    rmSync(join(siteDir, ".git"), { recursive: true, force: true });
-    console.log("  git-Repo entfernt (enthielt keine gespeicherten Bearbeitungen).");
-  } else if (commits === null) {
-    console.log("  git-Repo bleibt erhalten (Historie nicht lesbar — unangetastet).");
-  } else if (commits > 0) {
-    console.log(`  git-Repo bleibt erhalten (${commits} Version${commits === 1 ? "" : "en"}).`);
+    console.log("  Entwurfs-Repo entfernt (enthielt keine gespeicherten Bearbeitungen).");
+  } else {
+    // Was NICHT gelöscht wurde, gehört EINZELN genannt — ein Betreiber, der
+    // `disable` für „alles weg" hält, räumt sonst von Hand nach und trifft die
+    // Historie. Und ein Sammelbegriff wie „der Entwurf bleibt" liest sich, als
+    // sei die schwebende Änderung mitgemeint; sie muss deshalb eigens dastehen.
+    console.log("  Der Entwurf und die Versionshistorie bleiben erhalten.");
+    if (commits === null) {
+      console.log(`  ${entwurfDir} (Historie nicht lesbar — unangetastet).`);
+    } else if (commits > 0) {
+      console.log(
+        `  ${entwurfDir} (${commits} Version${commits === 1 ? "" : "en"}), ` +
+          "darin auch noch nicht veröffentlichte Änderungen.",
+      );
+    }
+    if (schwebendVorhanden(siteDir)) {
+      console.log(
+        "  Ebenfalls erhalten: eine offene KI-Änderung in .regoro/schwebend/, die noch",
+      );
+      console.log("  nicht übernommen wurde — sie hat Kontingent gekostet.");
+    }
+    console.log("  Ebenfalls erhalten: die Prüfsummen der letzten Veröffentlichung.");
+    console.log("  Alles restlos entfernen: --purge (verweigert, solange Bearbeitungen darin stehen).");
   }
 
   console.log("");
@@ -1048,6 +1166,7 @@ function cmdService(args: string[]): void {
     "--systemd",
     "--caddy",
     "--multi",
+    "--staging",
     "--apparmor",
   ]);
 
@@ -1092,7 +1211,18 @@ function cmdService(args: string[]): void {
   }
 
   const multi = args.includes("--multi");
+  const staging = args.includes("--staging");
   const domain = flagValue("--domain");
+  // Zwei Betriebsformen für dasselbe Verzeichnis, die sich in der Zuordnung
+  // widersprechen: Host-Header gegen Pfad-Abschnitt. Eine Datei kann nicht
+  // beides sein.
+  if (multi && staging) {
+    fail(
+      "--multi und --staging schließen sich aus.\n" +
+        "  --multi ordnet über den Host-Header zu (eine Domain je Kunde),\n" +
+        "  --staging über den Pfad (/p/<slug>/, ohne Anmeldung).",
+    );
+  }
   // Im Sammelbetrieb bestimmt der Ordnername die Domain. Eine zusätzlich
   // angegebene --domain würde stillschweigend ignoriert — lieber laut scheitern.
   if (multi && domain !== undefined) {
@@ -1134,7 +1264,11 @@ function cmdService(args: string[]): void {
     user: flagValue("--user") ?? (process.env.SUDO_USER || process.env.USER || "www-data"),
     domain,
     multi,
-    browserHerkuenfte: multi ? [] : alleBrowserHerkuenfte(loadIntegrationen(siteDir)),
+    staging,
+    // Im Staging wie im Sammelbetrieb: EIN Block für viele Websites, also keine
+    // gemeinsame Herkunftsliste. Eine Preview mit fremder Integration ist ein
+    // Fall, den es nicht gibt — Interessenten richten keine ein.
+    browserHerkuenfte: multi || staging ? [] : alleBrowserHerkuenfte(loadIntegrationen(siteDir)),
     herkuenfteJeHost,
   };
 
@@ -1154,7 +1288,13 @@ function cmdService(args: string[]): void {
   if (!opts.domain && !multi) {
     console.log("# Hinweis: ohne --domain steht example.com im Caddy-Block.\n");
   }
-  console.log(multi ? `# Sammelverzeichnis: ${siteDir}` : `# Site:   ${siteDir}`);
+  console.log(
+    multi
+      ? `# Sammelverzeichnis: ${siteDir}`
+      : staging
+        ? `# Preview-Verzeichnis: ${siteDir}   (OHNE ANMELDUNG erreichbar)`
+        : `# Site:   ${siteDir}`,
+  );
   console.log(`# Dienst: regoro-${slug}   Port: ${port}${portRaw ? "" : " (aus dem Ordnernamen abgeleitet)"}`);
   console.log(`# Nutzer: ${opts.user}\n`);
   console.log("# ── /etc/systemd/system/regoro-" + slug + ".service ──");
@@ -1173,7 +1313,9 @@ function cmdService(args: string[]): void {
   console.log(
     multi
       ? `#   regoro service ${shellQuote(siteDir)} --multi --caddy   # globalen Block oben einfügen!`
-      : `#   regoro service --caddy --domain ${opts.domain ?? "deine-domain.de"} | sudo tee -a /etc/caddy/Caddyfile`,
+      : staging
+        ? `#   regoro service ${shellQuote(siteDir)} --staging --caddy --domain ${opts.domain ?? "intern.deine-domain.de"} | sudo tee -a /etc/caddy/Caddyfile`
+        : `#   regoro service --caddy --domain ${opts.domain ?? "deine-domain.de"} | sudo tee -a /etc/caddy/Caddyfile`,
   );
 }
 
@@ -1188,7 +1330,8 @@ function cmdService(args: string[]): void {
  * Eine Website abschalten: `regoro disable`. Ebenfalls kein Neustart.
  */
 function cmdServe(args: string[]): void {
-  checkFlags("serve", args, ["--port", "--versand-config"]);
+  checkFlags("serve", args, ["--port", "--versand-config", "--staging"]);
+  const staging = args.includes("--staging");
 
   // Flag und Wert PAARWEISE herausschneiden, nicht nach Textgleichheit filtern.
   // Ein Filter `a !== portRaw` verschluckt sonst `serve 8080 --port 8080` — beide
@@ -1212,7 +1355,19 @@ function cmdServe(args: string[]): void {
       versandConfig = value;
       continue;
     }
+    if (arg === "--staging") continue;
     positional.push(arg);
+  }
+
+  // Im Staging gibt es keine Anmeldung und damit keinen Einmalcode — eine
+  // Versand-Konfiguration wäre wirkungslos. Lieber laut scheitern als
+  // stillschweigend ignorieren: Wer sie angibt, erwartet etwas anderes, als er
+  // bekommt.
+  if (staging && versandConfig !== undefined) {
+    fail(
+      "--staging und --versand-config schließen sich aus.\n" +
+        "  Eine Preview kennt keine Anmeldung, also wird nie ein Einmalcode verschickt.",
+    );
   }
 
   // Kein Rückfall auf die cwd wie bei `run`: ein Sammelverzeichnis ist nichts,
@@ -1242,15 +1397,54 @@ function cmdServe(args: string[]): void {
   if (entries.length === 0) {
     fail(
       `keine Website-Ordner in ${sitesRoot}\n` +
-        "  Erwartet wird je ein Unterordner pro Domain, z.B. kunde.de/\n" +
+        (staging
+          ? "  Erwartet wird je ein Unterordner pro Preview, z.B. bergdolt-c89a/\n"
+          : "  Erwartet wird je ein Unterordner pro Domain, z.B. kunde.de/\n") +
         "  Eine Website aufnehmen: Ordner anlegen und darin `regoro init` ausführen.",
     );
   }
-  const reachable = entries.filter((e) => e.host !== null);
+
+  /**
+   * Ein Punkt im Ordnernamen heißt im Staging: falsches Verzeichnis.
+   *
+   * `SLUG_RE` verbietet Punkte, ein Ordner `kunde.de` wäre unter `/p/kunde.de/`
+   * also ohnehin unerreichbar — der Abbruch nimmt nichts weg, er macht nur
+   * sichtbar, was sonst als stiller 404 für JEDEN Kunden erschiene. Genau
+   * dieser Tippfehler ist der gefährliche: `regoro serve --staging /srv/sites`
+   * statt `/srv/previews`.
+   *
+   * Nur Verzeichnisse, und versteckte übersprungen: eine `README.md` oder ein
+   * `.gitkeep` im Sammelverzeichnis darf den Dienst nicht am Start hindern —
+   * `listSites` liefert ohnehin nur Verzeichnisse, der Punkt-Präfix-Filter
+   * schließt `.git`/`.cache` aus.
+   */
+  if (staging) {
+    const nachDomainAussehend = entries.filter(
+      (e) => !e.name.startsWith(".") && e.name.includes("."),
+    );
+    if (nachDomainAussehend.length > 0) {
+      fail(
+        `${sitesRoot} sieht nach einem PRODUKTIONS-Sammelverzeichnis aus.\n` +
+          "  Diese Ordner tragen einen Punkt im Namen, sind also Domains:\n" +
+          nachDomainAussehend.map((e) => `    ${e.name}`).join("\n") +
+          "\n\n  Im Staging ist ein Ordnername ein Slug ohne Punkt (bergdolt-c89a), und\n" +
+          "  diese Ordner wären unter /p/<slug>/ allesamt unerreichbar.\n" +
+          "  Gemeint war vermutlich: regoro serve " +
+          shellQuote(sitesRoot) +
+          "   (ohne --staging)",
+      );
+    }
+  }
+
+  // Erreichbar heißt im Staging „gültiger Slug", im Sammelbetrieb „gültiger
+  // Hostname". Zwei Auflösungsarten, zwei Grammatiken.
+  const reachable = entries.filter((e) => (staging ? SLUG_RE.test(e.name) : e.host !== null));
   if (reachable.length === 0) {
     fail(
       `keine erreichbaren Website-Ordner in ${sitesRoot}\n` +
-        "  Der Ordnername MUSS die Domain sein (kleingeschrieben, ohne www.):\n" +
+        (staging
+          ? "  Der Ordnername MUSS ein Slug sein (a-z, 0-9, Bindestrich; kein Punkt):\n"
+          : "  Der Ordnername MUSS die Domain sein (kleingeschrieben, ohne www.):\n") +
         entries.map((e) => `    ${e.name}`).join("\n"),
     );
   }
@@ -1261,22 +1455,44 @@ function cmdServe(args: string[]): void {
   for (const site of reachable) {
     const pages = listPageFiles(site.siteDir).length;
     const seiten = pages === 1 ? "1 Seite" : `${pages} Seiten`;
-    const editor = existsSync(authFilePath(site.siteDir))
-      ? "Editor aktiv"
-      : `Editor aus (regoro init ${site.siteDir})`;
+    // Im Staging sagt die Auth-Datei nichts über den Editor — er ist dort immer
+    // offen. Angezeigt wird stattdessen die Adresse, die man weitergibt.
+    const editor = staging
+      ? `/p/${site.name}/edit`
+      : existsSync(authFilePath(site.siteDir))
+        ? "Editor aktiv"
+        : `Editor aus (regoro init ${site.siteDir})`;
     console.log(`  ${site.name.padEnd(width)}  ${seiten.padStart(9)}  ${editor}`);
   }
   // Ordner ohne Seiten oder ohne Auth-Datei sind kein Fehler — eine Website kann
   // legitim gerade erst angelegt sein. Genannt werden sie trotzdem.
-  const unerreichbar = entries.filter((e) => e.host === null);
+  const unerreichbar = entries.filter((e) => !reachable.includes(e));
   if (unerreichbar.length > 0) {
-    console.log("Nicht erreichbar (Ordnername ist nicht die Domain):");
+    console.log(
+      staging
+        ? "Nicht erreichbar (Ordnername ist kein gültiger Slug):"
+        : "Nicht erreichbar (Ordnername ist nicht die Domain):",
+    );
     for (const e of unerreichbar) console.log(`  ${e.name}`);
   }
 
-  const { port: actual } = startServer({ sitesRoot, port, versandConfig });
+  if (staging) {
+    // Unmissverständlich und vor dem Start: Wer das liest und stutzt, hat den
+    // Prozess auf dem falschen Verzeichnis gestartet.
+    console.log("");
+    console.log("  ┌─────────────────────────────────────────────────────────────────┐");
+    console.log("  │  STAGING — die Bearbeitung ist OHNE ANMELDUNG erreichbar.       │");
+    console.log("  │  Wer den Link hat, kann bearbeiten. Nur für Vorschau-Websites,  │");
+    console.log("  │  niemals für Kundenwebsites mit echten Daten.                   │");
+    console.log("  └─────────────────────────────────────────────────────────────────┘");
+    console.log("");
+  }
+
+  const { port: actual } = startServer({ sitesRoot, port, versandConfig, staging });
   console.log(
-    `Regoro Editor läuft auf Port ${actual} — welche Website, entscheidet der Host-Header.`,
+    staging
+      ? `Regoro Editor (Staging) läuft auf Port ${actual} — welche Website, entscheidet /p/<slug>/.`
+      : `Regoro Editor läuft auf Port ${actual} — welche Website, entscheidet der Host-Header.`,
   );
 }
 
@@ -1295,12 +1511,9 @@ function cmdRun(args: string[]): void {
   }
   const siteDir = requireDir(positional[0]);
   const port = Number(process.env.PORT ?? 8788);
-  const { port: actual } = startServer({
-    siteDir,
-    repoRoot: siteDir, // repoRoot = siteDir → pages top-level (sitePrefix="")
-    port,
-    versandConfig,
-  });
+  // Wo die Historie liegt, gibt der Aufrufer nicht mehr an: sie liegt im
+  // Entwurfs-Repo unter <siteDir>/.regoro/entwurf (Invariante 9).
+  const { port: actual } = startServer({ siteDir, port, versandConfig });
   console.log(`Regoro Editor läuft auf http://localhost:${actual}/edit/login`);
 }
 

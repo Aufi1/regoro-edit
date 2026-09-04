@@ -288,13 +288,33 @@ describe("auth — issueCookie/checkCookie", () => {
 // ===========================================================================
 // Host-Integration: gemeinsame Fixture + call()-Helfer
 // ===========================================================================
+/**
+ * Ein Site-Ordner, wie ihn `regoro init` hinterlässt: die Website plus das
+ * Entwurfs-Repo unter `.regoro/entwurf/`. KEIN Repo im Site-Ordner selbst —
+ * das wäre der Zustand, den `istNichtMigriert()` fail-closed abschaltet, und
+ * jede Editor-Route gäbe dann 404, ohne dass es an der Auth läge.
+ *
+ * `repoRoot === entwurfDir`, weil die Historie dort wohnt (C1).
+ */
 function makeSiteFixture(): { repoRoot: string; siteDir: string } {
-  const repoRoot = makeTmpDir("regoro-v8-fixture-");
-  const siteDir = join(repoRoot, "site");
-  mkdirSync(siteDir, { recursive: true });
+  const siteDir = makeTmpDir("regoro-v8-fixture-");
   cpSync(REAL_SITE, siteDir, { recursive: true });
-  return { repoRoot, siteDir };
+  stelleEntwurfBereit(siteDir);
+  return { repoRoot: entwurfPfad(siteDir), siteDir };
 }
+
+/** Die vier Felder aus C1, die jeder Ctx tragen muss. */
+function ctxFelder(siteDir: string) {
+  return {
+    entwurfDir: entwurfPfad(siteDir),
+    schwebendDir: schwebendPfad(siteDir),
+    basis: "",
+    staging: false,
+  };
+}
+
+import { entwurfPfad, stelleEntwurfBereit } from "./entwurf.ts";
+import { schwebendPfad } from "./arbeitskopie.ts";
 
 const PAGE_WHITELIST = ["index.html", "impressum.html", "datenschutz.html", "agb.html"];
 
@@ -318,7 +338,13 @@ describe("host — fail-closed bei auth===null", () => {
 
   beforeEach(() => {
     const fx = makeSiteFixture();
-    ctx = { repoRoot: fx.repoRoot, siteDir: fx.siteDir, pageWhitelist: PAGE_WHITELIST, auth: null };
+    ctx = {
+      repoRoot: fx.repoRoot,
+      ...ctxFelder(fx.siteDir),
+      siteDir: fx.siteDir,
+      pageWhitelist: PAGE_WHITELIST,
+      auth: null,
+    };
   });
 
   test("GET /edit/login → 404", async () => {
@@ -348,7 +374,13 @@ describe("host — mit gültiger Auth", () => {
 
   beforeEach(() => {
     const fx = makeSiteFixture();
-    ctx = { repoRoot: fx.repoRoot, siteDir: fx.siteDir, pageWhitelist: PAGE_WHITELIST, auth: TEST_AUTH };
+    ctx = {
+      repoRoot: fx.repoRoot,
+      ...ctxFelder(fx.siteDir),
+      siteDir: fx.siteDir,
+      pageWhitelist: PAGE_WHITELIST,
+      auth: TEST_AUTH,
+    };
   });
 
   test("richtiger Code ergibt 302 + Set-Cookie", async () => {
@@ -408,7 +440,13 @@ describe("host — Auth-Datei-Web-Block (.regoro/auth.json, .git/)", () => {
     // Auch eine .git/config-Fixture anlegen (Block-Test).
     mkdirSync(join(fx.siteDir, ".git"), { recursive: true });
     writeFileSync(join(fx.siteDir, ".git", "config"), "[core]\n  bare = false\n");
-    ctx = { repoRoot: fx.repoRoot, siteDir: fx.siteDir, pageWhitelist: PAGE_WHITELIST, auth: loaded };
+    ctx = {
+      repoRoot: fx.repoRoot,
+      ...ctxFelder(fx.siteDir),
+      siteDir: fx.siteDir,
+      pageWhitelist: PAGE_WHITELIST,
+      auth: loaded,
+    };
   });
 
   async function expectBlocked(path: string): Promise<void> {

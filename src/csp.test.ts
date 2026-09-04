@@ -24,6 +24,8 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { caddyBlock, type ServiceOpts } from "./service.ts";
+import { isEditorPath } from "./host.ts";
+import { resolveStagingPath } from "./sites.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..");
 
@@ -327,9 +329,13 @@ describe.skipIf(!haveCaddy())("der erzeugte Block auf der Leitung", () => {
    */
   async function mitCaddy<T>(
     opts: Partial<ServiceOpts>,
-    fn: (basis: string) => Promise<T>,
+    fn: (basis: string, siteDir: string) => Promise<T>,
   ): Promise<T> {
     const siteDir = tmp("regoro-csp-site-");
+    // Im Staging ist `siteDir` das Sammelverzeichnis der Previews. Der Ordner
+    // muss wirklich existieren, sonst löst `resolveStagingPath` nichts auf und
+    // die Paritätsprüfung unten verglichen zwei Ablehnungen.
+    mkdirSync(join(siteDir, "kunde-a"), { recursive: true });
     mkdirSync(join(siteDir, "assets"), { recursive: true });
     writeFileSync(join(siteDir, "index.html"), "<!doctype html><html><body><h1>Start</h1></body></html>");
     writeFileSync(join(siteDir, "styles.css"), "body{margin:0}");
@@ -365,7 +371,7 @@ describe.skipIf(!haveCaddy())("der erzeugte Block auf der Leitung", () => {
           await Bun.sleep(100);
         }
       }
-      return await fn(basis);
+      return await fn(basis, siteDir);
     } finally {
       caddy.kill();
       await caddy.exited;
@@ -397,6 +403,80 @@ describe.skipIf(!haveCaddy())("der erzeugte Block auf der Leitung", () => {
     });
   }, 60_000);
 
+  test("Staging: die Editor-Adressen gehen an den Bun-Prozess und tragen KEINE CSP", async () => {
+    /**
+     * DER NACHWEIS AUF DER LEITUNG, und er ist hier nicht schmückend.
+     *
+     * Im Staging-Block wird ALLES an den Bun-Prozess weitergereicht — auch die
+     * Vorschau selbst, denn nur er kennt den Entwurf. Die Trennung liegt
+     * deshalb nicht am Upstream, sondern an der KOPFZEILE: Editor-Adressen ohne
+     * CSP (`connect-src 'none'` legte jedes fetch des Overlays lahm), alles
+     * andere mit.
+     *
+     * Gemessen am Produktions-Matcher wäre das hier reihenweise schiefgegangen:
+     * `path`-Globs überqueren Schrägstriche nur bei EINEM Stern, das Präfix
+     * erzwingt einen zweiten — `/p/k/edit/agent/status` und
+     * `/p/k/edit-assets/overlay.js` fielen lautlos in den anderen Zweig. Eine
+     * Zeichenketten-Prüfung sieht das nicht; ob ein Muster greift, weiß nur caddy.
+     */
+    await mitCaddy({ staging: true }, async (basis) => {
+      for (const pfad of [
+        "/p/kunde-a/edit",
+        "/p/kunde-a/edit/zustand",
+        "/p/kunde-a/edit/agent/status",
+        "/p/kunde-a/edit/agent/events",
+        "/p/kunde-a/edit-assets/overlay.js",
+        "/p/kunde-a/impressum.html/edit",
+      ]) {
+        const r = await fetch(basis + pfad);
+        const koerper = await r.text();
+        // Der Stub antwortet `editor:<pfad>` — daran hängt, dass die Anfrage
+        // WIRKLICH am Bun-Prozess ankam und nicht bloß irgendein 200 war.
+        expect(`${pfad} → ${koerper}`).toBe(`${pfad} → editor:${pfad}`);
+        expect(`${pfad}: ${r.headers.get("content-security-policy")}`).toBe(`${pfad}: null`);
+      }
+    });
+  }, 60_000);
+
+  test("Staging: die Vorschau selbst kommt ebenfalls vom Bun-Prozess — aber MIT CSP", async () => {
+    // Die Gegenprobe zur Zeile darüber. Ohne sie wäre „keine CSP" auch dann
+    // erfüllt, wenn der Block überhaupt keine setzte — und dann liefe der
+    // Entwurf eines Interessenten ohne die dritte Grenze.
+    await mitCaddy({ staging: true }, async (basis) => {
+      for (const pfad of ["/p/kunde-a/", "/p/kunde-a/index.html", "/p/kunde-a/edit-preise.html"]) {
+        const r = await fetch(basis + pfad);
+        const koerper = await r.text();
+        expect(`${pfad} → ${koerper}`).toBe(`${pfad} → editor:${pfad}`);
+        expect(`${pfad}: ${r.headers.get("content-security-policy")}`).toBe(
+          `${pfad}: ${CSP_OHNE_INTEGRATIONEN}`,
+        );
+        expect(`${pfad}: ${r.headers.get("x-content-type-options")}`).toBe(`${pfad}: nosniff`);
+      }
+    });
+  }, 60_000);
+
+  test("Staging: der Dotfile-Riegel gewinnt gegen den Editor-Matcher", async () => {
+    // Unter `.regoro/` liegen das Entwurfs-Repo, die schwebende Änderung und
+    // die Auth-Datei. Der Riegel steht deshalb VOR @editor — und weil beide
+    // Zweige denselben Upstream haben, sieht man den Unterschied nur daran,
+    // dass hier NICHTS durchgereicht wird.
+    await mitCaddy({ staging: true }, async (basis) => {
+      for (const pfad of [
+        "/p/kunde-a/.regoro/auth.json",
+        "/p/kunde-a/.regoro/entwurf/HEAD",
+        "/p/kunde-a/assets/.geheim.html",
+        "/p/kunde-a/.regoro/entwurf/edit",
+      ]) {
+        const r = await fetch(basis + pfad);
+        const koerper = await r.text();
+        expect(`${pfad} → ${r.status}`).toBe(`${pfad} → 404`);
+        expect(`${pfad}: ${koerper.startsWith("editor:") ? "durchgereicht" : "geblockt"}`).toBe(
+          `${pfad}: geblockt`,
+        );
+      }
+    });
+  }, 60_000);
+
   test("die Extension-Allowlist und der Dotfile-Riegel gelten auch im Proxy", async () => {
     // Invariante 3: Caddy liefert die statische Site direkt aus, der Bun-Host ist
     // dafür nicht im Pfad. Ein blankes file_server unterliefe ASSET_TYPES
@@ -419,4 +499,238 @@ describe.skipIf(!haveCaddy())("der erzeugte Block auf der Leitung", () => {
       await r.text();
     });
   }, 60_000);
+
+  // ===========================================================================
+  // Proxy und Editor müssen dieselbe Grenze ziehen — Caddy nie laxer
+  // ===========================================================================
+  describe("der Matcher und isEditorPath() ziehen dieselbe Grenze", () => {
+    /**
+     * WARUM DAS EINE EIGENE ZUSICHERUNG IST UND KEINE AUFZÄHLUNG.
+     *
+     * `CADDY_HOST_RE` ↔ `HOST_RE` und die `@allowed`-Zeile ↔ `ASSET_TYPES` sind
+     * in diesem Repo schon aneinandergenagelt, weil sie sonst auseinanderlaufen.
+     * Für den Editor-Matcher fehlte das — und die Lücke war real: Der Generator
+     * führte `/edit-vorschau/*`, während `isEditorPath()` die Form noch nicht
+     * kannte. Der Proxy war damit LAXER als der Editor.
+     *
+     * Diese Richtung ist die gefährliche. Caddy darf strenger sein (dann kommt
+     * eine Editor-Anfrage gar nicht erst an, man merkt es sofort). Ist Caddy
+     * laxer, geht eine Anfrage an den Bun-Host, die der Editor für eine
+     * öffentliche Seite hält — im Produktionsblock also am `file_server`, an der
+     * Extension-Allowlist UND an der CSP vorbei. Das ist ein Publikationsweg, den
+     * kein Editor-Werkzeug zeigt.
+     *
+     * Geprüft wird deshalb die Implikation, nicht die Gleichheit — mit einer
+     * Gegenprobe, dass sie nicht leer ist.
+     */
+    const PFADE = [
+      // Editor-Formen (isEditorPath === true)
+      "/edit",
+      "/edit/login",
+      "/edit/save",
+      "/edit/agent/events",
+      "/edit/version/abc1234",
+      "/edit-assets/overlay.js",
+      "/edit-vorschau/assets/hero.png",
+      "/impressum.html/edit",
+      // Öffentliche Formen, die ihnen ähnlich sehen (isEditorPath === false)
+      "/edit-preise.html",
+      "/edit-vorschau-preise.html",
+      "/editieren.html",
+      "/blog/edit/beitrag.html",
+      "/index.html",
+      "/assets/hero.png",
+      "/styles.css",
+      "/",
+    ];
+
+    /** Trifft eine Anfrage den Editor-Zweig? Am Stub gemessen, nicht am Text. */
+    async function amEditor(basis: string, pfad: string): Promise<boolean> {
+      const r = await fetch(basis + pfad);
+      const koerper = await r.text();
+      return koerper.startsWith("editor:");
+    }
+
+    test("Produktion: Caddy ist nirgends laxer als isEditorPath()", async () => {
+      await mitCaddy({}, async (basis) => {
+        let beideJa = 0;
+        for (const pfad of PFADE) {
+          const proxy = await amEditor(basis, pfad);
+          const editor = isEditorPath(pfad);
+          if (proxy && editor) beideJa++;
+          // Verboten ist genau eine Kombination: Proxy leitet weiter, Editor
+          // hält den Pfad für öffentlich.
+          expect(`${pfad}: proxy=${proxy} editor=${editor}`).not.toBe(
+            `${pfad}: proxy=true editor=false`,
+          );
+        }
+        // GEGENPROBE ZUM MESSAPPARAT: Ohne sie wäre die Implikation auch dann
+        // erfüllt, wenn Caddy überhaupt nichts an den Editor weiterreichte.
+        expect(beideJa).toBeGreaterThan(4);
+      });
+    }, 60_000);
+
+    test("Staging: dieselbe Implikation, gemessen am abgestreiften Pfad", async () => {
+      // Im Staging vergleicht sich der Proxy mit dem, was die Anwendung NACH dem
+      // Abstreifen des Präfixes sieht — das ist der Pfad, über den `isEditorPath`
+      // dort urteilt.
+      await mitCaddy({ staging: true }, async (basis, sitesRoot) => {
+        let beideJa = 0;
+        for (const pfad of PFADE.map((p) => `/p/kunde-a${p === "/" ? "/" : p}`)) {
+          const proxy = await amEditor(basis, pfad);
+          const treffer = resolveStagingPath(sitesRoot, new URL(`http://x${pfad}`).pathname);
+          const editor = treffer !== null && isEditorPath(treffer.rest);
+          if (proxy && editor) beideJa++;
+          // Im Staging geht ALLES an den Bun-Prozess — der Unterschied liegt in
+          // der CSP. „Am Editor" heißt hier deshalb: im @editor-Zweig, also ohne
+          // CSP. Das prüft `cspFrei` unten.
+          const r = await fetch(basis + pfad);
+          const cspFrei = r.headers.get("content-security-policy") === null;
+          await r.text();
+          expect(`${pfad}: proxy=${cspFrei} editor=${editor}`).not.toBe(
+            `${pfad}: proxy=true editor=false`,
+          );
+          expect(proxy).toBe(true); // im Staging kommt jede Anfrage am Prozess an
+        }
+        expect(beideJa).toBeGreaterThan(4);
+      });
+    }, 60_000);
+
+    test("die öffentlichen Doppelgänger bleiben statisch UND tragen die CSP", async () => {
+      /**
+       * Die wichtigere Hälfte, weil sie eine zu gierige Regel fängt: Ein Muster
+       * mit einem Stern VORN und HINTEN um „/edit/" herum wäre die naheliegende
+       * Reparatur für das Staging-Präfix — caddy schaltet dann auf „Enthält" und
+       * verschlingt `/blog/edit/beitrag.html`, eine ganz normale Kundenseite, die
+       * damit ohne CSP an den Bun-Host ginge.
+       */
+      await mitCaddy({}, async (basis) => {
+        for (const pfad of ["/blog/edit/beitrag.html", "/edit-vorschau-preise.html", "/edit-preise.html"]) {
+          const r = await fetch(basis + pfad);
+          const koerper = await r.text();
+          expect(`${pfad}: ${koerper.startsWith("editor:") ? "am Editor" : "statisch"}`).toBe(
+            `${pfad}: statisch`,
+          );
+          // 404, weil die Datei in der Fixture nicht existiert — aber MIT der CSP
+          // des statischen Zweigs, und das ist hier der Punkt.
+          expect(`${pfad}: ${r.headers.get("content-security-policy")}`).toBe(
+            `${pfad}: ${CSP_OHNE_INTEGRATIONEN}`,
+          );
+        }
+      });
+    }, 60_000);
+
+    test("Staging in der TIEFE — ein einstufiger Test hätte die Lücke durchgelassen", async () => {
+      /**
+       * Gemessen: Caddys `path`-Glob überquert Schrägstriche nur bei EINEM Stern
+       * am Rand; ab dem zweiten gilt Segment-Semantik. Die naheliegende Form
+       * „/p/, Stern, /edit/, Stern" trifft deshalb `/p/k/edit/login`, verfehlt aber
+       * `/p/k/edit/agent/events` und `/p/k/edit/version/<id>` — genau die Routen
+       * der Seitenleiste, und zwar lautlos.
+       *
+       * Ein Test mit nur einer Ebene wäre grün gewesen. Deshalb hier ausdrücklich
+       * zwei und drei Ebenen unter dem Präfix.
+       */
+      await mitCaddy({ staging: true }, async (basis) => {
+        for (const pfad of [
+          "/p/kunde-a/edit/login",
+          "/p/kunde-a/edit/agent/events",
+          "/p/kunde-a/edit/agent/verlaeufe",
+          "/p/kunde-a/edit/version/abc1234",
+          "/p/kunde-a/edit-vorschau/assets/hero.png",
+        ]) {
+          const r = await fetch(basis + pfad);
+          await r.text();
+          expect(`${pfad}: ${r.headers.get("content-security-policy")}`).toBe(`${pfad}: null`);
+        }
+      });
+    }, 60_000);
+  });
+});
+
+// ===========================================================================
+// Der Staging-Block liefert NICHTS selbst aus — und Produktion sehr wohl
+// ===========================================================================
+describe("Staging-Block: kein file_server, kein root", () => {
+  /**
+   * Im Staging ist die öffentliche Sicht der ENTWURF, und den kennt nur der
+   * Bun-Prozess. Ein `root`/`file_server` im Proxy lieferte den
+   * veröffentlichten Stand aus — also genau das, was der Interessent gerade
+   * NICHT sehen soll.
+   *
+   * Beide Hälften sind nötig: Ohne die zweite wäre der Test auch grün, wenn der
+   * Generator überhaupt nichts mehr erzeugte.
+   */
+  const staging: ServiceOpts = {
+    ...base,
+    siteDir: "/srv/previews",
+    slug: "previews",
+    port: 8790,
+    staging: true,
+    domain: "intern.example.com",
+  };
+
+  /**
+   * Nur die WIRKSAMEN Zeilen. Ohne diesen Schnitt prüfte der Test die Prosa
+   * mit: Der Staging-Block erklärt in einem Kommentar ausdrücklich „kein
+   * `root`, kein `file_server`" — und ein `toContain` sähe dort genau das Wort,
+   * das nicht vorkommen soll. Ein Test, der am Kommentar scheitert, ist kein
+   * Befund, sondern ein Messfehler.
+   */
+  const nurDirektiven = (text: string): string =>
+    text
+      .split("\n")
+      .filter((z) => !z.trim().startsWith("#"))
+      .join("\n");
+
+  test("der Staging-Block enthält weder file_server noch root", () => {
+    const block = nurDirektiven(caddyBlock(staging));
+    expect(block).not.toContain("file_server");
+    expect(block).not.toContain("root *");
+  });
+
+  test("GEGENPROBE: der Produktionsblock enthält beide", () => {
+    // Ohne diese Hälfte wäre der Test darüber auch grün, wenn der Generator
+    // überhaupt nichts mehr erzeugte.
+    const block = nurDirektiven(caddyBlock(base));
+    expect(block).toContain("file_server");
+    expect(block).toContain("root *");
+  });
+
+  test("und deshalb trägt die Staging-Vorlage KEINE @allowed-Zeile", () => {
+    // Der Pinning-Test in service.test.ts vergleicht die `@allowed`-Zeile über
+    // die Vorlagen. Die Staging-Vorlage darf dort nicht mitlaufen — sie hat
+    // keine, und zwar aus einem Grund, nicht aus Vergesslichkeit.
+    const text = nurDirektiven(readFileSync(join(REPO_ROOT, "Caddyfile.staging.example"), "utf8"));
+    expect(text).not.toContain("@allowed");
+    expect(text).not.toContain("file_server");
+    // Gegenprobe: die beiden Produktions-Vorlagen führen beides sehr wohl.
+    for (const datei of ["Caddyfile.example", "Caddyfile.multi.example"]) {
+      const vorlage = nurDirektiven(readFileSync(join(REPO_ROOT, datei), "utf8"));
+      expect(`${datei}: ${vorlage.includes("@allowed") && vorlage.includes("file_server")}`).toBe(
+        `${datei}: true`,
+      );
+    }
+  });
+});
+
+// ===========================================================================
+// Ein übersprungener Test darf nicht wie ein bestandener aussehen
+// ===========================================================================
+describe("die Werkzeuge dieser Datei sind da", () => {
+  /**
+   * `test.skipIf` wertet beim EINSAMMELN aus, vor jedem `beforeAll`. In diesem
+   * Repo hat das schon vier Tests dauerhaft stillgelegt, die dabei grün
+   * meldeten — die teuerste Fehlerklasse, die CLAUDE.md kennt: ein Nachweis,
+   * der nicht anschlagen kann, beweist durch sein Ausbleiben nichts.
+   *
+   * Dieser Fall ist die Gegenmaßnahme und mit Absicht KEIN `skipIf`: Fehlt das
+   * Werkzeug, wird genau eine Zeile rot und nennt es beim Namen, statt dass
+   * eine Handvoll Prüfungen lautlos verschwindet. Wer hier bewusst ohne das
+   * Werkzeug arbeitet, sieht die eine rote Zeile und weiß, was ihm fehlt.
+   */
+  test("caddy ist installiert — sonst laufen die Prüfungen auf der Leitung ins Leere", () => {
+    expect(`caddy vorhanden: ${haveCaddy()}`).toBe("caddy vorhanden: true");
+  });
+
 });

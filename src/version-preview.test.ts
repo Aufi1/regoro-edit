@@ -16,6 +16,7 @@ import { test, expect, describe, beforeAll, beforeEach, afterAll } from "bun:tes
 import { mkdtempSync, rmSync, mkdirSync, cpSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { schwebendPfad } from "./arbeitskopie.ts";
 
 const TEST_SECRET = "testsecret-aaaaaaaaaaaaaaaaaaaaaaaa";
 const TEST_NUMMER = "+4915120464812";
@@ -78,7 +79,19 @@ describe("host.ts — Versions-Vorschau liefert Asset-URLs root-absolut", () => 
     writeFileSync(join(repoRoot, pagePath), oldHtml, "utf8");
     git.commitEdit(repoRoot, pagePath, "Alte Version mit Marker");
 
-    ctx = { repoRoot, siteDir, pageWhitelist: PAGE_WHITELIST, auth: TEST_AUTH };
+    // Drei Orte statt einem (Contract C1). Diese Vorrichtung stammt von davor:
+    // Entwurfs-Sicht und Abzug liegen hier auf demselben Ordner, damit die
+    // Zusicherungen dieses Blocks weiterhin den Router messen und nicht die Ablage.
+    ctx = {
+      repoRoot,
+      entwurfDir: siteDir,
+      schwebendDir: schwebendPfad(siteDir),
+      siteDir,
+      basis: "",
+      staging: false,
+      pageWhitelist: PAGE_WHITELIST,
+      auth: TEST_AUTH,
+    };
   });
 
   function authCookie(): string {

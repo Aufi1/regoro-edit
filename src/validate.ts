@@ -408,23 +408,86 @@ const JS_HREF_ZUWEISUNG_RE = /\.\s*href\s*=(?![=>])\s*([^;\n]*)/gi;
 const JS_CLICK_RE = /\.\s*click\s*\(\s*\)/;
 
 /**
- * Service Worker — die einzige Änderung, die die Versionsliste nicht zurücknimmt.
+ * Service Worker — die einzige Änderung, die im Browser des Besuchers weiterlebt.
  *
- * Der Plan trägt an einer Stelle sein ganzes Gewicht: „Änderungen gehen sofort
- * live, **die Versionsliste ist das Sicherheitsnetz**." Darauf ruht die
- * Entscheidung gegen einen Freigabeknopf. Für einen Service Worker hat das Netz
- * ein Loch, und ausgerechnet für die Klasse mit der längsten Wirkung.
+ * DER WORKER HÄNGT NICHT AN SEINER DATEI. Das ist der ganze Grund, und er gilt
+ * unabhängig davon, was der Editor mit der Datei anstellt: Die Registrierung
+ * liegt im Browserprofil des Besuchers, und dorthin reicht kein Befehl, den
+ * dieses Repo kennt — nicht Wiederherstellen, nicht Veröffentlichen, nicht
+ * Löschen. Alles, was wir tun können, ist, sie gar nicht erst entstehen zu
+ * lassen.
  *
- * Nachgewiesen gegen einen Server mit der echten erzeugten CSP: Der Agent legt
- * `sw.js` an und ein `app.js`, das ihn registriert. Der Kunde stellt
- * `index.html` über die Versionsliste wieder her — `curl` liefert danach die
- * saubere Seite, der Browser des Besuchers zeigt weiter die Entstellung.
+ * ZWEI GETRENNTE MESSUNGEN, und die Trennung ist wichtig — die zweite ist eine
+ * Eigenschaft des BROWSERS und hat mit diesem Repo nichts zu tun:
  *
- * Zwei Eigenschaften spielen zusammen, und keine ist allein der Fehler:
- * `restoreVersion` stellt genau EINEN Pfad wieder her und löscht nie etwas, also
- * bleibt `sw.js` mit 200 erreichbar — und ein registrierter Worker überlebt
- * dadurch jede Wiederherstellung. Die CSP kann hier nicht helfen: Die
- * Registrierung geht auf die EIGENE Herkunft, und die erlaubt sie zu Recht.
+ * (1) Entfernt der Editor die Datei überhaupt? Ja — gefahren durch die echte
+ *     Kette (echter Server, Attrappen-Worker, echte Sandbox, echtes git): Ein
+ *     Lauf legt eine Seite an, `uebernehmen` committet sie in den Entwurf,
+ *     `veroeffentlichen` stellt sie öffentlich (anonym 200), `restore` auf die
+ *     Baseline nimmt sie aus dem Entwurf, das nächste `veroeffentlichen` meldet
+ *     `{"geschrieben":0,"geloescht":1}` — anonym **404**, Datei physisch weg,
+ *     der Rest der Website unberührt. Solange nicht veröffentlicht ist, bleibt
+ *     die Datei anonym 404: Ein Service Worker, der nur im Entwurf steht,
+ *     erreicht keinen Besucher. `.js` steht in `ASSET_TYPES`, das Szenario ist
+ *     also real und nicht hypothetisch.
+ *
+ * (2) Überlebt die Registrierung, dass ihre Datei 404 wird? Ja — und das ist
+ *     der Punkt. Gemessen an einem EIGENSTÄNDIGEN Wegwerf-Server, auf dem sich
+ *     das 404-Werden exakt takten ließ (Chromium 151.0.7922.108, snap); regoro
+ *     kam darin nicht vor, weil die Frage am Browser hängt und nicht am Editor.
+ *
+ *       sofort, ohne Neuladen     entstellt, `controller` gesetzt
+ *       1./2./3. Neuladen         entstellt, Registrierung anzahl=1
+ *       erzwungenes update()      wirft TypeError — und räumt NICHT auf
+ *       echter Prozess-Neustart   entstellt (dauerhaftes Profil, 2 Phasen à 3 Ladevorgänge)
+ *
+ *     Der Browser hat `sw.js` **siebenmal** abgerufen und siebenmal 404
+ *     bekommen. Er sieht nach, findet nichts, behält die Registrierung.
+ *
+ * ES GIBT KEIN ZEITFENSTER, das man abwarten könnte. Die erwartete Frage „wie
+ * lange liefert der Worker noch aus" hat keine Zahl als Antwort, sondern eine
+ * Bedingung: Die Registrierung endet, wenn der Besucher seine Browserdaten
+ * löscht oder eine Seite derselben Herkunft `unregister()` ruft. Beides kann der
+ * Editor nicht auslösen — auch das korrekt löschende `veroeffentliche()` nicht.
+ *
+ * Und die Prüfung KONNTE ein Verschwinden zeigen — sonst bewiese ihr Ausbleiben
+ * nichts: Positivkontrolle im selben Lauf (Phasen mit `sw.js`=200 zeigen die
+ * Entstellung, sonst meldet das Skript sich selbst als ungültig), und getrennt
+ * die Gegenprobe `unregister()` → anzahl=0, nächster Aufruf zeigt wieder die
+ * Fassung aus dem Netz.
+ *
+ * NICHT gemessen, und deshalb hier auch nicht behauptet: echte Wanduhr-Zeit
+ * (mehrere Prozessneustarts und sieben Update-Abrufe, aber keine Tage) und
+ * andere Browser. Ob Chromium nach Wochen doch aufräumt, ist offen — es ließ
+ * sich nicht nachstellen, und darauf lässt sich keine Regel bauen.
+ *
+ * WAS VORHER HIER STAND, UND WARUM ES NICHT MEHR STIMMT. Die frühere Begründung
+ * lautete: `restoreVersion` stelle genau EINEN Pfad wieder her und lösche nie
+ * etwas, `sw.js` bleibe deshalb mit 200 erreichbar. Seit „Eine Bearbeitung, zwei
+ * Modi" arbeitet sie über den ganzen Baum und entfernt die Datei wirklich. Der
+ * alte Nachweis hatte **zu früh aufgehört**: Er zeigte, dass die Datei liegen
+ * bleibt, und schloss daraus auf das Überleben des Workers — geprüft war nur die
+ * erste Hälfte. Dass die Regel trotzdem richtig war, war Glück; die zweite
+ * Hälfte hätte auch anders ausgehen können.
+ *
+ * Die alte Fassung zeigte auf ein WERKZEUG, das wir kontrollieren, die neue auf
+ * eine EIGENSCHAFT, die wir nicht kontrollieren. Deshalb kann diese hier beim
+ * nächsten Umbau nicht wieder veralten — anders als die alte, die bei jeder
+ * Änderung an der Versionsliste erneut falsch geworden wäre (und genau das ist
+ * passiert).
+ *
+ * ZWEI FEHLMESSUNGEN AUF DEM WEG, damit sie niemand wiederholt — beide sahen
+ * nach einem Befund aus und waren der Messapparat:
+ *   - `chromium --dump-dom` taugt dafür nicht: Der Prozess endet, bevor der
+ *     Worker die Seite übernimmt. Dort schlug selbst die Positivkontrolle mit
+ *     `sw.js`=200 fehl.
+ *   - `--user-data-dir` unterhalb von `/tmp` ist für das Snap-Chromium
+ *     unerreichbar. Das Profil bleibt leer, und die Läufe landen über den
+ *     Singleton-Socket in einer bereits laufenden Instanz — man misst dann eine
+ *     andere Sitzung als die, die man aufgesetzt hat.
+ *
+ * Die CSP kann hier ebenfalls nicht helfen: Die Registrierung geht auf die
+ * EIGENE Herkunft, und die erlaubt sie zu Recht.
  *
  * Anders als bei der Navigation gibt es hier keinen legitimen Gegenfall — die
  * Broschüren-Website eines Handwerksbetriebs braucht keinen Service Worker.
@@ -434,10 +497,13 @@ const JS_CLICK_RE = /\.\s*click\s*\(\s*\)/;
 const JS_SERVICEWORKER_RE =
   /\bnavigator\s*(?:\.\s*serviceWorker\b|\[\s*(['"])serviceWorker\1\s*\])/gi;
 
+// Der Satz für den Kunden. Er nannte früher die Versionsliste als das, was nicht
+// hilft — das war zu eng: Es hilft NICHTS, was auf dem Server passiert, weil die
+// Registrierung im Browser des Besuchers liegt (nachgemessen, siehe oben).
 const SERVICEWORKER_GRUND =
-  "Service Worker werden nicht übernommen. Ein registrierter Service Worker bleibt im Browser der Besucher aktiv, " +
-  "auch nachdem die Seite über die Versionsliste zurückgenommen wurde — er ist die einzige Änderung, die sich " +
-  "nicht mehr rückgängig machen lässt. Für eine Website wie diese wird keiner gebraucht.";
+  "Service Worker werden nicht übernommen. Ein einmal registrierter Service Worker bleibt im Browser der Besucher " +
+  "aktiv — auch dann noch, wenn die Seite längst zurückgenommen und die Datei gelöscht ist. Er ist die einzige " +
+  "Änderung, die sich vom Server aus nicht mehr rückgängig machen lässt. Für eine Website wie diese wird keiner gebraucht.";
 
 /** Der Wert eines alleinstehenden String-Literals, oder null bei allem anderen. */
 function stringLiteral(ausdruck: string): string | null {

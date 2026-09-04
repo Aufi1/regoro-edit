@@ -1,0 +1,97 @@
+# Beispiel-Caddyfile für den regoro-edit STAGING-BETRIEB (Vorschau für
+# Interessenten).
+#
+# Ein Prozess, viele Previews, EIN Hostname. Unter /srv/previews/ liegt je ein
+# Ordner pro Interessent — der Ordnername ist der Slug im Pfad:
+#
+#   /srv/previews/bergdolt-c89a/   →  https://intern.sites.aufi.de/p/bergdolt-c89a/
+#
+# Der Kundenname steht im PFAD und nicht im Hostnamen. Das ist Absicht: In den
+# öffentlichen Certificate-Transparency-Logs erscheint nur der eine Hostname,
+# also weder welcher Betrieb eine Vorschau bekommt noch wann.
+#
+# ACHTUNG — der Editor ist hier OHNE ANMELDUNG erreichbar. Wer den Link hat,
+# kann bearbeiten. Dieser Block gehört auf einen internen Hostnamen und niemals
+# vor eine Kundenwebsite. Der Kostendeckel je Preview ist einmalig
+# (STAGING_KONTINGENT, eine Million Token, kein Monatsreset).
+#
+# Kein on_demand_tls und kein globaler Block: Es gibt genau einen Hostnamen,
+# also ein gewöhnliches Zertifikat.
+#
+# Erzeugt von: regoro service /srv/previews --staging --caddy --domain intern.sites.aufi.de
+# Einzelbetrieb: siehe Caddyfile.example · Sammelbetrieb: Caddyfile.multi.example
+#
+# Anpassen: Domain, Pfad zum Preview-Verzeichnis, ggf. Port.
+
+# Staging: EIN Hostname, viele Previews unter /p/<slug>/. Der Ordnername unter
+# /srv/previews ist der Slug — dieselbe Zuordnung wie im Sammelbetrieb, nur über
+# den Pfad statt über den Host-Header (SLUG_RE in sites.ts).
+#
+# ACHTUNG: Hinter diesem Block ist der Editor OHNE ANMELDUNG erreichbar. Er
+# gehört auf einen internen Hostnamen und niemals vor Kundenwebsites.
+intern.sites.aufi.de {
+    encode gzip
+
+    # Auth-Datei + alle Dotfiles, in jeder Tiefe. Regexp, kein Glob:
+    # `path /.*` deckt nur führende Punkte, /assets/.geheim.html käme durch.
+    #
+    # STEHT VOR @editor UND GEWINNT DAMIT: gemessen sind `.regoro/entwurf/` und
+    # `.regoro/schwebend/` so in jeder Tiefe unerreichbar, auch prozentkodiert
+    # (`%2eregoro`, `%2E`) und auch mit `/edit`-Suffix. Diese Reihenfolge nicht
+    # umstellen.
+    @hidden path_regexp (^|/)\.
+    handle @hidden {
+        respond 404
+    }
+
+    # Editor-Routen an den Bun-Prozess. Als REGEXP und nicht als Glob wie in
+    # Produktion: Caddys `path`-Glob überquert Schrägstriche nur bei einem
+    # EINZELNEN Stern am Anfang oder Ende — ab dem zweiten gilt Go-path.Match und
+    # ein Stern steht für genau ein Segment. Das Präfix `/p/<slug>/` erzwingt
+    # aber einen zweiten Stern. Gemessen mit caddy 2.11.4: `/p/*/edit/*` verfehlt
+    # `/edit/agent/events`, `/edit/agent/verlaeufe` und `/edit/version/<id>` —
+    # also genau die Routen der KI-Seitenleiste, und zwar lautlos.
+    #
+    # HIER KEINE CSP: `connect-src 'none'` blockierte jedes fetch des Overlays.
+    @editor path_regexp ^/p/[a-z0-9]([a-z0-9-]*[a-z0-9])?/(edit|edit/.*|edit-assets/.*|edit-vorschau/.*|[a-z0-9-]+\.html/edit)$
+    handle @editor {
+        reverse_proxy 127.0.0.1:8788 {
+            # Der Agentenlauf meldet sich über Server-Sent Events; diese Zeile
+            # schaltet jede Pufferung des Antwortkörpers ab.
+            #
+            # Sie ist NICHT der Grund, warum die Seitenleiste sofort aufgeht.
+            # Gemessen (caddy 2.11.4, Upstream schweigt 4 s): Caddy gibt die
+            # Antwort-HEADER erst mit dem ersten Körper-Byte heraus — 4,00 s,
+            # mit dieser Zeile wie ohne. Dagegen hilft kein Proxy-Schalter.
+            # Der Editor schickt deshalb beim Verbinden sofort einen
+            # SSE-Kommentar (": verbunden\n", ohne Leerzeile — ein
+            # vollständiger Rahmen erzeugte einen Phantom-Rahmen im Client);
+            # damit sind es 0,002 s.
+            # Wer hier eine Verzögerung sucht, sucht an der falschen Stelle.
+            flush_interval -1
+        }
+    }
+
+    # Alles andere ist die Vorschau selbst — auch sie kommt aus dem Bun-Prozess,
+    # denn nur der kennt den Entwurf. Kein `root`, kein `file_server`: siehe
+    # caddyBlockStaging() in src/service.ts.
+    handle {
+        header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'none'; form-action 'self'; frame-src 'none'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'"
+        header X-Content-Type-Options "nosniff"
+        reverse_proxy 127.0.0.1:8788 {
+            # Der Agentenlauf meldet sich über Server-Sent Events; diese Zeile
+            # schaltet jede Pufferung des Antwortkörpers ab.
+            #
+            # Sie ist NICHT der Grund, warum die Seitenleiste sofort aufgeht.
+            # Gemessen (caddy 2.11.4, Upstream schweigt 4 s): Caddy gibt die
+            # Antwort-HEADER erst mit dem ersten Körper-Byte heraus — 4,00 s,
+            # mit dieser Zeile wie ohne. Dagegen hilft kein Proxy-Schalter.
+            # Der Editor schickt deshalb beim Verbinden sofort einen
+            # SSE-Kommentar (": verbunden\n", ohne Leerzeile — ein
+            # vollständiger Rahmen erzeugte einen Phantom-Rahmen im Client);
+            # damit sind es 0,002 s.
+            # Wer hier eine Verzögerung sucht, sucht an der falschen Stelle.
+            flush_interval -1
+        }
+    }
+}

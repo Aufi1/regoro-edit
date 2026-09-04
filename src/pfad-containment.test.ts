@@ -37,6 +37,9 @@ const TEST_NUMMER = "+4915120464812";
 const TEST_AUTH = { nummern: [TEST_NUMMER], emails: [], secret: TEST_SECRET };
 
 const REPO_ROOT = join(import.meta.dir, "..");
+import { entwurfPfad, stelleEntwurfBereit } from "./entwurf.ts";
+import { schwebendPfad } from "./arbeitskopie.ts";
+
 const REAL_SITE = join(REPO_ROOT, "examples", "site");
 
 const tmpRoots: string[] = [];
@@ -142,15 +145,22 @@ describe("host.ts — der hängende Symlink schreibt nicht nach draußen", () =>
 
   beforeEach(async () => {
     const repoRoot = makeTmpDir("regoro-fixture-");
-    const siteDir = join(repoRoot, "site");
-    mkdirSync(siteDir, { recursive: true });
+    const siteDir = repoRoot;
     cpSync(REAL_SITE, siteDir, { recursive: true });
-    git.ensureRepo(repoRoot);
+    // Kein Repo IM Site-Ordner: die Historie wohnt im Entwurfs-Repo (C1), und
+    // ein `<siteDir>/.git` wäre der Zustand, den `istNichtMigriert()`
+    // fail-closed abschaltet.
+    stelleEntwurfBereit(siteDir);
     aussen = makeTmpDir("regoro-aussen-");
     versand = (await import("./versand.ts")).attrappenVersand();
     ctx = {
-      repoRoot,
+      repoRoot: entwurfPfad(siteDir),
+      entwurfDir: entwurfPfad(siteDir),
+      schwebendDir: schwebendPfad(siteDir),
       siteDir,
+      basis: "",
+      staging: false,
+      sitePrefix: "",
       pageWhitelist: ["index.html", "impressum.html", "datenschutz.html", "agb.html"],
       auth: TEST_AUTH,
       versand,
@@ -187,13 +197,16 @@ describe("host.ts — der hängende Symlink schreibt nicht nach draußen", () =>
     // vorhersagbar: Wer die Bytes kennt, kennt den Zielpfad und kann ihn vorab
     // als Symlink nach draußen anlegen. Genau das tut dieser Test.
     const sha8 = createHash("sha256").update(bytes).digest("hex").slice(0, 8);
-    const assets = join(ctx.siteDir, "assets");
+    // GESCHRIEBEN WIRD IN DEN ENTWURF, nicht in den Site-Ordner (C1). Ein
+    // Symlink im Site-Ordner wäre nach dem Umbau wirkungslos — der Test hätte
+    // dann bestanden, ohne den Riegel je berührt zu haben.
+    const assets = join(ctx.entwurfDir, "assets");
     mkdirSync(assets, { recursive: true });
     const beute = join(aussen, "beute.png");
     symlinkSync(beute, join(assets, `upload-${sha8}.png`));
 
     const fd = new FormData();
-    fd.set("pagePath", "site/index.html");
+    fd.set("pagePath", "index.html");
     fd.set("imgIdx", "0");
     const ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
     fd.set("image", new Blob([ab], { type: "image/png" }), "f.png");
@@ -214,7 +227,7 @@ describe("host.ts — der hängende Symlink schreibt nicht nach draußen", () =>
   test("Upload ohne Symlink → 200 (Gegenprobe: der Riegel sperrt nicht den Normalfall)", async () => {
     const cookie = await login();
     const fd = new FormData();
-    fd.set("pagePath", "site/index.html");
+    fd.set("pagePath", "index.html");
     fd.set("imgIdx", "0");
     const bytes = pngBytes();
     const ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
@@ -230,6 +243,17 @@ describe("host.ts — der hängende Symlink schreibt nicht nach draußen", () =>
     expect(res.status).toBe(200);
     const json = (await res.json()) as { ok: boolean; src: string };
     expect(json.ok).toBe(true);
-    expect(readFileSync(join(ctx.siteDir, json.src.replace(/^\//, "")))).toHaveLength(72);
+
+    /**
+     * ZWEI ORTE, EINE DATEI (C1/C11): Geschrieben wird in den Entwurf, aber die
+     * zurückgegebene Adresse zeigt in die ENTWURFS-SICHT (`/edit-vorschau/…`) —
+     * sonst zeigte der Editor das frisch hochgeladene Bild erst nach dem
+     * Veröffentlichen an, also genau dann nicht, wenn man es ansehen will.
+     */
+    expect(json.src.startsWith("/edit-vorschau/assets/")).toBe(true);
+    const relativZumEntwurf = json.src.replace(/^\/edit-vorschau\//, "");
+    expect(readFileSync(join(ctx.entwurfDir, relativZumEntwurf))).toHaveLength(72);
+    // Und im ausgelieferten Site-Ordner ist es NICHT gelandet.
+    expect(existsSync(join(ctx.siteDir, relativZumEntwurf))).toBe(false);
   });
 });

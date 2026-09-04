@@ -1,5 +1,6 @@
 /**
- * Die vier Routen der KI-Seitenleiste (Contract §7).
+ * Die Routen der KI-Seitenleiste (Contract §7). Die vier Routen der einen
+ * Bearbeitung (C2) gehören NICHT hierher — siehe den Kasten bei `ROUTEN`.
  *
  * ZWEI DINGE, DIE HIER FESTGENAGELT WERDEN:
  *
@@ -25,7 +26,8 @@ import { join } from "node:path";
 import * as host from "./host.ts";
 import { createAuthFile, issueCookie, loadAuthFile } from "./auth.ts";
 import { schreibeKiConfig, type KiConfig } from "./betreiber-config.ts";
-import { ensureRepo } from "./git.ts";
+import { entwurfPfad, stelleEntwurfBereit } from "./entwurf.ts";
+import { schwebendDateien, schwebendPfad } from "./arbeitskopie.ts";
 import { startServer } from "./server.ts";
 import { attrappenVersand } from "./versand.ts";
 import { meldeAn } from "./anmeldung.testhelfer.ts";
@@ -96,6 +98,20 @@ const ROUTEN: [string, string][] = [
 ];
 
 /**
+ * DIE VIER ROUTEN DER EINEN BEARBEITUNG STEHEN HIER NICHT — mit Absicht.
+ *
+ * `/edit/zustand`, `/edit/uebernehmen`, `/edit/verwerfen` und
+ * `/edit/veroeffentlichen` teilen zwar die Auth-Wand mit den Agenten-Routen,
+ * aber NICHT deren zweite Regel: Ohne betreiberweite `ki.json` gibt es die
+ * Seitenleiste nicht — die Bearbeitung sehr wohl. Stünden sie in `ROUTEN`,
+ * verlangte der Fall „ohne ki.json → alle 404" das auch von ihnen, und ein
+ * Kunde ohne Modellzugang könnte weder speichern noch veröffentlichen.
+ *
+ * Sie haben deshalb eine eigene Datei mit eigenem ROUTEN/ERREICHBAR-Paar:
+ * `editor-routes.test.ts`.
+ */
+
+/**
  * Was eine Route liefert, wenn alles stimmt — angemeldet, mit `ki.json`.
  *
  * `POST /edit/agent` und `GET /edit/agent/events` fehlen mit Absicht: Der eine
@@ -147,11 +163,24 @@ let ctx: host.HostCtx;
 beforeEach(async () => {
   siteDir = tmp("regoro-routes-site-");
   cpSync(REAL_SITE, siteDir, { recursive: true });
-  ensureRepo(siteDir);
+  // Die Historie liegt seit „Eine Bearbeitung, zwei Modi" im Entwurfs-Repo
+  // (C1/C4), nicht mehr im Site-Ordner: Arbeitsbaum des Repos ist die GANZE
+  // Website, der Site-Ordner ist ein Abzug davon. KEIN `ensureRepo(siteDir)`
+  // mehr — ein `<siteDir>/.git` neben dem Entwurfs-Repo ist genau der Zustand,
+  // den `istNichtMigriert()` fail-closed abschaltet.
+  //
+  // Und über `stelleEntwurfBereit` statt von Hand: Die Fixture soll den Zustand
+  // herstellen, den Produktion herstellt — sonst prüft sie einen, den es nie gibt.
+  stelleEntwurfBereit(siteDir);
+  const entwurfDir = entwurfPfad(siteDir);
   await createAuthFile(siteDir, [NUMMER]);
   process.env.RUNTIME_DIRECTORY = tmp("regoro-routes-run-");
   ctx = {
-    repoRoot: siteDir,
+    repoRoot: entwurfDir,
+    entwurfDir,
+    schwebendDir: schwebendPfad(siteDir),
+    basis: "",
+    staging: false,
     siteDir,
     pageWhitelist: PAGES,
     auth: loadAuthFile(siteDir),
@@ -316,7 +345,7 @@ describe("angemeldet MÜSSEN diese Routen erreichbar sein", () => {
     // Ohne `id`: 400 mit Grund — eine Antwort, kein Durchfallen.
     const ohneId = await ruf("GET", "/edit/agent/verlauf", { cookie: c });
     expect(ohneId.status).toBe(400);
-    expect(await ohneId.json()).toEqual({ ok: false, grund: "Kennung fehlt." });
+    expect(await ohneId.json()).toEqual({ ok: false, fehler: "verlauf-kennung", grund: "Kennung fehlt." });
 
     // Und mit einer echten Kennung kommen echte Zeilen zurück.
     const info = legeVerlaufAn(siteDir, "Leg eine Seite an.");
@@ -335,7 +364,7 @@ describe("POST /edit/agent", () => {
   test("ohne Auftrag: 400 mit der gemeinsamen Fehlerform", async () => {
     const r = await ruf("POST", "/edit/agent", { cookie: cookie(), body: {} });
     expect(r.status).toBe(400);
-    expect(await r.json()).toEqual({ ok: false, grund: "Auftrag fehlt." });
+    expect(await r.json()).toEqual({ ok: false, fehler: "auftrag-fehlt", grund: "Auftrag fehlt." });
   });
 
   test("eine absurd lange Gesprächskennung wird abgewiesen", async () => {
@@ -348,7 +377,7 @@ describe("POST /edit/agent", () => {
       body: { auftrag: "mach was", verlauf: "x".repeat(500) },
     });
     expect(r.status).toBe(400);
-    expect(await r.json()).toEqual({ ok: false, grund: "Ungültige Gesprächskennung." });
+    expect(await r.json()).toEqual({ ok: false, fehler: "verlauf-kennung", grund: "Ungültige Gesprächskennung." });
   });
 
   test("ein Auftrag aus Leerzeichen zählt als keiner", async () => {
@@ -371,6 +400,7 @@ describe("POST /edit/agent", () => {
     expect(r.status).toBe(409);
     expect(await r.json()).toEqual({
       ok: false,
+      fehler: "laeuft-bereits",
       grund: "Es läuft bereits ein Auftrag für diese Website.",
     });
     brichAb(siteDir);
@@ -379,11 +409,14 @@ describe("POST /edit/agent", () => {
   test("erschöpftes Kontingent: 429 mit Klartext, der den Monatsersten nennt", async () => {
     // Der Kunde soll hier nicht rätseln müssen. „429" allein ist im Browser
     // eine leere Seite; der Satz sagt ihm, dass es von selbst weitergeht.
-    verbucheTokens(siteDir, TOKEN_KONTINGENT + 1);
+    // `art` ist Pflicht, seit es zwei Verfallsregeln gibt (C9): Produktion
+    // rechnet monatlich, die Preview einmalig.
+    verbucheTokens(siteDir, TOKEN_KONTINGENT + 1, "monatlich");
     const r = await ruf("POST", "/edit/agent", { cookie: cookie(), body: { auftrag: "harmlos" } });
     expect(r.status).toBe(429);
     expect(await r.json()).toEqual({
       ok: false,
+      fehler: "kontingent",
       grund: "Das Monatskontingent ist aufgebraucht. Es setzt sich am Monatsersten zurück.",
     });
     expect(laufAktiv(siteDir)).toBeNull();
@@ -397,6 +430,7 @@ describe("POST /edit/agent", () => {
       expect(r.status).toBe(503);
       expect(await r.json()).toEqual({
         ok: false,
+        fehler: "keine-sandbox",
         grund: "Die Sandbox (bwrap) ist auf diesem Server nicht verfügbar.",
       });
       expect(laufAktiv(siteDir)).toBeNull();
@@ -502,7 +536,7 @@ describe("ein Gespräch zum Nachlesen", () => {
   test("ohne `id`: 400 mit der gemeinsamen Fehlerform", async () => {
     const r = await ruf("GET", "/edit/agent/verlauf", { cookie: cookie() });
     expect(r.status).toBe(400);
-    expect(await r.json()).toEqual({ ok: false, grund: "Kennung fehlt." });
+    expect(await r.json()).toEqual({ ok: false, fehler: "verlauf-kennung", grund: "Kennung fehlt." });
   });
 
   test("eine absurd lange Kennung: 400, wie beim Auftrag", async () => {
@@ -510,7 +544,7 @@ describe("ein Gespräch zum Nachlesen", () => {
     // sein, sonst rät beim nächsten Mal jemand, welche Grenze gilt.
     const r = await ruf("GET", `/edit/agent/verlauf?id=${"x".repeat(500)}`, { cookie: cookie() });
     expect(r.status).toBe(400);
-    expect(await r.json()).toEqual({ ok: false, grund: "Ungültige Gesprächskennung." });
+    expect(await r.json()).toEqual({ ok: false, fehler: "verlauf-kennung", grund: "Ungültige Gesprächskennung." });
   });
 
   test("eine unbekannte Kennung: 404, kein Fehler", async () => {
@@ -657,7 +691,7 @@ describe("GET /edit/agent/events (echter Server)", () => {
   async function bootMitKi(ki: KiConfig | null) {
     const site = tmp("regoro-sse-site-");
     cpSync(REAL_SITE, site, { recursive: true });
-    ensureRepo(site);
+    stelleEntwurfBereit(site);
     await createAuthFile(site, [NUMMER]);
     process.env.RUNTIME_DIRECTORY = tmp("regoro-sse-run-");
 
@@ -670,14 +704,27 @@ describe("GET /edit/agent/events (echter Server)", () => {
     process.env.CREDENTIALS_DIRECTORY = creds;
 
     const versand = attrappenVersand();
-    const { port } = startServer({ siteDir: site, repoRoot: site, port: 0, versand });
+    // Kein `repoRoot` mehr: Die Historie liegt im Entwurfs-Repo, und wohin das
+    // zeigt, folgt aus dem Site-Ordner — der Aufrufer hat dort nichts zu wählen.
+    const { port } = startServer({ siteDir: site, port: 0, versand });
     const base = `http://localhost:${port}`;
     return { site, base, cookie: await meldeAn(base, NUMMER, versand) };
   }
 
   /** Ctx für eine der gebooteten Sites — um einen Lauf am HTTP-Weg vorbei zu starten. */
   function ctxFuer(site: string): host.HostCtx {
-    return { repoRoot: site, siteDir: site, pageWhitelist: PAGES, auth: loadAuthFile(site), sitePrefix: "", ki: KI };
+    return {
+      repoRoot: entwurfPfad(site),
+      entwurfDir: entwurfPfad(site),
+      schwebendDir: schwebendPfad(site),
+      basis: "",
+      staging: false,
+      siteDir: site,
+      pageWhitelist: PAGES,
+      auth: loadAuthFile(site),
+      sitePrefix: "",
+      ki: KI,
+    };
   }
 
   test("ohne ki.json bleibt die Route 404, auch angemeldet", async () => {
@@ -711,10 +758,30 @@ describe("GET /edit/agent/events (echter Server)", () => {
     expect(namen).toContain("tokens");
     expect(namen.at(-1)).toBe("fertig");
 
-    const fertig = JSON.parse(rahmen.at(-1)!.data) as { zusammenfassung: string; dateien: string[]; commit: string };
+    const fertig = JSON.parse(rahmen.at(-1)!.data) as {
+      zusammenfassung: string;
+      dateien: string[];
+      commit: string | null;
+    };
     expect(fertig.dateien).toEqual(["leistungen.html"]);
-    expect(fertig.commit).toMatch(/^[0-9a-f]{7,40}$/);
-    expect(existsSync(join(site, "leistungen.html"))).toBe(true);
+
+    /**
+     * GEÄNDERT MIT „Eine Bearbeitung, zwei Modi" (Plan §2). Hier stand einmal
+     * `expect(fertig.commit).toMatch(/^[0-9a-f]{7,40}$/)` und daneben
+     * `existsSync(join(site, "leistungen.html"))` — also: der Lauf schreibt in
+     * die ausgelieferte Website und committet selbst.
+     *
+     * GENAU DAS IST DER FEHLER, um den es in diesem Umbau geht: Der erste
+     * Moment, in dem der Kunde das Ergebnis sieht, war der, in dem es schon
+     * öffentlich war. Ein Test, der den Commit verlangt, hielte diesen Zustand
+     * fest — und die Umsetzung müsste ihn beibehalten, um grün zu bleiben.
+     *
+     * Neu gilt: Der Lauf legt das geprüfte Ergebnis SCHWEBEND ab und rührt
+     * weder Site-Ordner noch Historie an. Commit gibt es erst beim Übernehmen.
+     */
+    expect(fertig.commit ?? null).toBeNull();
+    expect(schwebendDateien(site)).toEqual(["leistungen.html"]);
+    expect(existsSync(join(site, "leistungen.html"))).toBe(false);
   }, 40_000);
 
   test.skipIf(!haveBwrap())("ein Lauf ohne Änderung liefert dateien:[] und commit:null im Rahmen", async () => {
@@ -949,9 +1016,11 @@ describe("GET /edit/agent/events (echter Server)", () => {
       expect(danach.map((r) => r.event)).toContain("werkzeug");
       expect(danach.at(-1)!.event).toBe("fertig");
 
-      const fertig = JSON.parse(danach.at(-1)!.data) as { dateien: string[]; commit: string };
+      const fertig = JSON.parse(danach.at(-1)!.data) as { dateien: string[]; commit: string | null };
       expect(fertig.dateien).toEqual(["leistungen.html"]);
-      expect(fertig.commit).toMatch(/^[0-9a-f]{7,40}$/);
+      // Wie oben: der Lauf committet nicht mehr selbst (Plan §2). Nachgelesen
+      // wird dieselbe Zusammenfassung, nicht ein anderer Zustand.
+      expect(fertig.commit ?? null).toBeNull();
     }, 40_000);
 
     test("auch ein gescheiterter Lauf bleibt nachlesbar", async () => {
@@ -1027,4 +1096,25 @@ describe("GET /edit/agent/events (echter Server)", () => {
       brichAb(site);
     }, 40_000);
   });
+});
+
+// ===========================================================================
+// Ein übersprungener Test darf nicht wie ein bestandener aussehen
+// ===========================================================================
+describe("die Werkzeuge dieser Datei sind da", () => {
+  /**
+   * `test.skipIf` wertet beim EINSAMMELN aus, vor jedem `beforeAll`. In diesem
+   * Repo hat das schon vier Tests dauerhaft stillgelegt, die dabei grün
+   * meldeten — die teuerste Fehlerklasse, die CLAUDE.md kennt: ein Nachweis,
+   * der nicht anschlagen kann, beweist durch sein Ausbleiben nichts.
+   *
+   * Dieser Fall ist die Gegenmaßnahme und mit Absicht KEIN `skipIf`: Fehlt das
+   * Werkzeug, wird genau eine Zeile rot und nennt es beim Namen, statt dass
+   * eine Handvoll Prüfungen lautlos verschwindet. Wer hier bewusst ohne das
+   * Werkzeug arbeitet, sieht die eine rote Zeile und weiß, was ihm fehlt.
+   */
+  test("bwrap ist installiert — sonst läuft kein einziger echter Lauf", () => {
+    expect(`bwrap vorhanden: ${haveBwrap()}`).toBe("bwrap vorhanden: true");
+  });
+
 });

@@ -18,7 +18,17 @@ Du hast bereits eine fertige statische Website (HTML/CSS/Bilder in einem Ordner)
 1. deine bestehende Site **unverändert ausliefert** (`/`, `/ueber-uns.html`, Assets …) und
 2. auf **jeder** Seite unter `…/edit` einen WYSIWYG-Editor bereitstellt (nach Login).
 
-Bearbeitet werden **Text, Formatierung** (fett/kursiv/unterstrichen, Farbe, Links), **Bilder** (Austausch per Upload) und **Absätze/Zeilenumbrüche** – direkt auf der gerenderten Seite. Der Editor ändert nur die HTML-Dateien im Site-Ordner; du behältst volle Kontrolle. Eine Version je Speicherung via Git.
+Bearbeitet werden **Text, Formatierung** (fett/kursiv/unterstrichen, Farbe, Links), **Bilder** (Austausch per Upload) und **Absätze/Zeilenumbrüche** – direkt auf der gerenderten Seite.
+
+**Gespeichert ist nicht veröffentlicht.** Was im Editor gespeichert wird — von Hand oder vom KI-Assistenten —, landet zunächst in einem Entwurf. Die Besucher sehen weiter den zuletzt veröffentlichten Stand. Erst „Veröffentlichen" rollt den Entwurf in die ausgelieferte Website. Drei Zustände statt zwei:
+
+| Zustand | wo | wer sieht ihn |
+|---|---|---|
+| **Entwurf, ungespeichert** | im Browser (manuell) bzw. als offene Änderung des Assistenten | nur du |
+| **Gespeichert** | Entwurf auf dem Server, überlebt Tage und Neustarts | nur du |
+| **Veröffentlicht** | die ausgelieferte Website | deine Besucher |
+
+Eine Version je Speicherung via Git — im Entwurf, für die ganze Website.
 
 ## Voraussetzungen
 
@@ -168,9 +178,17 @@ Zwei Fallstricke, die früh auffallen sollen und deshalb schon beim Laden geprü
 
 Beim Start warnt der Server laut davor. Niemals in Produktion.
 
-## Versionen
+## Entwurf, Veröffentlichen, Versionen
 
-Jede Speicherung und jede Wiederherstellung ist ein Git-Commit im Site-Ordner. In der Editor-Leiste gibt es „Versionen" (Vorschau früherer Stände + Wiederherstellen).
+Der Editor arbeitet auf einem **Entwurf** (`<siteDir>/.regoro/entwurf/`, ein Git-Repo mit der ganzen Website). Was du unter `…/edit` siehst, ist dieser Entwurf; was deine Besucher sehen, ist der Site-Ordner daneben.
+
+- **Speichern** schreibt in den Entwurf und macht daraus einen Commit. Live geht dabei nichts.
+- **Der KI-Assistent** schreibt am Ende eines Auftrags nicht mehr direkt, sondern legt eine **offene Änderung** ab. Du siehst sie auf der Seite und entscheidest: übernehmen oder verwerfen. Sie überlebt einen Neustart und ist am nächsten Tag noch da; ein zweites Gerät sieht dieselbe.
+- **Es ist immer nur eine Bearbeitung offen.** Solange eine Änderung des Assistenten aussteht, nimmt der Editor weder ein Speichern noch einen neuen Auftrag an — erst übernehmen oder verwerfen.
+- **Veröffentlichen** rollt den Entwurf in den Site-Ordner: geänderte Dateien werden geschrieben, im Entwurf gelöschte auch dort entfernt. Alles, was seit dem letzten Mal zusammengekommen ist, geht in einem Vorgang live — auch gemischt manuelle und KI-Änderungen über mehrere Tage.
+- **Versionen** gelten für die **ganze Website**, nicht je Seite: Ein Commit ist eine gespeicherte Änderung und kann mehrere Seiten umfassen. Wiederherstellen setzt den ganzen Entwurf auf diesen Stand zurück — auch neu angelegte Dateien verschwinden dabei wirklich — und erzeugt dafür eine neue Version obendrauf. Die Historie wächst nur nach vorn.
+
+Wiederhergestellt und verworfen wird immer nur im **Entwurf**. Die Live-Seite ändert sich erst, wenn du wieder veröffentlichst.
 
 ## Produktion (TLS, öffentliche Domain)
 
@@ -434,13 +452,26 @@ gar keine Freischaltung.
 `regoro integration <site> --list` zeigt die eingerichteten Dienste, **ohne
 Schlüssel**.
 
-### Wichtig: ein Fabrik-Neubau überschreibt Kundenänderungen
+### Wichtig: wer schreiben darf
 
-Was der Kunde hier ändert, lebt **nur in seinem Site-Ordner**. Die
-Website-Pipeline kennt diese Commits nicht. Wird die Seite neu gebaut und
-ausgerollt, sind die Änderungen weg. Es gibt kein Zurückspielen in die Fabrik —
-wer eine Seite neu baut, muss die Kundenänderungen vorher aus dem Git-Repo des
-Site-Ordners übernehmen.
+> **Vor der Initialisierung gehört die Website der Fabrik, danach dem Entwurf.**
+
+Was der Kunde ändert, lebt im **Entwurfs-Repo** (`<siteDir>/.regoro/entwurf/`); der
+Site-Ordner ist ein Abzug davon. Ein Neubau, der direkt in den Site-Ordner
+ausrollt, wird beim nächsten Veröffentlichen überschrieben — und umgekehrt.
+Deshalb: Wer nach der Initialisierung neu baut, zieht das Entwurfs-Repo, baut
+darauf, committet und lädt hoch. Es gibt zu jedem Zeitpunkt genau einen Schreiber.
+
+Reihenfolge bei der Einrichtung deshalb **erst deployen, dann `regoro init`** — der
+Ausgangsstand entsteht auf der fertigen Website, es gibt nichts zusammenzuführen.
+
+Als Notbremse schreibt das Veröffentlichen die Prüfsummen der ausgerollten Dateien
+mit und vergleicht sie beim nächsten Mal. Hat jemand danebengeschrieben, bricht es
+ab und nennt die Dateien, statt sie zu überschreiben.
+
+Eine Website mit einem alten `<siteDir>/.git`, aber ohne Entwurfs-Repo, schaltet
+den Editor ab (`/edit*` → 404) und schreibt eine Erklärung ins Log. Die Website
+selbst läuft weiter.
 
 ## Editor wieder abschalten
 
@@ -448,9 +479,11 @@ Site-Ordners übernehmen.
 regoro disable            # im Site-Ordner
 ```
 
-Entfernt `.regoro/`. Die Website wird unverändert weiter ausgeliefert, alle `/edit*`-Routen antworten mit `404` (fail-closed). Umkehrbar mit `regoro init`.
+Entfernt, was **Zugang** gewährt: `auth.json` und `integrationen.json`. Die Website wird unverändert weiter ausgeliefert, alle `/edit*`-Routen antworten mit `404` (fail-closed). Umkehrbar mit `regoro init`.
 
-Die Versionshistorie (`.git`) bleibt dabei erhalten — **jede Speicherung im Editor ist ein Commit, und der Editor ist die einzige Quelle dieser Änderungen.** `regoro disable --purge` löscht `.git` mit, aber nur solange nichts anderes darin steht als der Baseline-Commit von `init`. Sobald es gespeicherte Bearbeitungen gibt, bricht `--purge` ab und rührt nichts an.
+**Kundenarbeit bleibt liegen** — der Entwurf mitsamt Versionshistorie, eine noch nicht übernommene Änderung des Assistenten, die Abrechnung. Abschalten ist keine Löschung: Wer den Zugang entzieht, will in aller Regel nicht die Arbeit von Wochen wegwerfen.
+
+`regoro disable --purge` löscht den Entwurf mit, aber nur solange nichts anderes darin steht als der Ausgangsstand von `init`. Sobald es gespeicherte Bearbeitungen gibt, bricht `--purge` ab und rührt nichts an. Lässt sich die Historie nicht lesen, bricht es ebenfalls ab — im Zweifel wird nicht gelöscht.
 
 ## Weitere CLI-Optionen
 
@@ -490,7 +523,9 @@ zum Abhängigkeitsbaum passt.
 - Nur Top-Level-`*.html` sind im **Text-Editor** editierbar (keine verschachtelten Pfade). Der KI-Agent kann neue Seiten anlegen, sie müssen dafür aber demselben Muster folgen.
 - Im Text-Editor kein Layout-/Strukturbau und keine neuen Seiten — das ist genau die Lücke, die die KI-Seitenleiste schließt.
 - Keine Benutzer-/Rollenverwaltung: jede Website hat ihre eigenen Kontaktwege in ihrem eigenen Ordner, und wer das Telefon oder das Postfach hat, hat den Zugang.
-- Keine Freigabe vor dem Livegang und keine Vorher-Nachher-Ansicht: Änderungen des Agenten gehen sofort live, die Versionsliste ist das Sicherheitsnetz.
+- Keine Vorher-Nachher-Ansicht nebeneinander: Du siehst den Entwurf, nicht beide Stände gleichzeitig. (Die Freigabe vor dem Livegang gibt es inzwischen — siehe „Entwurf, Veröffentlichen, Versionen".)
+- Kein Übernehmen einzelner Dateien aus einem Auftrag: Ein Lauf ist eine Einheit, ganz oder gar nicht.
+- **Kein `worker-src` in der CSP** — Service Worker wehrt der Validator ab, der Browser bekommt dafür keine zusätzliche Schranke. Grund: `worker-src` regelt Web Worker, SharedWorker und Service Worker **gemeinsam**, es gibt keine Direktive, die sie trennt. `'none'` wäre alles-oder-nichts, und für einen *Web* Worker lässt sich kein legitimer Grund ausschließen. `examples/site` beweist dafür nichts (vier Seiten, keine einzige `.js`-Datei), während echte Fabrik-Seiten nachgezählt 8–13 Inline-Skriptblöcke tragen — die Fixture ist nicht repräsentativ, und ein gebrochener Web Worker scheitert **still im Browser des Besuchers**. Ein Folgepunkt, kein Teil dieses Umbaus.
 - Der Agent erzeugt keine Bilder — vorhandene umsortieren kann er.
 - Kein Selbstbedienungs-Wechsel der Nummer — die hinterlegt der Betreiber. Sonst könnte sich jemand mit einer eigenen Nummer selbst eintragen.
 

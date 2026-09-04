@@ -2,10 +2,17 @@
  * regoro.de Inline-Editor — Browser-Overlay
  *
  * Plain, dependency-freies Browser-JS. Kein Bundler, kein Build.
- * Wird vom Editor-Host vor </body> eingebunden via <script src="/edit-assets/overlay.js">.
+ * Wird vom Editor-Host vor </body> eingebunden via
+ * <script src="{basis}/edit-assets/overlay.js"> — in Staging mit Präfix, siehe u().
  *
  * Erwartet (vom Server injiziert):
- *   - window.__REGORO_EDIT__ = { pagePath, fileHash, pages?:string[], page?:string, ki?:boolean }
+ *   - window.__REGORO_EDIT__ = { pagePath, fileHash, pages?:string[], page?:string, ki?:boolean,
+ *                                basis?:string, staging?:boolean, zustand?:Zustand }
+ *     basis   = "" (Produktion) | "/p/<slug>" (Staging). JEDER Pfad hier geht durch u().
+ *     staging = true -> es gibt kein Veröffentlichen-Ziel, der Knopf fehlt ersatzlos.
+ *     zustand = der Rumpf von GET /edit/zustand, damit die Leiste beim ersten Bild
+ *               stimmt, ohne auf eine Anfrage zu warten. Danach hält ladeZustand()
+ *               ihn nach; steht auf JEDER /edit-Antwort, auch ohne Modellzugang.
  *   - data-edit-idx="N" auf jedem editierbaren Text-Lauf (inline-<span>, auch der
  *     Text rund um Inline-Links — Mixed-Content). Format gilt für den GANZEN Lauf.
  *   - data-edit-img-idx="N" auf jedem austauschbaren <img> (Bild-Upload im Edit-Modus).
@@ -18,17 +25,31 @@
  *
  * HTTP-Contract (alle same-origin):
  *   POST /edit/save  { pagePath, fileHash, edits: Op[] }   -> 200 {ok,fileHash} | 409
+ *        409 hat ZWEI Bedeutungen, unterschieden an der Kennung im Rumpf:
+ *        `konflikt` (die Datei hat sich geändert) und `schwebende-aenderung`
+ *        (eine KI-Änderung liegt offen). Sie verlangen Gegenteiliges.
  *        Op = { idx, text?, bold?, italic?, underline?, link?, color? }  (Whole-Run; link/color=…|null)
  *           | { idx, start, end, bold?, italic?, underline?, color? }    (Range/Markierung, v4)
  *           | { idx, brAt }                                              (Enter -> <br> an Offset)
  *           | { op:"deleteBr", brIdx }                                   (<br> entfernen, Backspace)
  *           | { op:"delete", delIdx }                                    (Block löschen)
  *   POST /edit/upload          multipart: pagePath, imgIdx, image (Datei)
- *        -> 200 { ok:true, src, fileHash } | 400 { error } (committet serverseitig sofort)
- *   GET  /edit/versions?page=<basename>
- *        -> 200 [{ commit, date, subject }]
+ *        -> 200 { ok:true, src, fileHash } | 4xx { fehler, grund }
+ *   GET  /edit/versions        -> 200 [{ commit, date, subject }]
+ *        OHNE `page`: Eine Version umfasst die GANZE Website, nicht eine Seite.
  *   GET  /edit/version/<commit>?page=<basename>   (read-only HTML-Vorschau)
- *   POST /edit/restore         { commit, pagePath } -> 200 { ok:true }
+ *        MIT `page`: die Vorschau zeigt sehr wohl eine einzelne Seite.
+ *   POST /edit/restore         { commit } -> 200 { ok:true }
+ *        Setzt den GANZEN Baum zurück; hinzugekommene Dateien verschwinden dabei.
+ *
+ * Eine Bearbeitung, zwei Modi — der KI-Lauf schreibt NICHT mehr in die Website,
+ * sondern legt eine schwebende Änderung ab, die der Kunde übernimmt oder wegwirft:
+ *   POST /edit/uebernehmen     -> 200 { ok, commit, dateien } | 409 | 422
+ *   POST /edit/verwerfen       { umfang:"schwebend"|"entwurf" } -> 200 { ok:true }
+ *   POST /edit/veroeffentlichen-> 200 { ok, geschrieben, geloescht } | 409 | 403
+ *   GET  /edit/zustand         -> 200 { schwebend, schwebendSeit, unveroeffentlicht,
+ *                                       unveroeffentlichtAnzahl, unveroeffentlichtSeit, … }
+ * Fehlerform durchgehend { fehler:"<kennung>", grund:"<deutscher Satz>" }.
  *
  * KI-Seitenleiste (nur wenn CFG.ki === true; sonst existiert sie nicht im DOM):
  *   POST /edit/agent           { auftrag } -> 200 { ok:true, laufId } | 400/409/429/503 { ok:false, grund }
@@ -140,6 +161,47 @@
 
   // pageBasename = letztes Pfadsegment von pagePath (Contract: page-Query = Basename).
   var pageBasename = CFG.pagePath.split("/").pop() || CFG.pagePath;
+
+  /**
+   * DAS PRÄFIX GEHÖRT AN JEDEN EINZELNEN PFAD — ein vergessener ist ein
+   * stummer 404.
+   *
+   * In Produktion ist `basis` leer und `u()` gibt den Pfad unverändert zurück;
+   * in Staging liegt dieselbe Website unter `/p/<slug>/`, und ein absoluter
+   * `/edit/save` zeigt dann an ihr vorbei. Der Fehler meldet sich nicht: Der
+   * Editor sieht aus wie immer und tut nichts. Deshalb geht in dieser Datei
+   * KEIN Pfad mehr ohne u() hinaus — auch keiner, der heute nur in Produktion
+   * gebraucht wird.
+   *
+   * Der Contract sagt „nie mit Schrägstrich am Ende"; abgeschnitten wird er
+   * trotzdem. Ein doppelter Schrägstrich wäre wieder ein 404, und die eine
+   * Zeile ist billiger als die Suche danach.
+   */
+  var BASIS = (typeof CFG.basis === "string" ? CFG.basis : "").replace(/\/+$/, "");
+  function u(pfad) {
+    return BASIS + pfad;
+  }
+
+  /**
+   * Der zuletzt bekannte Zustand der Website: liegt eine KI-Änderung bereit,
+   * und wie viel ist noch nicht veröffentlicht?
+   *
+   * Kommt beim ersten Bild aus `CFG.zustand` (der Server hat ihn ohnehin
+   * gerade ermittelt) und wird danach von `ladeZustand()` nachgeführt. Ohne
+   * den mitgelieferten Anfangswert zeigte die Leiste nach jedem Seitenaufruf
+   * für einen Wimpernschlag „nichts offen" und spränge dann um — bei einer
+   * seit Tagen schwebenden Änderung genau die falsche erste Auskunft.
+   */
+  var zustand = (CFG.zustand && typeof CFG.zustand === "object") ? CFG.zustand : {};
+  /**
+   * Ob beim letzten `updateButtons()` etwas Ungespeichertes vorlag.
+   *
+   * `isDirty()` läuft über alle Läufe; bei jedem Tastendruck die ganze Leiste
+   * neu zu setzen wäre Arbeit für nichts. Gefragt ist nur der UMSCHLAG — von
+   * „nichts geändert" auf „geändert" und zurück —, denn nur dann ändern
+   * „Speichern", „Verwerfen" und „Veröffentlichen" ihr Aussehen.
+   */
+  var warDirty = false;
 
   // ---------------------------------------------------------------------------
   // Helpers
@@ -502,6 +564,43 @@
       "#__regoro-bar button.__regoro-btn:disabled{opacity:.45;cursor:not-allowed;}",
       "#__regoro-bar button.__regoro-primary{background:#e2571e;border-color:#e2571e;font-weight:600;}",
       "#__regoro-bar button.__regoro-primary:hover{background:#cf4d18;}",
+      /**
+       * ZWEI BEARBEITUNGSMODI DERSELBEN SACHE, NICHT ZWEI WERKZEUGE.
+       *
+       * „Manuell bearbeiten" und „KI-Assistent" sitzen in einer gemeinsamen
+       * Fassung und lesen sich damit als das, was sie sind: eine Wahl zwischen
+       * zwei Wegen zum selben Ziel. Vorher standen sie an entgegengesetzten
+       * Enden einer Reihe aus fünf gleich aussehenden Knöpfen, zwischen
+       * „Speichern" und „Versionen" — nichts daran sagte, dass die beiden
+       * zusammengehören und die anderen auf ihr Ergebnis wirken.
+       *
+       * Der aktive Modus ist AUSGEFÜLLT, nicht nur umrandet: Der Kunde muss
+       * auf einen Blick sehen können, ob die Seite gerade auf seine Klicks
+       * hört oder nicht.
+       */
+      "#__regoro-bar .__regoro-modusgruppe{display:inline-flex;gap:4px;padding:3px;",
+      "background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.18);",
+      "border-radius:9px;}",
+      "#__regoro-bar .__regoro-modusgruppe button.__regoro-btn{border-color:transparent;",
+      "background:transparent;}",
+      "#__regoro-bar .__regoro-modusgruppe button.__regoro-btn:hover:not(:disabled)",
+      "{background:rgba(255,255,255,.16);}",
+      "#__regoro-bar button.__regoro-modus-an{background:#fff;color:#14324f;font-weight:600;}",
+      "#__regoro-bar .__regoro-modusgruppe button.__regoro-modus-an{background:#fff;}",
+      "#__regoro-bar .__regoro-modusgruppe button.__regoro-modus-an:hover{background:#eef4f8;}",
+      /**
+       * DIE ZUSTANDSZEILE SAGT, WAS GILT — `status` SAGT, WAS GERADE GESCHAH.
+       *
+       * Beides in eine Zeile zu legen hieße, dass „Offene KI-Änderung, 12 Tage
+       * alt" von der nächsten Meldung („Gespeichert.") verdeckt wird. Ein
+       * Zustand, der beim ersten Klick verschwindet, ist keiner.
+       */
+      "#__regoro-bar .__regoro-zustand{font-size:13px;opacity:.95;white-space:nowrap;",
+      "display:none;align-items:center;gap:6px;}",
+      "#__regoro-bar .__regoro-zustand.__regoro-da{display:inline-flex;}",
+      "#__regoro-bar .__regoro-zustand.__regoro-offen{color:#ffd9a8;font-weight:600;}",
+      "#__regoro-bar .__regoro-zustand .__regoro-punkt{width:8px;height:8px;border-radius:50%;",
+      "background:currentColor;flex:0 0 auto;}",
       "#__regoro-bar .__regoro-status{font-size:13px;opacity:.95;min-height:1em;white-space:nowrap;}",
       "#__regoro-bar .__regoro-status.__regoro-err{color:#ffd0c2;font-weight:600;}",
       "#__regoro-bar .__regoro-status.__regoro-ok{color:#bff0cf;font-weight:600;}",
@@ -790,7 +889,45 @@
       "  body.__regoro-agent-offen #__regoro-bar{right:0;}",
       "  #__regoro-agent,#__regoro-versions{flex:1 1 auto;width:auto;max-width:none;",
       "  box-shadow:0 -4px 18px rgba(0,0,0,.28);}",
-      "}"
+      "}",
+
+      /**
+       * DAS ERSTE EIGENE MODAL DIESER DATEI — und der Grund, warum es eines
+       * braucht: `confirm()` kann nur „OK" und „Abbrechen".
+       *
+       * Alle Fälle hier haben ZWEI benannte Handlungen, zwischen denen der
+       * Kunde wählt („Übernehmen" gegen „Verwerfen", „Behalten" gegen
+       * „Verwerfen"). In ein confirm() gepresst hieße eine davon „Abbrechen"
+       * — und welche, müsste der Kunde aus dem Fließtext erraten. Bei einer
+       * Frage, deren eine Antwort Arbeit wegwirft, ist das nicht zumutbar.
+       *
+       * Es hängt am document.body, NICHT in #__regoro-shell: die Hülle ist
+       * eine Flex-Spalte, ein Kind darin würde zur Zeile zwischen Leiste und
+       * Panels statt über allem zu liegen.
+       */
+      "#__regoro-modal{position:fixed;inset:0;z-index:2147483610;",
+      "background:rgba(11,26,40,.55);display:flex;align-items:center;justify-content:center;",
+      "padding:20px;",
+      "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;}",
+      "#__regoro-modal *{box-sizing:border-box;}",
+      "#__regoro-modal .__regoro-modalbox{background:#fff;color:#16222e;border-radius:12px;",
+      "box-shadow:0 12px 40px rgba(0,0,0,.35);padding:20px 22px;width:480px;max-width:100%;",
+      "max-height:100%;overflow:auto;}",
+      "#__regoro-modal h2{margin:0 0 8px;font-size:16.5px;font-weight:700;}",
+      "#__regoro-modal p{margin:0 0 6px;font-size:14px;line-height:1.55;}",
+      "#__regoro-modal .__regoro-modalliste{margin:8px 0 0;padding-left:18px;font-size:13.5px;",
+      "line-height:1.5;}",
+      // Die Knöpfe brechen auf schmalen Fenstern um, statt sich zu zerdrücken;
+      // `flex-end` hält die Hauptantwort rechts, wo der Daumen sie erwartet.
+      "#__regoro-modal .__regoro-modalbtns{display:flex;gap:8px;flex-wrap:wrap;",
+      "justify-content:flex-end;margin-top:18px;}",
+      "#__regoro-modal button.__regoro-modalbtn{appearance:none;border:1px solid #cbd5dc;",
+      "background:#f5f8fa;color:#16222e;border-radius:8px;padding:8px 15px;font:inherit;",
+      "font-size:14px;cursor:pointer;line-height:1.2;}",
+      "#__regoro-modal button.__regoro-modalbtn:hover{background:#e8eef2;}",
+      "#__regoro-modal button.__regoro-modalprimaer{background:#e2571e;border-color:#e2571e;",
+      "color:#fff;font-weight:600;}",
+      "#__regoro-modal button.__regoro-modalprimaer:hover{background:#cf4d18;}"
     ].join("");
     var style = el("style", { id: "__regoro-style" });
     style.appendChild(document.createTextNode(css));
@@ -808,8 +945,11 @@
 
     var pageSwitcher = buildPageSwitcher(); // null wenn keine pages
 
-    ui.btnEdit = el("button", { class: "__regoro-btn", text: "Bearbeiten", type: "button" });
-    ui.btnSave = el("button", { class: "__regoro-btn __regoro-primary", text: "Speichern", type: "button" });
+    ui.btnEdit = el("button", {
+      class: "__regoro-btn", text: "Manuell bearbeiten", type: "button",
+      title: "Texte und Bilder dieser Seite von Hand ändern"
+    });
+    ui.btnSave = el("button", { class: "__regoro-btn", text: "Speichern", type: "button" });
     ui.btnDiscard = el("button", { class: "__regoro-btn", text: "Verwerfen", type: "button" });
     ui.btnVersions = el("button", { class: "__regoro-btn", text: "Versionen", type: "button" });
     // Nur wenn der Server einen Modellzugang hat. Ohne ihn antworten alle
@@ -818,21 +958,39 @@
     ui.btnAgent = CFG.ki === true
       ? el("button", { class: "__regoro-btn", type: "button", title: "Der Website in normalen Sätzen sagen, was sich ändern soll" }, ["KI-Assistent"])
       : null;
+    /**
+     * In Staging fehlt „Veröffentlichen" ERSATZLOS — kein grauer Knopf.
+     *
+     * Ein gesperrter Knopf sagt „geht gerade nicht"; hier gibt es aber gar
+     * kein Ziel, in das veröffentlicht würde, und daran ändert kein Warten
+     * etwas. Der Interessent soll nicht rätseln, was ihm fehlt.
+     */
+    ui.btnVeroeff = CFG.staging === true
+      ? null
+      : el("button", { class: "__regoro-btn", text: "Veröffentlichen", type: "button" });
 
     ui.status = el("span", { class: "__regoro-status" });
+    ui.zustandZeile = el("span", { class: "__regoro-zustand" });
     var spacer = el("span", { class: "__regoro-spacer" });
 
     var formatBar = buildFormatToolbar();
 
+    // Die beiden Bearbeitungsmodi in einer Fassung, der Rest daneben: was auf
+    // das ERGEBNIS wirkt (speichern, verwerfen, veröffentlichen), steht nicht
+    // zwischen den Wegen, die dorthin führen.
+    var modusgruppe = el("span", { class: "__regoro-modusgruppe" }, [ui.btnEdit]);
+    if (ui.btnAgent) modusgruppe.appendChild(ui.btnAgent);
+
     bar.appendChild(title);
     if (pageSwitcher) bar.appendChild(pageSwitcher);
-    bar.appendChild(ui.btnEdit);
+    bar.appendChild(modusgruppe);
     bar.appendChild(ui.btnSave);
     bar.appendChild(ui.btnDiscard);
+    if (ui.btnVeroeff) bar.appendChild(ui.btnVeroeff);
     bar.appendChild(ui.btnVersions);
-    if (ui.btnAgent) bar.appendChild(ui.btnAgent);
     bar.appendChild(formatBar);
     bar.appendChild(spacer);
+    bar.appendChild(ui.zustandZeile);
     bar.appendChild(ui.status);
 
     ui.btnEdit.addEventListener("click", toggleEditing);
@@ -840,6 +998,7 @@
     ui.btnDiscard.addEventListener("click", onDiscard);
     ui.btnVersions.addEventListener("click", onVersions);
     if (ui.btnAgent) ui.btnAgent.addEventListener("click", onAgent);
+    if (ui.btnVeroeff) ui.btnVeroeff.addEventListener("click", onVeroeffentlichen);
 
     var shell = el("div", { id: "__regoro-shell" });
     shell.appendChild(bar);
@@ -1506,8 +1665,8 @@
   // /edit (Root-Edit), jede andere Seite unter /<name>.html/edit. Der Basename
   // wird encodeURIComponent'et (defensiv; die Whitelist erlaubt nur [a-z0-9-]).
   function editUrlForPage(basename) {
-    if (basename === "index.html") return "/edit";
-    return "/" + encodeURIComponent(basename) + "/edit";
+    if (basename === "index.html") return u("/edit");
+    return u("/" + encodeURIComponent(basename) + "/edit");
   }
 
   function setStatus(msg, kind) {
@@ -1515,10 +1674,318 @@
     ui.status.textContent = msg || "";
   }
 
+  var TAG_MS = 24 * 60 * 60 * 1000;
+
+  /**
+   * Wie viele volle Tage liegt ein Zeitpunkt zurück? `null`, wenn unlesbar.
+   *
+   * Verstrichene Zeit, nicht Kalendertage: Für die Drei-Tage-Schwelle aus C8
+   * ist genau das gemeint („älter als drei Tage"), und eine Änderung von
+   * gestern 23:00 ist heute um 01:00 eben zwei Stunden alt und nicht „einen
+   * Tag". Bei einer Frist zählt die Dauer, nicht der Kalender.
+   */
+  function tageSeit(iso) {
+    if (!iso) return null;
+    var t = new Date(iso).getTime();
+    if (isNaN(t)) return null;
+    return Math.floor(Math.max(0, Date.now() - t) / TAG_MS);
+  }
+
+  /** „von heute" / „von gestern" / „12 Tage alt" — leer, wenn nichts bekannt. */
+  function alterText(iso) {
+    var d = tageSeit(iso);
+    if (d === null) return "";
+    if (d === 0) return "von heute";
+    if (d === 1) return "von gestern";
+    return d + " Tage alt";
+  }
+
+  /** Einen Modusknopf als aktiv markieren (ausgefüllt + für Screenreader). */
+  function setzeGedrueckt(btn, an) {
+    if (!btn) return;
+    btn.classList.toggle("__regoro-modus-an", !!an);
+    btn.setAttribute("aria-pressed", an ? "true" : "false");
+  }
+
+  /** Liegt eine vom Assistenten erzeugte, noch nicht übernommene Änderung vor? */
+  function offeneKiAenderung() {
+    return !!(zustand && zustand.schwebend);
+  }
+
+  /**
+   * Die ganze Leiste aus EINEM Zustand ableiten — nicht Knopf für Knopf an
+   * den Aufrufstellen.
+   *
+   * Es gibt zu jedem Zeitpunkt höchstens EINE offene Bearbeitung (Plan §3):
+   * entweder die manuelle im DOM oder die schwebende der KI. „Speichern" und
+   * „Verwerfen" wirken deshalb auf das, was gerade offen ist, und brauchen
+   * keine zwei Knopfpaare. Welcher der beiden Wege dahinter steht, entscheidet
+   * `onSave`/`onDiscard` — hier steht nur, OB etwas offen ist.
+   */
   function updateButtons() {
-    ui.btnEdit.textContent = editing ? "Bearbeiten beenden" : "Bearbeiten";
-    ui.btnSave.disabled = !editing;
-    ui.btnDiscard.disabled = !editing;
+    // `setAgentLaeuft` kann über `zeigeKontingent` sehr früh laufen; ohne
+    // Leiste gäbe es hier nichts zu setzen.
+    if (!ui.btnEdit) return;
+    var offeneKi = offeneKiAenderung();
+    var offenManuell = editing && isDirty();
+    var etwasOffen = offeneKi || offenManuell;
+    warDirty = offenManuell;
+
+    // Die Modusknöpfe: der aktive ist ausgefüllt. Während ein Lauf arbeitet,
+    // ist der manuelle Modus zu — er schriebe in eine Datei, die sich gerade
+    // unter ihm ändert.
+    setzeGedrueckt(ui.btnEdit, editing);
+    ui.btnEdit.disabled = agentLaeuft;
+    setzeGedrueckt(ui.btnAgent, !!agentPanel);
+
+    // „Gefüllt/fett, sobald etwas offen ist" — ein Knopf, der IMMER hervorsticht,
+    // sagt nichts. Genau darin liegt der Hinweis, dass etwas auf Antwort wartet.
+    ui.btnSave.disabled = agentLaeuft || !etwasOffen;
+    ui.btnSave.classList.toggle("__regoro-primary", etwasOffen);
+    ui.btnSave.title = offeneKi
+      ? "Die bereitliegende KI-Änderung übernehmen"
+      : "Die Änderungen an dieser Seite speichern";
+    // Verwerfen bleibt im Editiermodus auch ohne Änderung erreichbar: es ist
+    // dort zugleich der Weg aus dem Modus heraus.
+    ui.btnDiscard.disabled = agentLaeuft || !(offeneKi || editing);
+    ui.btnDiscard.title = offeneKi
+      ? "Die bereitliegende KI-Änderung wegwerfen"
+      : "Die Änderungen an dieser Seite wegwerfen";
+
+    if (ui.btnVeroeff) {
+      var anzahl = Number(zustand.unveroeffentlichtAnzahl) || 0;
+      ui.btnVeroeff.textContent = anzahl > 0
+        ? "Veröffentlichen (" + anzahl + ")"
+        : "Veröffentlichen";
+      // Jede Sperre nennt ihren Grund. Ein grauer Knopf ohne Erklärung ist der
+      // Punkt, an dem der Kunde anruft.
+      var hindernis = "";
+      if (agentLaeuft) hindernis = "Der Assistent arbeitet gerade.";
+      else if (offeneKi) hindernis = "Übernimm oder verwirf zuerst die bereitliegende KI-Änderung.";
+      else if (offenManuell) hindernis = "Speichere zuerst die Änderungen an dieser Seite.";
+      else if (!zustand.unveroeffentlicht) hindernis = "Es gibt nichts zu veröffentlichen — die Live-Seite ist auf dem neuesten Stand.";
+      else if (zustand.veroeffentlichenMoeglich === false) hindernis = "Veröffentlichen ist auf diesem Server nicht eingerichtet.";
+      ui.btnVeroeff.disabled = hindernis !== "";
+      ui.btnVeroeff.title = hindernis || (anzahl + " gespeicherte Änderung" +
+        (anzahl === 1 ? "" : "en") + " auf die Live-Seite übertragen");
+      ui.btnVeroeff.classList.toggle("__regoro-primary", !hindernis);
+    }
+
+    zeigeZustandszeile(offeneKi);
+  }
+
+  /**
+   * Was gerade GILT — dauerhaft, im Unterschied zu `setStatus`.
+   *
+   * Das Alter ist der eigentliche Inhalt: Eine Änderung, die seit zwölf Tagen
+   * schwebt, ist etwas anderes als eine von vorhin, und ohne die Zahl sieht
+   * beides gleich aus.
+   */
+  function zeigeZustandszeile(offeneKi) {
+    var zeile = ui.zustandZeile;
+    if (!zeile) return;
+    var text = "";
+    var offen = false;
+    if (agentLaeuft) {
+      text = "Der Assistent arbeitet …";
+    } else if (offeneKi) {
+      var alt = alterText(zustand.schwebendSeit);
+      text = "Offene KI-Änderung" + (alt ? ", " + alt : "");
+      offen = true;
+    } else if (ui.btnVeroeff && zustand.unveroeffentlicht) {
+      // In Staging gibt es keinen Veröffentlichen-Knopf und damit auch keine
+      // Live-Seite, zu der etwas „noch nicht" gehörte — dann schweigt die Zeile.
+      var n = Number(zustand.unveroeffentlichtAnzahl) || 0;
+      var seit = alterText(zustand.unveroeffentlichtSeit);
+      text = n === 1 ? "1 Änderung noch nicht auf der Live-Seite" :
+        (n > 0 ? n + " Änderungen noch nicht auf der Live-Seite" : "Nicht veröffentlichte Änderungen");
+      if (seit) text += ", " + seit;
+    }
+    zeile.textContent = "";
+    if (text) {
+      if (offen) zeile.appendChild(el("span", { class: "__regoro-punkt" }));
+      zeile.appendChild(document.createTextNode(text));
+    }
+    zeile.className = "__regoro-zustand" + (text ? " __regoro-da" : "") +
+      (offen ? " __regoro-offen" : "");
+  }
+
+  /**
+   * Den Zustand beim Server nachfragen — FAIL-SOFT.
+   *
+   * Fällt die Route aus (alter Server, 404, kaputtes JSON), bleibt der zuletzt
+   * bekannte Zustand stehen und die Leiste arbeitet weiter. Dieselbe Regel wie
+   * bei der Gesprächsliste: Was Komfort ist, darf nie im Arbeitsweg stehen.
+   */
+  function ladeZustand() {
+    return fetch(u("/edit/zustand"), {
+      credentials: "same-origin",
+      headers: { "Accept": "application/json" }
+    }).then(function (res) {
+      if (!res.ok) throw new Error("Zustand nicht abrufbar (" + res.status + ")");
+      return res.json();
+    }).then(function (z) {
+      if (z && typeof z === "object") {
+        zustand = z;
+        updateButtons();
+      }
+      return z;
+    }).catch(function () {
+      return null;
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Modal — das einzige eigene Fenster dieser Datei
+  //
+  // Warum nicht `confirm()`, wie an den elf anderen Stellen: Jede Frage hier
+  // hat ZWEI benannte Antworten, zwischen denen der Kunde wählt. Ein confirm()
+  // kennt nur „OK" und „Abbrechen" — eine der beiden Handlungen hieße dann
+  // „Abbrechen", und welche, müsste man dem Fließtext entnehmen. Bei einer
+  // Frage, deren eine Antwort Arbeit wegwirft, ist das nicht zumutbar.
+  // ---------------------------------------------------------------------------
+  var modalKnoten = null;
+  var modalAbbruch = null;
+
+  /**
+   * @param opts {titel, text (string|string[]), liste?:string[],
+   *              aktionen:[{text, primaer?, fn}], abbrechenText?:string|null}
+   * `abbrechenText: null` heißt: keine dritte Möglichkeit. Für C8 gewollt —
+   * dort MUSS der Kunde sich entscheiden, ein Weg daran vorbei liefe auf einen
+   * Auftrag hinaus, den er nicht beurteilen konnte.
+   */
+  function zeigeModal(opts) {
+    schliesseModal();
+    var box = el("div", { class: "__regoro-modalbox", role: "dialog", "aria-modal": "true" });
+    var titelId = "__regoro-modaltitel";
+    box.setAttribute("aria-labelledby", titelId);
+    box.appendChild(el("h2", { id: titelId, text: opts.titel }));
+    var absaetze = Array.isArray(opts.text) ? opts.text : [opts.text];
+    absaetze.forEach(function (t) {
+      if (t) box.appendChild(el("p", { text: t }));
+    });
+    if (opts.liste && opts.liste.length) {
+      var ul = el("ul", { class: "__regoro-modalliste" });
+      opts.liste.forEach(function (z) { ul.appendChild(el("li", { text: String(z) })); });
+      box.appendChild(ul);
+    }
+
+    var reihe = el("div", { class: "__regoro-modalbtns" });
+    var abbrechenText = opts.abbrechenText === undefined ? "Abbrechen" : opts.abbrechenText;
+    if (abbrechenText) {
+      var abbr = el("button", { class: "__regoro-modalbtn", type: "button", text: abbrechenText });
+      abbr.addEventListener("click", function () { schliesseModal(); });
+      reihe.appendChild(abbr);
+    }
+    var ersterKnopf = null;
+    (opts.aktionen || []).forEach(function (a) {
+      var b = el("button", {
+        class: "__regoro-modalbtn" + (a.primaer ? " __regoro-modalprimaer" : ""),
+        type: "button", text: a.text
+      });
+      b.addEventListener("click", function () {
+        schliesseModal();
+        if (typeof a.fn === "function") a.fn();
+      });
+      reihe.appendChild(b);
+      if (!ersterKnopf || a.primaer) ersterKnopf = b;
+    });
+    box.appendChild(reihe);
+
+    var grund = el("div", { id: "__regoro-modal" }, [box]);
+    // Klick NEBEN die Box = Abbruch; ein Klick IN die Box darf nicht schließen.
+    grund.addEventListener("click", function (e) {
+      if (e.target === grund && abbrechenText !== null) schliesseModal();
+    });
+    document.body.appendChild(grund);
+    modalKnoten = grund;
+    modalAbbruch = abbrechenText === null ? null : schliesseModal;
+    document.addEventListener("keydown", onModalKeydown, true);
+    if (ersterKnopf && typeof ersterKnopf.focus === "function") ersterKnopf.focus();
+  }
+
+  function onModalKeydown(e) {
+    if (e.key === "Escape" && modalAbbruch) {
+      e.preventDefault();
+      schliesseModal();
+    }
+  }
+
+  function schliesseModal() {
+    document.removeEventListener("keydown", onModalKeydown, true);
+    if (modalKnoten && modalKnoten.parentNode) modalKnoten.parentNode.removeChild(modalKnoten);
+    modalKnoten = null;
+    modalAbbruch = null;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Fehler des Servers in Sätze übersetzen
+  //
+  // Die Zuordnung nach `fehler` steht HIER und nicht im Server, obwohl der ein
+  // `grund` mitschickt: Deutsche Oberflächentexte gehören in die Oberfläche,
+  // und mehrere dieser Meldungen brauchen ohnehin die Dateiliste aus derselben
+  // Antwort — die ließe sich aus einem fertigen Satz nicht mehr einbauen.
+  //
+  // `grund` ist der RÜCKFALL für Kennungen, die diese Datei nicht kennt. So
+  // wird eine später hinzugefügte Fehlerart zu einem lesbaren Satz statt zu
+  // einer nackten Kennung. Nie steht am Ende eine Zahl allein da: „409" ist
+  // für den Kunden dasselbe wie gar keine Auskunft.
+  // ---------------------------------------------------------------------------
+  var FEHLERTEXTE = {
+    "konflikt":
+      "Diese Seite wurde zwischenzeitlich an anderer Stelle geändert — auf einem anderen " +
+      "Gerät oder in einem zweiten Fenster.",
+    // Bild-Upload. Die ersten beiden kann nur ein Fehler im Editor auslösen —
+    // sie stehen trotzdem hier, weil ein Kunde, der sie zu sehen bekommt, sonst
+    // eine Kennung läse.
+    "pfad": "Diese Seite lässt sich nicht bearbeiten.",
+    "formular": "Die Anfrage war unvollständig. Bitte lade die Seite neu und versuch es erneut.",
+    "keine-datei": "Es wurde keine Datei ausgewählt.",
+    "zu-gross": "Das Bild ist zu groß. Bis 5 MB sind möglich.",
+    "dateityp": "Dieses Dateiformat geht nicht. Möglich sind PNG, JPG, WebP und GIF.",
+    "bild-index": "Dieses Bild gibt es auf der Seite nicht mehr. Bitte lade die Seite neu.",
+    "bild-nicht-ersetzt":
+      "Das Bild ließ sich auf der Seite nicht austauschen. Bitte lade die Seite neu " +
+      "und versuch es erneut.",
+    "wiederherstellen":
+      "Diese Version ließ sich nicht wiederherstellen. An der Website hat sich " +
+      "nichts geändert.",
+    "schwebende-aenderung":
+      "Es liegt eine Änderung des KI-Assistenten bereit, die noch nicht übernommen ist. " +
+      "Solange sie offen ist, geht nichts anderes.",
+    "keine-schwebende-aenderung":
+      "Es liegt keine KI-Änderung mehr bereit. Vielleicht wurde sie auf einem anderen " +
+      "Gerät schon übernommen oder verworfen.",
+    "fremd-geaendert":
+      "Die Seiten haben sich geändert, seit der Assistent gearbeitet hat. Seine Änderung " +
+      "passt nicht mehr darauf und wurde deshalb nicht übernommen.",
+    "validierung":
+      "Die Änderung des Assistenten hat die Prüfung nicht bestanden und wurde nicht " +
+      "übernommen. Die Website ist unverändert.",
+    "fremd-geschrieben":
+      "Jemand hat direkt an den Dateien der Website gearbeitet, außerhalb des Editors. " +
+      "Damit nichts von dieser Arbeit verlorengeht, wurde nichts überschrieben.",
+    "staging":
+      "Das hier ist eine Vorschau-Website. Es gibt keine Live-Seite, auf die " +
+      "veröffentlicht werden könnte.",
+    "umfang":
+      "Der Editor hat eine unverständliche Anfrage gestellt. Bitte lade die Seite neu."
+  };
+
+  /** Der Satz zu einer Serverantwort — nie eine nackte Zahl. */
+  function fehlerSatz(body, status, ersatz) {
+    var kennung = body && typeof body.fehler === "string" ? body.fehler : "";
+    if (kennung && FEHLERTEXTE[kennung]) return FEHLERTEXTE[kennung];
+    if (body && typeof body.grund === "string" && body.grund) return body.grund;
+    return (ersatz || "Das hat nicht geklappt.") +
+      (status ? " (Fehler " + status + ")" : "");
+  }
+
+  /** Antwort samt (womöglich fehlendem) JSON-Rumpf einsammeln. */
+  function mitRumpf(res) {
+    return res.json().catch(function () { return null; }).then(function (body) {
+      return { status: res.status, ok: res.ok, body: body };
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -1684,6 +2151,11 @@
   }
   function onInput(e) {
     reflectDirty(e.target);
+    // Nur beim UMSCHLAG die Leiste neu setzen. `isDirty()` läuft über alle
+    // Läufe; das bei jedem Tastendruck zu tun wäre Arbeit für nichts — aber
+    // ganz zu unterlassen hieße, dass „Speichern" erst beim nächsten Klick
+    // irgendwohin aufwacht.
+    if (isDirty() !== warDirty) updateButtons();
   }
   // Fokus auf einen Lauf -> aktiven Lauf merken + Format-Toolbar spiegeln.
   function onRunFocus(e) {
@@ -1767,6 +2239,18 @@
     updateFormatToolbar();
   }
 
+  /**
+   * Der Wechsel in den manuellen Modus — und die Rückfrage davor.
+   *
+   * Es darf immer nur EINE Bearbeitung offen sein. Liegt eine KI-Änderung
+   * bereit, ist von Hand zu tippen kein zweiter Weg, sondern ein Konflikt: Der
+   * Server nähme das Speichern mit `409 schwebende-aenderung` ohnehin nicht an,
+   * und der Kunde hätte seine Arbeit dann umsonst gemacht. Also VORHER fragen,
+   * nicht hinterher ablehnen.
+   *
+   * Ein Klick auf den bereits gedrückten Knopf verlässt den Modus wieder — die
+   * Beschriftung „Bearbeiten beenden" ist weggefallen, der Ausweg nicht.
+   */
   function toggleEditing() {
     if (editing) {
       // Beim Verlassen des Editier-Modus ungespeicherte Änderungen abfragen.
@@ -1777,10 +2261,88 @@
       if (isDirty()) resetToOriginal();
       setEditing(false);
       setStatus("");
-    } else {
-      setEditing(true);
-      setStatus("Klick in einen Text, um ihn zu ändern.");
+      return;
     }
+    if (offeneKiAenderung()) {
+      frageWegenOffenerKiAenderung();
+      return;
+    }
+    setEditing(true);
+    setStatus("Klick in einen Text, um ihn zu ändern.");
+  }
+
+  /**
+   * Die Rückfrage bei offener KI-Änderung — in beide Richtungen dieselbe.
+   *
+   * BEWUSST OHNE FORTSETZUNG: Beide Antworten laden die Seite neu, weil die
+   * Editor-Ansicht bis dahin die schwebende Fassung als Auflage zeigt. Ein
+   * „und mach dann weiter, was du vorhattest" könnte hier gar nicht mehr
+   * laufen — es sähe nur so aus, als täte es das.
+   */
+  function frageWegenOffenerKiAenderung() {
+    var alt = alterText(zustand.schwebendSeit);
+    zeigeModal({
+      titel: "Es liegt eine KI-Änderung bereit",
+      text: [
+        "Der Assistent hat eine Änderung vorbereitet" + (alt ? " (" + alt + ")" : "") +
+          ", die noch nicht übernommen ist. Es kann immer nur eine Bearbeitung offen sein.",
+        "Möchtest du sie übernehmen oder wegwerfen?"
+      ],
+      liste: Array.isArray(zustand.schwebendDateien) ? zustand.schwebendDateien : null,
+      aktionen: [
+        { text: "Verwerfen", fn: function () { verwirfSchwebend(); } },
+        { text: "Übernehmen", primaer: true, fn: function () { uebernehmeSchwebend(); } }
+      ]
+    });
+  }
+
+  /**
+   * Die Gegenrichtung: ungespeicherte Handarbeit, bevor der Assistent loslegt.
+   *
+   * Der Agent arbeitet auf der Datei auf dem Server, nicht auf diesem DOM.
+   * Liefe er los, schriebe er die Datei neu — und was hier im Browser steht,
+   * wäre beim nächsten Laden spurlos weg. Früher lehnte die Leiste hier nur ab
+   * („Speichere sie zuerst"); das war richtig, ließ den Kunden aber mit der
+   * Arbeit allein. Jetzt bietet sie beide Auswege an.
+   */
+  function frageWegenHandarbeit(danach) {
+    zeigeModal({
+      titel: "Ungespeicherte Änderungen an dieser Seite",
+      text: [
+        "An dieser Seite gibt es Änderungen, die noch nicht gespeichert sind.",
+        "Der Assistent arbeitet an der Datei auf dem Server und würde sie überschreiben — " +
+          "die Änderungen hier im Browser wären dann verloren."
+      ],
+      aktionen: [
+        {
+          text: "Änderungen verwerfen",
+          fn: function () {
+            var hatteBrLoeschung = deleteBrOps.length > 0;
+            resetToOriginal();
+            setEditing(false);
+            // Ein per Backspace entferntes gespeichertes <br> lässt sich aus dem
+            // DOM nicht zurückholen (siehe onDiscard) — dann hilft nur neu laden,
+            // und der Auftrag muss den Reload überleben.
+            if (hatteBrLoeschung) { setStatus("Verworfen. Seite wird neu geladen…", "ok"); forceReload(); return; }
+            setStatus("Verworfen.", "ok");
+            if (typeof danach === "function") danach();
+          }
+        },
+        {
+          text: "Erst speichern", primaer: true,
+          fn: function () {
+            // Bewusst NICHT automatisch weiter: Ein Speichern lädt je nach
+            // Änderung die Seite neu, und ein Auftrag, der irgendwann von
+            // selbst losliefe, wäre für den Kunden nicht vorhersehbar.
+            if (agentPanel && (ui.agent.eingabe.value || "").trim()) {
+              setAgentHinweis("Die Änderungen werden gespeichert. Danach noch einmal auf " +
+                "„Senden“ klicken.");
+            }
+            onSave();
+          }
+        }
+      ]
+    });
   }
 
   function resetToOriginal() {
@@ -1927,7 +2489,7 @@
     fd.append("image", file);
 
     // WICHTIG: keinen Content-Type setzen — der Browser setzt die multipart-Boundary.
-    fetch("/edit/upload", {
+    fetch(u("/edit/upload"), {
       method: "POST",
       credentials: "same-origin",
       body: fd
@@ -1936,16 +2498,31 @@
         return { status: res.status, ok: res.ok, data: data };
       });
     }).then(function (r) {
-      if (r.status === 400) {
-        var msg = (r.data && r.data.error) ? r.data.error
-          : "Nur PNG/JPG/WebP/GIF bis 5 MB.";
-        throw new Error(msg);
+      // Ein Bildaustausch ist ein Speichern in Verkleidung und fällt deshalb
+      // unter denselben Riegel: Solange eine KI-Änderung offen ist, geht er nicht.
+      if (r.status === 409) {
+        ladeZustand().then(function () {
+          if (offeneKiAenderung()) frageWegenOffenerKiAenderung();
+        });
+        throw new Error(fehlerSatz(r.data, r.status, "Das Bild konnte nicht ersetzt werden."));
       }
+      // Das Feld hieß bis zur Vereinheitlichung der Fehlerform `error` und
+      // trug einen deutschen Satz. Jetzt ist es `{fehler, grund}` — läse hier
+      // weiter `r.data.error`, bekäme JEDER Fehlschlag den Rückfalltext „Nur
+      // PNG/JPG/WebP/GIF bis 5 MB.", auch ein zu großes Bild oder ein Bild, das
+      // es auf der Seite nicht mehr gibt. Eine Meldung, die immer dasselbe sagt,
+      // ist schlimmer als keine: Sie schickt den Kunden auf die falsche Suche.
       if (!r.ok || !r.data || !r.data.ok || typeof r.data.src !== "string") {
-        throw new Error("Bild-Upload fehlgeschlagen (" + r.status + ").");
+        throw new Error(fehlerSatz(r.data, r.status, "Das Bild konnte nicht ersetzt werden."));
       }
       // Neues Bild sofort laden. Der Server liefert pro Upload einen neuen Pfad
       // (upload-xxx.<ext>), daher kein Cache-Busting nötig.
+      //
+      // `src` wird UNVERÄNDERT übernommen, auch unter einem Präfix: Seit C11
+      // liegt die Entwurfs-Sicht unter `{basis}/edit-vorschau/…`, und welcher
+      // Pfad das im Einzelnen ist, weiß der Server. Schriebe der Browser hier
+      // selbst einen Präfix davor, hätte dieselbe Konvention zwei Quellen —
+      // und die zweite veraltet.
       rec.img.addEventListener("load", function reposOnce() {
         rec.img.removeEventListener("load", reposOnce);
         if (editing) positionImageBadges();
@@ -2068,7 +2645,27 @@
   // ---------------------------------------------------------------------------
   // Verwerfen
   // ---------------------------------------------------------------------------
+  /**
+   * „Verwerfen" wirft weg, was gerade offen ist — die schwebende KI-Änderung
+   * hat dabei Vorrang. Sie ist die haltbarere der beiden (sie liegt auf dem
+   * Server und überlebt Tage), und solange sie da ist, kommt der manuelle
+   * Modus ohnehin nicht in Gang.
+   */
   function onDiscard() {
+    if (offeneKiAenderung()) {
+      var alt = alterText(zustand.schwebendSeit);
+      zeigeModal({
+        titel: "Die KI-Änderung wegwerfen?",
+        text: [
+          "Die vorbereitete Änderung" + (alt ? " (" + alt + ")" : "") +
+            " wird vollständig verworfen — auch neu angelegte Dateien verschwinden dabei.",
+          "An der Website ändert sich dadurch nichts; sie bleibt so, wie sie jetzt ist."
+        ],
+        liste: Array.isArray(zustand.schwebendDateien) ? zustand.schwebendDateien : null,
+        aktionen: [{ text: "Endgültig verwerfen", primaer: true, fn: function () { verwirfSchwebend(); } }]
+      });
+      return;
+    }
     if (!editing) return;
     if (isDirty() && !window.confirm("Alle ungespeicherten Änderungen verwerfen?")) return;
     // Ein per Backspace optisch entferntes gespeichertes <br> sitzt zwischen den
@@ -2082,9 +2679,176 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Die schwebende KI-Änderung: übernehmen, verwerfen — und veröffentlichen
+  //
+  // Der Agent schreibt seit diesem Umbau NICHT mehr in die Website. Sein
+  // Ergebnis liegt bereit, bis der Kunde es angesehen und entschieden hat.
+  // Das ist der ganze Zweck des Plans: erst ansehen, dann übernehmen.
+  // ---------------------------------------------------------------------------
+
+  /** Läuft gerade eine dieser Anfragen? Verhindert Doppelklicks. */
+  var zustandsAktionLaeuft = false;
+
+  function zustandsAktion(pfad, rumpf) {
+    return fetch(u(pfad), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify(rumpf || {})
+    }).then(mitRumpf);
+  }
+
+  function uebernehmeSchwebend() {
+    if (zustandsAktionLaeuft) return;
+    zustandsAktionLaeuft = true;
+    setStatus("Änderung wird übernommen…");
+    updateButtons();
+    zustandsAktion("/edit/uebernehmen").then(function (r) {
+      zustandsAktionLaeuft = false;
+      if (r.ok && r.body && r.body.ok) {
+        // Neu laden: Die Seite zeigt bis hierher die schwebende Fassung als
+        // Auflage; erst nach dem Übernehmen ist sie Teil des Entwurfs.
+        setStatus("Übernommen. Seite wird neu geladen…", "ok");
+        forceReload();
+        return;
+      }
+      // 422 nennt Datei UND Grund — beides gehört auf den Tisch, sonst weiß der
+      // Kunde nur, dass „etwas" nicht ging.
+      var liste = null;
+      if (r.body && Array.isArray(r.body.dateien)) {
+        liste = r.body.dateien.map(function (d) {
+          if (d && typeof d === "object") {
+            return String(d.pfad || "") + (d.grund ? ": " + d.grund : "");
+          }
+          return String(d);
+        });
+      }
+      zeigeModal({
+        titel: "Die Änderung wurde nicht übernommen",
+        text: fehlerSatz(r.body, r.status, "Die Änderung konnte nicht übernommen werden."),
+        liste: liste,
+        aktionen: [{ text: "Seite neu laden", primaer: true, fn: forceReload }],
+        abbrechenText: "Schließen"
+      });
+      ladeZustand();
+    }).catch(function () {
+      zustandsAktionLaeuft = false;
+      setStatus("Die Änderung konnte nicht übernommen werden.", "err");
+      updateButtons();
+    });
+  }
+
+  function verwirfSchwebend() {
+    if (zustandsAktionLaeuft) return;
+    zustandsAktionLaeuft = true;
+    setStatus("Änderung wird verworfen…");
+    updateButtons();
+    zustandsAktion("/edit/verwerfen", { umfang: "schwebend" }).then(function (r) {
+      zustandsAktionLaeuft = false;
+      if (r.ok && r.body && r.body.ok) {
+        // Auch hier neu laden: Die Auflage ist weg, die Seite zeigt sonst
+        // weiter etwas, das es nicht mehr gibt.
+        setStatus("Verworfen. Seite wird neu geladen…", "ok");
+        forceReload();
+        return;
+      }
+      setStatus(fehlerSatz(r.body, r.status, "Die Änderung konnte nicht verworfen werden."), "err");
+      ladeZustand();
+    }).catch(function () {
+      zustandsAktionLaeuft = false;
+      setStatus("Die Änderung konnte nicht verworfen werden.", "err");
+      updateButtons();
+    });
+  }
+
+  /**
+   * Den Entwurf auf den veröffentlichten Stand zurücksetzen (C8).
+   *
+   * Nur aus dem Drei-Tage-Hinweis heraus erreichbar, und mit Absicht ohne
+   * eigenen Knopf in der Leiste: „Alles seit der letzten Veröffentlichung
+   * wegwerfen" ist nichts, was man versehentlich anklicken dürfen soll.
+   */
+  function verwirfEntwurf(danach) {
+    if (zustandsAktionLaeuft) return;
+    zustandsAktionLaeuft = true;
+    setStatus("Änderungen werden zurückgesetzt…");
+    zustandsAktion("/edit/verwerfen", { umfang: "entwurf" }).then(function (r) {
+      zustandsAktionLaeuft = false;
+      if (r.ok && r.body && r.body.ok) {
+        if (typeof danach === "function") danach();
+        return;
+      }
+      setStatus(fehlerSatz(r.body, r.status, "Die Änderungen konnten nicht zurückgesetzt werden."), "err");
+      ladeZustand();
+    }).catch(function () {
+      zustandsAktionLaeuft = false;
+      setStatus("Die Änderungen konnten nicht zurückgesetzt werden.", "err");
+    });
+  }
+
+  function onVeroeffentlichen() {
+    if (!ui.btnVeroeff || ui.btnVeroeff.disabled || zustandsAktionLaeuft) return;
+    var anzahl = Number(zustand.unveroeffentlichtAnzahl) || 0;
+    var seit = alterText(zustand.unveroeffentlichtSeit);
+    zeigeModal({
+      titel: "Auf die Live-Seite übertragen?",
+      text: [
+        (anzahl === 1 ? "Eine gespeicherte Änderung" : anzahl + " gespeicherte Änderungen") +
+          (seit ? " (die älteste " + seit + ")" : "") +
+          " werden auf die öffentliche Website übertragen.",
+        "Ab dann sehen Besucher den aktuellen Stand."
+      ],
+      aktionen: [{
+        text: "Jetzt veröffentlichen", primaer: true,
+        fn: function () {
+          zustandsAktionLaeuft = true;
+          setStatus("Wird veröffentlicht…");
+          updateButtons();
+          zustandsAktion("/edit/veroeffentlichen").then(function (r) {
+            zustandsAktionLaeuft = false;
+            if (r.ok && r.body && r.body.ok) {
+              var g = Number(r.body.geschrieben) || 0;
+              var w = Number(r.body.geloescht) || 0;
+              setStatus("Veröffentlicht — " + g + " Datei" + (g === 1 ? "" : "en") +
+                " übertragen" + (w > 0 ? ", " + w + " entfernt" : "") + ".", "ok");
+              ladeZustand();
+              return;
+            }
+            // Die Notbremse ist der wichtigste Fall: Der Kunde muss erfahren,
+            // dass jemand ANDERS an den Dateien war — nicht, dass „409" war.
+            zeigeModal({
+              titel: "Es wurde nichts veröffentlicht",
+              text: fehlerSatz(r.body, r.status, "Veröffentlichen hat nicht geklappt."),
+              liste: (r.body && Array.isArray(r.body.dateien)) ? r.body.dateien : null,
+              aktionen: [],
+              abbrechenText: "Schließen"
+            });
+            ladeZustand();
+          }).catch(function () {
+            zustandsAktionLaeuft = false;
+            setStatus("Veröffentlichen hat nicht geklappt.", "err");
+            updateButtons();
+          });
+        }
+      }]
+    });
+  }
+
+  // ---------------------------------------------------------------------------
   // Speichern
   // ---------------------------------------------------------------------------
+  /**
+   * EIN Knopf, zwei Mechanismen — und das ist der Titel des Plans.
+   *
+   * Für den Kunden ist „Speichern" eine Sache: das, was offen ist, festhalten.
+   * Ob dahinter ein Satz Text-Ops an `/edit/save` geht oder ein Übernehmen der
+   * schwebenden KI-Änderung, ist die Frage des Editors, nicht seine.
+   */
   function onSave() {
+    if (offeneKiAenderung()) {
+      uebernehmeSchwebend();
+      return;
+    }
     if (!editing) return;
     var edits = collectOps();
     var dropped = lastCollectDropped; // veraltete Fallback-Range-Ops (fast nie > 0)
@@ -2105,7 +2869,7 @@
     ui.btnSave.disabled = true;
     setStatus("Speichern…");
 
-    fetch("/edit/save", {
+    fetch(u("/edit/save"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       credentials: "same-origin",
@@ -2115,9 +2879,27 @@
         edits: edits
       })
     }).then(function (res) {
+      // 409 HAT SEIT DIESEM UMBAU ZWEI BEDEUTUNGEN, und sie erfordern
+      // entgegengesetztes Handeln: Beim fileHash-Konflikt hilft nur Neuladen,
+      // bei einer offenen KI-Änderung muss der Kunde erst über SIE entscheiden.
+      // Unterschieden wird an der Kennung im Rumpf (`konflikt` gegen
+      // `schwebende-aenderung`) — nicht am Fehlen eines Feldes, das wäre die
+      // Prüfung, die nichts misst.
       if (res.status === 409) {
-        handleConflict();
-        return null;
+        return mitRumpf(res).then(function (r) {
+          if (r.body && r.body.fehler === "schwebende-aenderung") {
+            ui.btnSave.disabled = false;
+            setStatus(FEHLERTEXTE["schwebende-aenderung"], "err");
+            // Den Zustand nachziehen: Die Leiste wusste offenbar noch nichts
+            // davon, sonst wäre es gar nicht so weit gekommen.
+            ladeZustand().then(function () {
+              if (offeneKiAenderung()) frageWegenOffenerKiAenderung();
+            });
+            return null;
+          }
+          handleConflict();
+          return null;
+        });
       }
       if (!res.ok) {
         return res.text().then(function (t) {
@@ -2160,9 +2942,14 @@
       deleteBrOps = [];
       setEditing(false);
       setStatus("Gespeichert.", "ok");
+      // Der Zustand hat sich geändert: ein Commit mehr, der noch nicht
+      // veröffentlicht ist. Ohne das bliebe „Veröffentlichen (3)" stehen,
+      // obwohl es vier sind.
+      ladeZustand();
     }).catch(function (err) {
       ui.btnSave.disabled = false;
       setStatus(err && err.message ? err.message : "Speichern fehlgeschlagen.", "err");
+      updateButtons();
     });
   }
 
@@ -2208,7 +2995,7 @@
     var panel = el("div", { id: "__regoro-versions" });
 
     var head = el("div", { class: "__regoro-vhead" }, [
-      el("h2", { text: "Versionen" })
+      el("h2", { text: "Versionen der Website" })
     ]);
     var closeBtn = el("button", { class: "__regoro-vclose", text: "×", type: "button", "aria-label": "Schließen" });
     closeBtn.addEventListener("click", closeVersions);
@@ -2224,7 +3011,11 @@
     (unten() || document.body).appendChild(panel);
     versionsPanel = panel;
 
-    fetch("/edit/versions?page=" + encodeURIComponent(pageBasename), {
+    // OHNE `?page=`: Eine Version umfasst seit dem Umbau die GANZE Website
+    // (Plan §1). Den Parameter weiter mitzuschicken, obwohl der Server ihn
+    // nicht mehr auswertet, ließe den nächsten Leser eine Seitenbezogenheit
+    // vermuten, die es nicht mehr gibt.
+    fetch(u("/edit/versions"), {
       credentials: "same-origin",
       headers: { "Accept": "application/json" }
     }).then(function (res) {
@@ -2258,7 +3049,7 @@
       var actions = el("div", { class: "__regoro-vactions" });
       var preview = el("button", { class: "__regoro-vbtn", text: "Vorschau", type: "button" });
       preview.addEventListener("click", function () { onPreview(v.commit); });
-      var restore = el("button", { class: "__regoro-vbtn __regoro-vrestore", text: "Diese Version speichern", type: "button" });
+      var restore = el("button", { class: "__regoro-vbtn __regoro-vrestore", text: "Auf diesen Stand zurück", type: "button" });
       restore.addEventListener("click", function () { onRestore(v.commit, v.subject); });
 
       actions.appendChild(preview);
@@ -2288,40 +3079,77 @@
       "(Die Vorschau öffnet in einem neuen Tab und ist nur zur Ansicht.)")) {
       return;
     }
-    var url = "/edit/version/" + encodeURIComponent(commit) +
-      "?page=" + encodeURIComponent(pageBasename);
+    var url = u("/edit/version/" + encodeURIComponent(commit) +
+      "?page=" + encodeURIComponent(pageBasename));
     window.open(url, "_blank", "noopener");
   }
 
+  /**
+   * DIESE RÜCKFRAGE MUSS SAGEN, DASS ES UM DIE GANZE WEBSITE GEHT.
+   *
+   * Seit dem Umbau umfasst eine Version den ganzen Baum, und das
+   * Wiederherstellen läuft über `read-tree` — Dateien, die seither
+   * hinzugekommen sind, VERSCHWINDEN dabei. Genau darum wurde es so gebaut:
+   * Ein KI-Lauf, der drei Seiten anlegt, ließ sich vorher nicht als Ganzes
+   * zurücknehmen.
+   *
+   * Der Kunde steht dabei auf EINER Seite und klickt in einer Liste, die
+   * neben dieser Seite aufgeht. „Diese Version wiederherstellen" liest sich
+   * dort zwangsläufig als „diese Seite". Es hier nicht auszusprechen wäre der
+   * teuerste Satz des ganzen Editors.
+   */
   function onRestore(commit, subject) {
-    if (!window.confirm(
-      "Diese Version wiederherstellen?\n\n" +
-      (subject ? "„" + subject + "“\n\n" : "") +
-      "Der aktuelle Stand wird durch diese Version ersetzt und als neue Version gesichert. " +
-      "Die Seite wird danach neu geladen.")) {
-      return;
-    }
-    fetch("/edit/restore", {
+    zeigeModal({
+      titel: "Die ganze Website auf diesen Stand zurücksetzen?",
+      text: [
+        subject ? "Version: „" + subject + "“" : "",
+        "Es geht nicht nur um diese Seite: ALLE Seiten und Dateien der Website gehen auf " +
+          "diesen Stand zurück.",
+        "Was seither hinzugekommen ist — auch ganze neu angelegte Seiten —, verschwindet dabei.",
+        "Der jetzige Stand geht nicht verloren: Er bleibt als Version erhalten, und du kannst " +
+          "genauso wieder zu ihm zurück."
+      ],
+      aktionen: [{
+        // Die Handlung steht AUF dem Knopf, nicht nur im Text darüber. Ein „OK"
+        // hier wäre die Zustimmung zu etwas, das man beim Klicken nicht mehr
+        // vor Augen hat.
+        text: "Ganze Website zurücksetzen", primaer: true,
+        fn: function () { fuehreRestoreAus(commit); }
+      }]
+    });
+  }
+
+  function fuehreRestoreAus(commit) {
+    setStatus("Wird zurückgesetzt…");
+    fetch(u("/edit/restore"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       credentials: "same-origin",
-      body: JSON.stringify({ commit: commit, pagePath: CFG.pagePath })
-    }).then(function (res) {
-      if (!res.ok) {
-        return res.text().then(function (t) {
-          throw new Error("Wiederherstellen fehlgeschlagen (" + res.status + ")" + (t ? ": " + t : ""));
-        });
-      }
-      return res.json();
-    }).then(function (data) {
-      if (data && data.ok) {
+      // OHNE `pagePath`: `restoreVersion(repoRoot, commit)` hat den Parameter
+      // verloren (C10), weil es jetzt den ganzen Baum anfasst. Ihn weiter
+      // mitzuschicken wäre unschädlich und trotzdem falsch — er behauptete eine
+      // Seitenbezogenheit, die es hier nicht mehr gibt.
+      body: JSON.stringify({ commit: commit })
+    }).then(mitRumpf).then(function (r) {
+      if (r.ok && r.body && r.body.ok) {
         // Restore committet serverseitig -> Seite neu laden.
         forceReload();
-      } else {
-        throw new Error("Wiederherstellen nicht bestätigt.");
+        return;
       }
-    }).catch(function (err) {
-      window.alert(err && err.message ? err.message : "Wiederherstellen fehlgeschlagen.");
+      // Auch das Zurücksetzen fällt unter den Riegel: Unter einer offenen
+      // KI-Änderung setzte es ihr den Unterbau weg, und das Übernehmen
+      // scheiterte danach mit „fremd-geaendert", ohne dass jemand versteht warum.
+      if (r.status === 409 && r.body && r.body.fehler === "schwebende-aenderung") {
+        closeVersions();
+        ladeZustand().then(function () {
+          if (offeneKiAenderung()) frageWegenOffenerKiAenderung();
+        });
+        setStatus(FEHLERTEXTE["schwebende-aenderung"], "err");
+        return;
+      }
+      setStatus(fehlerSatz(r.body, r.status, "Zurücksetzen hat nicht geklappt."), "err");
+    }).catch(function () {
+      setStatus("Zurücksetzen hat nicht geklappt.", "err");
     });
   }
 
@@ -2366,9 +3194,46 @@
     }
   }
 
+  /**
+   * Ein Auftrag, der einen Seiten-Reload überleben muss.
+   *
+   * Gebraucht für genau einen Weg: den Drei-Tage-Hinweis aus C8. „Änderungen
+   * verwerfen" setzt den Entwurf zurück, lädt die Seite neu und schickt DANN
+   * den Auftrag ab — über den Reload hinweg gibt es aber keinen JS-Zustand
+   * mehr.
+   *
+   * EINMALIG, und zwar durch Löschen VOR dem Senden: Bricht danach irgendetwas
+   * ab, liegt nichts mehr da, das beim nächsten Laden ein zweites Mal losliefe.
+   * Ein Geisterauftrag kostet echtes Geld und wäre für den Kunden nicht
+   * erklärbar.
+   */
+  var AUFTRAG_MERK = "regoro-agent-auftrag";
+  function merkeAuftrag(text) {
+    try { window.sessionStorage.setItem(AUFTRAG_MERK, String(text)); } catch (e) { /* egal */ }
+  }
+  function holeAuftrag() {
+    var wert = null;
+    try {
+      wert = window.sessionStorage.getItem(AUFTRAG_MERK);
+      window.sessionStorage.removeItem(AUFTRAG_MERK);
+    } catch (e) {
+      return null;
+    }
+    return wert || null;
+  }
+
   function onAgent() {
     if (agentPanel) {
       closeAgent();
+      return;
+    }
+    // Der Moduswechsel in die andere Richtung: ungespeicherte Handarbeit,
+    // bevor der Assistent ins Spiel kommt. Erst fragen, dann öffnen.
+    if (editing && isDirty()) {
+      frageWegenHandarbeit(function () {
+        closeVersions();
+        openAgent();
+      });
       return;
     }
     closeVersions();
@@ -2388,6 +3253,7 @@
     agentPanel = null;
     document.body.classList.remove("__regoro-agent-offen");
     merkeAgentOffen(false);
+    updateButtons();   // der Modusknopf ist nicht mehr gedrückt
   }
 
   function openAgent() {
@@ -2488,10 +3354,31 @@
       }
     });
 
+    // Die Leiste kennt jetzt einen Modus mehr — der KI-Knopf muss als gedrückt
+    // erscheinen, solange das Panel offen ist.
+    updateButtons();
+
     // Erst das Gespräch, dann der Zustand: `ladeAgentStatus` hängt sich am Ende
     // an den Ereignisstrom, und ob dabei der ganze letzte Lauf oder nur sein
     // Ausgang nachgereicht wird, hängt davon ab, ob hier schon etwas steht.
     ladeGespraech();
+
+    /**
+     * Ein Auftrag, der über den Reload gerettet wurde (C8, „Änderungen
+     * verwerfen"). Er wird hier zu Ende geführt, nicht beim Klick — dazwischen
+     * lag ein Seitenwechsel.
+     *
+     * `holeAuftrag()` löscht beim Lesen. Ein zweites Öffnen der Leiste findet
+     * nichts mehr, und ein Fehlschlag hinterlässt keine Wiedervorlage, die
+     * irgendwann von selbst Geld ausgäbe.
+     */
+    var gemerkt = holeAuftrag();
+    if (gemerkt) {
+      eingabe.value = gemerkt;
+      setAgentHinweis("Die Änderungen wurden verworfen — der Auftrag läuft jetzt auf dem " +
+        "Stand der Live-Seite.");
+      sendeAuftrag(gemerkt);
+    }
   }
 
   /**
@@ -2566,7 +3453,7 @@
   }
 
   function holeListe() {
-    return fetch("/edit/agent/verlaeufe", {
+    return fetch(u("/edit/agent/verlaeufe"), {
       credentials: "same-origin",
       headers: { "Accept": "application/json" }
     }).then(function (res) {
@@ -2694,9 +3581,9 @@
    */
   function ladeNachrichten(id, vor, generation) {
     var meine = generation === undefined ? agentLadeGeneration : generation;
-    var u = "/edit/agent/verlauf?id=" + encodeURIComponent(id) + "&anzahl=" + VERLAUF_SEITE;
-    if (typeof vor === "number") u += "&vor=" + vor;
-    return fetch(u, {
+    var ziel = u("/edit/agent/verlauf?id=" + encodeURIComponent(id) + "&anzahl=" + VERLAUF_SEITE);
+    if (typeof vor === "number") ziel += "&vor=" + vor;
+    return fetch(ziel, {
       credentials: "same-origin",
       headers: { "Accept": "application/json" }
     }).then(function (res) {
@@ -2782,7 +3669,7 @@
    * (sonst öffnete jeder Abschluss einen zweiten Strom auf sich selbst).
    */
   function ladeAgentStatus(nurKontingent, opts) {
-    fetch("/edit/agent/status", {
+    fetch(u("/edit/agent/status"), {
       credentials: "same-origin",
       headers: { "Accept": "application/json" }
     }).then(function (res) {
@@ -2851,7 +3738,22 @@
          * tauscht einen Fehler gegen einen kleineren — eine Leiste ohne
          * Kontingent und ohne Anschluss an den laufenden Auftrag.
          */
-        if (!ueberholt) {
+        /**
+         * UND NUR, WENN NICHT SCHON ETWAS LÄUFT.
+         *
+         * Eine Nachlese ist die Wiederholung eines BEENDETEN Laufs. Ist
+         * inzwischen ein neuer unterwegs, hätte sie nichts nachzureichen und
+         * risse ihm den Ereignisstrom weg: `verbindeStrom` schließt die
+         * vorhandene Quelle, die Nachlese bekäme „Kein Lauf aktiv." und der
+         * echte Lauf liefe unbeobachtet zu Ende.
+         *
+         * Erreichbar wurde das mit dem nachgereichten Auftrag aus dem
+         * Drei-Tage-Hinweis (C8): Der schickt unmittelbar beim Öffnen der
+         * Leiste ab, also genau in dem Fenster, in dem diese Antwort noch
+         * unterwegs ist. Von Hand ist so schnell niemand — deshalb fiel es
+         * vorher nicht auf, und deshalb steht der Fall jetzt im Prüfstand.
+         */
+        if (!ueberholt && !agentLaeuft) {
           verbindeStrom({ nachlese: true, nurAbschluss: !!(opts && opts.nurAbschluss) });
         }
       }
@@ -2980,6 +3882,11 @@
 
   function setAgentLaeuft(laeuft) {
     agentLaeuft = laeuft;
+    // Auch die OBERE LEISTE hängt daran, nicht nur das Panel: Während ein Lauf
+    // arbeitet, darf niemand nebenher von Hand in dieselbe Datei schreiben.
+    // Deshalb VOR dem frühen Ausstieg unten — der greift, wenn das Panel
+    // geschlossen ist, und genau dann bliebe die Leiste sonst gesperrt zurück.
+    updateButtons();
     if (!agentPanel) return;
     // `agentGesperrt` überlebt das Ende eines Laufs — ein aufgebrauchtes
     // Kontingent wird nicht dadurch wieder voll, dass ein Strom zu Ende ist.
@@ -3029,6 +3936,52 @@
     agentAnsEnde(false);
   }
 
+  /** Ist die Frist aus C8 gerissen? Verstrichene Zeit, nicht Kalendertage. */
+  var DREI_TAGE_MS = 3 * TAG_MS;
+  function entwurfIstAlt() {
+    if (!zustand || !zustand.unveroeffentlicht || !zustand.unveroeffentlichtSeit) return false;
+    var t = new Date(zustand.unveroeffentlichtSeit).getTime();
+    if (isNaN(t)) return false;
+    return (Date.now() - t) > DREI_TAGE_MS;
+  }
+
+  /**
+   * Der Drei-Tage-Hinweis (C8) — die einzige Stelle, an der der Editor von
+   * sich aus nach der Live-Seite fragt.
+   *
+   * Der Fall dahinter: Jemand hat vor zwei Wochen etwas geändert, nie
+   * veröffentlicht, und beauftragt jetzt den Assistenten. Der baut dann auf
+   * einem Stand auf, den seit zwei Wochen niemand gesehen hat — und der Kunde
+   * merkt es erst, wenn das Ergebnis nicht zu dem passt, was er im Netz sieht.
+   *
+   * Ohne Ausweichmöglichkeit (`abbrechenText: null`): Wer hier vorbeikäme,
+   * bekäme genau den Auftrag, den er nicht beurteilen konnte.
+   */
+  function frageWegenAltemEntwurf(auftrag) {
+    var seit = alterText(zustand.unveroeffentlichtSeit);
+    zeigeModal({
+      titel: "Achtung",
+      text: [
+        "Es bestehen noch Änderungen zur Live-Seite, die älter sind als drei Tage" +
+          (seit ? " (die älteste " + seit + ")" : "") + ".",
+        "Möchtest du die Änderungen verwerfen und die Bearbeitung von der Live-Seite aus " +
+          "beginnen, oder von deinen bestehenden Änderungen aus weitermachen?"
+      ],
+      abbrechenText: null,
+      aktionen: [
+        {
+          text: "Änderungen verwerfen",
+          fn: function () {
+            // Der Auftrag muss den Reload überleben — siehe merkeAuftrag.
+            merkeAuftrag(auftrag);
+            verwirfEntwurf(function () { forceReload(); });
+          }
+        },
+        { text: "Änderungen behalten", primaer: true, fn: function () { sendeAuftrag(auftrag); } }
+      ]
+    });
+  }
+
   function onAuftragSenden() {
     if (!agentPanel || agentLaeuft) return;
     var auftrag = (ui.agent.eingabe.value || "").trim();
@@ -3036,24 +3989,45 @@
       setAgentHinweis("Schreib zuerst, was sich ändern soll.", true);
       return;
     }
-    // Ungespeicherte Text-Edits: Der Agent arbeitet auf der Datei auf Platte,
-    // nicht auf dem DOM dieses Fensters. Liefe er los, schriebe er die Datei
-    // neu — und die Änderungen hier im Browser wären beim nächsten Laden weg,
-    // ohne dass jemand es gemerkt hätte. Deshalb ablehnen und den Grund nennen.
+    // Drei Riegel, in dieser Reihenfolge — jeder räumt eine Sache weg, die den
+    // Auftrag sonst wertlos machte:
+    //
+    // (1) Ungespeicherte Handarbeit. Der Agent arbeitet auf der Datei auf
+    //     Platte, nicht auf diesem DOM; liefe er los, wäre die Arbeit hier beim
+    //     nächsten Laden spurlos weg. Früher lehnte die Leiste nur ab — richtig,
+    //     aber der Kunde stand mit seiner Arbeit allein da. Jetzt: Rückfrage.
+    // (2) Eine bereits offene KI-Änderung. Der Server nähme den Auftrag mit
+    //     409 gar nicht an, also vorher fragen statt hinterher ablehnen.
+    // (3) Ein Entwurf, der seit über drei Tagen nicht veröffentlicht ist (C8).
+    //
+    // Die Reihenfolge ist nicht beliebig: (3) kann den ganzen Entwurf
+    // zurücksetzen, und das würde eine ungeklärte Handarbeit aus (1)
+    // stillschweigend mitnehmen.
     if (isDirty()) {
-      setAgentHinweis(
-        "Es gibt ungespeicherte Änderungen an dieser Seite. Speichere sie zuerst — sonst " +
-        "gingen sie verloren, sobald der Assistent die Datei neu schreibt.", true);
+      frageWegenHandarbeit(function () { onAuftragSenden(); });
       return;
     }
+    if (offeneKiAenderung()) {
+      frageWegenOffenerKiAenderung();
+      return;
+    }
+    if (entwurfIstAlt()) {
+      frageWegenAltemEntwurf(auftrag);
+      return;
+    }
+    sendeAuftrag(auftrag);
+  }
 
+  /** Der eigentliche Versand — ohne Rückfragen, die stehen in onAuftragSenden. */
+  function sendeAuftrag(auftrag) {
+    if (!agentPanel || agentLaeuft) return;
     setAgentHinweis("");
     agentTextBlase = null;
     agentNachricht(auftrag, "kunde");
     ui.agent.eingabe.value = "";
     setAgentLaeuft(true);
 
-    fetch("/edit/agent", {
+    fetch(u("/edit/agent"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       credentials: "same-origin",
@@ -3071,12 +4045,18 @@
       if (!r.ok) {
         // Der Server liefert für jeden Fehlerfall einen deutschen Klartextsatz;
         // 404 hat als einzige keinen Rumpf (die Route existiert dann nicht).
-        var grund = r.body && r.body.grund
-          ? r.body.grund
-          : "Der KI-Assistent ist gerade nicht verfügbar.";
-        agentNachricht(grund, "fehler");
+        agentNachricht(
+          fehlerSatz(r.body, r.status, "Der KI-Assistent ist gerade nicht verfügbar."),
+          "fehler");
         setAgentLaeuft(false);
         ladeAgentStatus(true);             // nur die Kontingentanzeige nachziehen
+        // Eine schwebende Änderung ist der einzige Fehlschlag, aus dem der Kunde
+        // selbst herauskommt — also gleich fragen statt ihn suchen zu lassen.
+        if (r.status === 409) {
+          ladeZustand().then(function () {
+            if (offeneKiAenderung()) frageWegenOffenerKiAenderung();
+          });
+        }
         return;
       }
       // Ab jetzt ist das neu angelegte Gespräch das jüngste — „auto" trifft
@@ -3092,7 +4072,7 @@
 
   function onAuftragAbbrechen() {
     ui.agent.abbrechen.disabled = true;
-    fetch("/edit/agent/abort", {
+    fetch(u("/edit/agent/abort"), {
       method: "POST",
       credentials: "same-origin"
     }).catch(function () {
@@ -3138,7 +4118,7 @@
     // zweiter Auftrag stören könnte.
     if (!nachlese) setAgentLaeuft(true);
 
-    var quelle = new EventSource("/edit/agent/events");
+    var quelle = new EventSource(u("/edit/agent/events"));
     agentQuelle = quelle;
     var etwasGesehen = false;
 
@@ -3225,10 +4205,17 @@
   function zeigeAusgang(dateien) {
     agentTextBlase = null;
     var nichtsGeaendert = dateien.length === 0;
+    // Ob „geändert" oder „vorbereitet" stimmt, hängt davon ab, ob der Kunde
+    // die Änderung inzwischen übernommen hat. Beides pauschal „geändert" zu
+    // nennen wäre in einem der beiden Fälle die Unwahrheit — und zwar in dem,
+    // in dem noch eine Entscheidung von ihm aussteht.
+    var liegtBereit = offeneKiAenderung();
     var node = agentNachricht(
       nichtsGeaendert
         ? "Der letzte Auftrag hat an der Website nichts geändert."
-        : "Der letzte Auftrag hat diese Dateien geändert:",
+        : (liegtBereit
+          ? "Der letzte Auftrag hat diese Dateien vorbereitet — noch nicht übernommen:"
+          : "Der letzte Auftrag hat diese Dateien geändert:"),
       nichtsGeaendert ? "agent" : "fertig",
     );
     if (node && !nichtsGeaendert) {
@@ -3294,15 +4281,29 @@
       liste.appendChild(el("li", { text: String(name) }));
     });
     node.appendChild(liste);
-    // Die Seite im Browser ist jetzt veraltet: Der Agent hat die Datei auf
-    // Platte geändert, dieses DOM kennt den alten Stand. Ein Reload ist kein
-    // Vorschlag, sondern nötig — sonst überschriebe ein späteres Speichern
-    // die Arbeit des Agenten (oder scheiterte am fileHash mit 409).
-    var neu = el("button", { class: "__regoro-abtn", type: "button", text: "Seite neu laden" });
+    /**
+     * DIE ÄNDERUNG IST NICHT LIVE — und das ist der ganze Umbau.
+     *
+     * Hier stand „Die Änderung ist live. Über ‚Versionen‘ lässt sie sich
+     * zurücknehmen." Beides stimmt nicht mehr: Der Lauf legt sein Ergebnis
+     * bereit, geschrieben wird erst beim Übernehmen. Und zurücknehmen muss man
+     * nichts, was nie hinausging.
+     *
+     * Der Reload bleibt trotzdem nötig, und zwar aus einem NEUEN Grund: Die
+     * Editor-Ansicht liefert die schwebende Fassung als Auflage aus. Ohne
+     * Neuladen sieht der Kunde weiter den alten Stand — und soll dann etwas
+     * übernehmen, das er gar nicht gesehen hat. Genau das sollte dieser Plan
+     * abschaffen.
+     */
+    var neu = el("button", { class: "__regoro-abtn", type: "button", text: "Änderung ansehen" });
     neu.addEventListener("click", forceReload);
     node.appendChild(el("div", { class: "__regoro-azeile" }, [neu]));
-    setAgentHinweis("Die Änderung ist live. Über „Versionen“ lässt sie sich zurücknehmen.");
+    setAgentHinweis("Die Änderung liegt bereit — sie ist noch nicht auf der Website. " +
+      "Sieh sie dir an und übernimm sie dann mit „Speichern“.");
     ladeAgentStatus(true);
+    // Ab jetzt liegt etwas Schwebendes vor: Die Leiste muss „Speichern" und
+    // „Verwerfen" freigeben, auch wenn der Kunde nicht neu lädt.
+    ladeZustand();
   }
 
   // ---------------------------------------------------------------------------
@@ -3338,6 +4339,20 @@
   // fixe Toolbar, das Versionen-Panel, die KI-Seitenleiste und die aufgelegte
   // Bild-„ersetzen"-Badge. Fehlte #__regoro-agent hier, fräße der Navigations-Guard
   // im Edit-Modus jeden Klick auf „Auftrag geben" — die Leiste wäre stumm.
+  //
+  // #__regoro-modal steht aus demselben Grund dabei — aber NACHGEMESSEN ist die
+  // Wirkung kleiner, als dieser Kommentar vermuten lässt, und das gehört hierhin,
+  // damit es niemand ein zweites Mal herausfinden muss:
+  //
+  //   `e.preventDefault()` in einem CAPTURE-Listener unterdrückt nur die
+  //   Standardhandlung, NICHT den eigenen click-Listener des Knopfes. Im
+  //   headless-Browser geprüft (Knopf mit `type="button"`, capture-Listener auf
+  //   document, der preventDefault ruft): Der Handler lief.
+  //
+  // Für die Knöpfe dieser Datei — alle `type="button"` mit JS-Handler — ist der
+  // Selektor also VORSORGE, kein Rettungsanker. Er trägt, sobald in einem der
+  // Panels je ein `<a href>`, ein Submit-Knopf oder ein `<summary>` steht; genau
+  // dort greift der Guard wirklich. Wer die Liste kürzt, nimmt diese Vorsorge weg.
   function isOwnUI(target) {
     if (!target || typeof target.closest !== "function") return false;
     // Sicherheitsnetz: alles innerhalb eines editierbaren Inhalts-Elements ist
@@ -3348,7 +4363,7 @@
       if (!target.closest(".__regoro-img-badge")) return false;
     }
     return !!target.closest(
-      "#__regoro-bar, #__regoro-versions, #__regoro-agent, .__regoro-img-badge"
+      "#__regoro-bar, #__regoro-versions, #__regoro-agent, #__regoro-modal, .__regoro-img-badge"
     );
   }
 
@@ -3385,6 +4400,11 @@
     // fehlt, wenn der Server keinen Modellzugang hat — dann gibt es nichts zu
     // öffnen, und das Merkzeichen bleibt folgenlos liegen.
     if (ui.btnAgent && warAgentOffen()) openAgent();
+    // Der Server liefert den Zustand normalerweise mit (CFG.zustand) — dann
+    // stimmt die Leiste ohne eine einzige Anfrage. Fehlt er (älterer Server),
+    // wird er einmal nachgeholt, statt die Leiste stumm falsch stehen zu
+    // lassen: „nichts offen" ist die gefährlichere der beiden Auskünfte.
+    if (!CFG.zustand) ladeZustand();
     window.addEventListener("beforeunload", onBeforeUnload);
     document.addEventListener("click", onCaptureClick, true);
     document.addEventListener("submit", onCaptureSubmit, true);
