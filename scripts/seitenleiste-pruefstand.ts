@@ -115,6 +115,39 @@ interface Fall {
    * anschlagen kann, beweist durch sein Ausbleiben nichts.
    */
   sofort?: boolean;
+  /**
+   * Liefert die Seite einen KLEBENDEN Kopf (`position:sticky;top:0`) und genug
+   * Text darunter, um wirklich scrollen zu können?
+   *
+   * Der Fehler, den das prüft, ist erst NACH dem Scrollen zu sehen: Ungescrollt
+   * sitzt der Kopf korrekt unter der Leiste, der Messapparat stimmt. Erst wenn
+   * die Seite läuft, bleibt der klebende Kopf am Viewport hängen und wandert
+   * unter die Leiste. Eine kurze Seite kann das nicht zeigen — ohne Fülltext
+   * wäre der Fall immer grün, ganz gleich was das Overlay tut.
+   */
+  klebrigerKopf?: boolean;
+  /**
+   * Muss die KI-Seitenleiste GESCHLOSSEN sein?
+   *
+   * Für die Kopf-Fälle ist das die Voraussetzung, nicht Geschmackssache: Unter
+   * 900 px Breite legt sich das Panel über die ganze Seite (`flex:1 1 auto` in
+   * der Media-Query). Ein Kopf hinter dem Panel sagt nichts darüber, ob die
+   * EDITOR-LEISTE ihn verdeckt — die Messung liefe ins Leere.
+   *
+   * Geschlossen wird AKTIV, nicht durch Weglassen des Öffnen-Klicks: Die Leiste
+   * merkt sich in `sessionStorage`, dass sie offen war, und geht beim nächsten
+   * Seitenaufruf von selbst wieder auf. Ein Fall, der sie nur nicht öffnet,
+   * hinge davon ab, welcher Fall vorher lief.
+   */
+  leisteZu?: boolean;
+  /**
+   * Fenstergröße, die VOR dem Laden gesetzt wird — etwa `"390x844"`.
+   *
+   * Die Überdeckung hängt an der Leistenhöhe, und die hängt am Umbruch: mobil
+   * dreizeilig (gemessen 128 px), auf dem Schreibtisch einzeilig (47 px). Ein
+   * Fall ohne feste Fenstergröße misst deshalb je nach Maschine etwas anderes.
+   */
+  viewport?: string;
   /** JS-Ausdruck, im Browser ausgewertet — liefert das Prüfergebnis als JSON. */
   pruefung: string;
   /** Was dieser Ausdruck liefern MUSS. */
@@ -157,6 +190,42 @@ const NEU_KLICK =
 const LISTE_AUF =
   "js \"Array.from(document.querySelectorAll('.__regoro-akopfbtn'))" +
   ".find(function(b){return b.textContent==='Verlauf'}).click()\"";
+
+/** Weit genug, dass der klebende Kopf sicher am oberen Rand hängt. */
+const SCROLLEN = 'js "window.scrollTo(0,900)"';
+
+/**
+ * Die Kopf-Prüfung — EINMAL, für den mobilen und den Schreibtisch-Fall.
+ *
+ * Zwei Fälle, eine Erwartung: Der Fehler ist in beiden Fenstergrößen derselbe,
+ * nur unterschiedlich auffällig. Stünde der Ausdruck zweimal da, könnten die
+ * beiden Fassungen auseinanderlaufen — und dann prüfte einer der Fälle etwas
+ * anderes, ohne dass es jemandem auffiele.
+ *
+ * `gescrollt` und `panelZu` messen nicht das Ergebnis, sondern den Messapparat:
+ * Ungescrollt sitzt der Kopf auch ohne Behebung richtig, und hinter einem
+ * offenen Panel (unter 900 px deckt es die ganze Seite) wäre die Rechnung
+ * bedeutungslos. Ohne diese beiden wäre der Fall grün, wenn die Prüfung gar
+ * nicht stattgefunden hat.
+ */
+const KOPF_PRUEFUNG =
+  "JSON.stringify((function(){" +
+  "var bar=document.querySelector('#__regoro-bar').getBoundingClientRect();" +
+  "var kopf=document.querySelector('.pruefstand-kopf').getBoundingClientRect();" +
+  "var ban=document.querySelector('.pruefstand-banner');" +
+  "var voll=document.querySelector('.pruefstand-vollbild');" +
+  "var tk=document.querySelector('.pruefstand-tabellenkopf');" +
+  "return {ueberdeckung:Math.max(0,Math.round(bar.bottom-kopf.top))," +
+  "kopfSichtbar:kopf.top>=0&&kopf.bottom<=innerHeight," +
+  "bannerKlebtUnten:Math.round(ban.getBoundingClientRect().bottom)===innerHeight," +
+  "vollbildUnberuehrt:Math.round(voll.getBoundingClientRect().top)===0," +
+  "tabellenkopfUnberuehrt:getComputedStyle(tk).top==='0px'," +
+  "gescrollt:scrollY>0,panelZu:!document.querySelector('#__regoro-agent')};})())";
+
+const KOPF_SOLL =
+  '{"ueberdeckung":0,"kopfSichtbar":true,"bannerKlebtUnten":true,' +
+  '"vollbildUnberuehrt":true,"tabellenkopfUnberuehrt":true,' +
+  '"gescrollt":true,"panelZu":true}';
 
 const FAELLE: Record<string, Fall> = {
   "mit-dateien": {
@@ -518,6 +587,115 @@ const FAELLE: Record<string, Fall> = {
     ],
   },
 
+  /**
+   * DER KOPF DER KUNDENSEITE, NACHDEM GESCROLLT WURDE — mobil.
+   *
+   * Gemessen vor der Behebung (390×844): Leiste 0..128, klebender Kopf 0..55 —
+   * VOLLSTÄNDIG verdeckt. Ursache ist nicht die Leistenhöhe, sondern die
+   * Struktur: `padding-top` auf dem `<body>` bewegt `position:sticky|fixed`
+   * nicht, weil solche Elemente sich am Viewport ausrichten und nicht am Fluss.
+   *
+   * `gescrollt` ist die Gegenprobe am Messapparat selbst, kein Beiwerk:
+   * Ungescrollt sitzt der Kopf auch OHNE Behebung korrekt unter der Leiste.
+   * Eine Seite, die sich nicht scrollen lässt, machte diesen Fall dauerhaft
+   * grün — ein Nachweis, der nicht anschlagen kann, beweist durch sein
+   * Ausbleiben nichts.
+   */
+  "kopf-frei": {
+    tun: "Seite in 390×844 laden (Seitenleiste bleibt zu), auf 900 px scrollen.",
+    erwartung:
+      "Der klebende Kopf der Kundenseite steht VOLLSTÄNDIG UNTER der Editor-Leiste: " +
+      "`bar.bottom` ist nicht größer als `kopf.top`, die Überdeckung ist 0. Der Kopf " +
+      "ist dabei sichtbar (nicht aus dem Bild geschoben) und die Seite ist wirklich " +
+      "gescrollt — sonst misst der Fall nichts. Der Cookie-Hinweis am UNTEREN Rand " +
+      "(`position:fixed;bottom:0`) bleibt unangetastet: Er hat mit der Leiste oben " +
+      "nichts zu tun, und wer ihn mitschöbe, schöbe ihn aus dem Bild. ACHTUNG, hier " +
+      "liegt eine Falle: Er meldet NICHT `top:auto`, sondern seine ausgerechnete " +
+      "Position (gemessen 930 px) — `getComputedStyle` liefert für positionierte " +
+      "Elemente den benutzten Wert. Genau daran ist die erste Fassung gescheitert. " +
+      "Dasselbe gilt für ein Vollbild-Overlay: Es beginnt oben, verliert nach unten " +
+      "geschoben aber nur seinen unteren Rand samt Knöpfen.",
+    ki: true,
+    leisteZu: true,
+    klebrigerKopf: true,
+    viewport: "390x844",
+    schritte: [SCROLLEN],
+    pruefung: KOPF_PRUEFUNG,
+    sollwert: KOPF_SOLL,
+    ereignisse: [],
+  },
+
+  /**
+   * DERSELBE FEHLER AUF DEM SCHREIBTISCH — er fällt nur weniger auf.
+   *
+   * Gemessen (1440×900): Leiste 0..47 über Kopf 0..55, also 47 von 55 px
+   * verdeckt. Es bleibt ein 8-px-Streifen stehen, und daraus wurde „auf Desktop
+   * passt es". Das ist eine Fehlwahrnehmung, keine Grenze des Fehlers — deshalb
+   * steht der Fall hier eigenständig neben dem mobilen.
+   */
+  "kopf-frei-desktop": {
+    tun: "Seite in 1440×900 laden (Seitenleiste bleibt zu), auf 900 px scrollen.",
+    erwartung:
+      "Wie `kopf-frei`, nur im Schreibtisch-Fenster. Vor der Behebung waren hier 47 von " +
+      "55 px verdeckt — sichtbar blieb ein 8-px-Streifen, und genau der hat den Fehler " +
+      "auf dem Schreibtisch verborgen.",
+    ki: true,
+    leisteZu: true,
+    klebrigerKopf: true,
+    viewport: "1440x900",
+    schritte: [SCROLLEN],
+    pruefung: KOPF_PRUEFUNG,
+    sollwert: KOPF_SOLL,
+    ereignisse: [],
+  },
+
+  /**
+   * DER WAHRSCHEINLICHSTE UMSETZUNGSFEHLER, ALS EIGENER FALL.
+   *
+   * Der Versatz greift in eine fremde Seite ein. Wer den Ausgangswert nicht
+   * merkt, addiert bei JEDEM Durchlauf erneut auf — und die Kundenseite wandert
+   * mit jeder Fenster-Änderung weiter nach unten. Das sieht man einer einzelnen
+   * Messung nicht an: Direkt nach dem Laden stimmt der Wert in beiden Fassungen.
+   *
+   * Gemessen wird deshalb der ABSTAND zur Leistenhöhe, nicht der `top`-Wert
+   * selbst: Der Kopf startet bei `top:0`, also muss `top` nach beliebig vielen
+   * Umbrüchen GENAU der aktuellen Leistenhöhe entsprechen. Ein aufaddierender
+   * Fehler ergibt hier 128, 256, 384 … statt 0 — und zwar unabhängig davon, wie
+   * hoch die Leiste auf der prüfenden Maschine tatsächlich umbricht.
+   *
+   * `barhPlausibel` sichert wieder den Messapparat: Wäre `--regoro-barh` leer,
+   * käme die Differenz aus zwei Unbekannten.
+   */
+  "kopf-wandert-nicht": {
+    tun:
+      "Seite in 390×844 laden (Seitenleiste bleibt zu), das Fenster mehrfach zwischen " +
+      "Schreibtisch- und Handy-Größe wechseln, dann scrollen.",
+    erwartung:
+      "Der Kopf sitzt weiterhin GENAU eine Leistenhöhe tief — nicht zwei, nicht vier. " +
+      "Jeder Wechsel löst den ResizeObserver aus; ohne gemerkten Ausgangswert addiert " +
+      "sich der Versatz auf und die Kundenseite wandert nach unten.",
+    ki: true,
+    leisteZu: true,
+    klebrigerKopf: true,
+    viewport: "390x844",
+    schritte: [
+      "viewport 1440x900",
+      "viewport 390x844",
+      "viewport 1440x900",
+      "viewport 390x844",
+      SCROLLEN,
+    ],
+    pruefung:
+      "JSON.stringify((function(){" +
+      "var kopf=document.querySelector('.pruefstand-kopf');" +
+      "var top=parseFloat(getComputedStyle(kopf).top);" +
+      "var barh=parseFloat(getComputedStyle(document.documentElement)" +
+      ".getPropertyValue('--regoro-barh'));" +
+      "return {versatzUeberBarh:Math.round(top-barh),barhPlausibel:barh>20};})())",
+    sollwert: '{"versatzUeberBarh":0,"barhPlausibel":true}',
+    ereignisse: [],
+  },
+
   "ohne-ki": {
     tun: "Seite laden, die obere Leiste ansehen.",
     erwartung:
@@ -536,7 +714,50 @@ const FAELLE: Record<string, Fall> = {
 /** Erschöpftes Kontingent — eigener Schalter, weil es am Status hängt, nicht am Strom. */
 const ERSCHOEPFT = "erschoepft";
 
-function seite(ki: boolean): string {
+/**
+ * Der klebende Kopf der Kundenseite — nachgebaut, nicht importiert.
+ *
+ * Bewusst OHNE die Klassennamen der Fabrik (`.kanon-header`): Der Editor darf
+ * die Fabrik nicht kennen, und ein Prüfstand, der ihre Namen benutzt, könnte
+ * eine Lösung durchwinken, die genau daran hängt. Was hier zählt, ist allein
+ * `position:sticky;top:0` — dieselbe Eigenschaft, an der der Fehler hängt.
+ *
+ * Der Fülltext ist Teil der Messung, nicht Zierde: Ohne scrollbare Seite bleibt
+ * der Kopf im Fluss stehen, das `padding-top` des Body trägt ihn, und der Fall
+ * wäre auch mit unverändertem Overlay grün.
+ */
+const KLEBRIGER_KOPF = `<header class="pruefstand-kopf" data-edit-idx="90">Kopf der Kundenseite</header>
+<div class="pruefstand-banner">Cookie-Hinweis der Kundenseite</div>
+<div class="pruefstand-vollbild">Vollbild-Overlay der Kundenseite</div>
+<div class="pruefstand-rollbereich">
+  <div class="pruefstand-tabellenkopf">Tabellenkopf im eigenen Rollbereich</div>
+  ${Array.from({ length: 20 }, (_, i) => `<p>Zeile ${i + 1}</p>`).join("\n")}
+</div>
+${Array.from({ length: 40 }, (_, i) => `<p data-edit-idx="${100 + i}">Fülltext ${i + 1}, damit die Seite scrollt.</p>`).join("\n")}`;
+
+const KLEBRIGER_KOPF_CSS =
+  ".pruefstand-kopf{position:sticky;top:0;background:#123;color:#fff;padding:16px;font-weight:700}" +
+  // Der Gegenbeweis am unteren Rand: `bottom:0` heißt `top:auto`, und ein
+  // Element, das UNTEN klebt, hat mit der Leiste am oberen Rand nichts zu tun.
+  // Würde der Versatz es „der Vollständigkeit halber" mitnehmen, schöbe er es
+  // aus dem Bild — der Kunde verlöre seinen Cookie-Hinweis samt Knöpfen.
+  ".pruefstand-banner{position:fixed;bottom:0;left:0;right:0;background:#333;color:#fff;padding:8px}" +
+  // Der zweite Grenzfall: ein Element, das den ganzen Bildschirm füllt
+  // (Consent-Dialog, Bildergalerie). Es beginnt oben, wird von der Leiste aber
+  // nicht im Sinne dieses Fehlers verdeckt — nach unten geschoben verlöre es
+  // nur seinen unteren Rand samt Knöpfen. `pointer-events:none`, weil es hier
+  // ein Messobjekt ist und die Klicks der anderen Schritte nicht abfangen soll;
+  // fürs Verschieben spielt das keine Rolle.
+  ".pruefstand-vollbild{position:fixed;top:0;left:0;width:100%;height:100vh;" +
+  "pointer-events:none;background:rgba(0,0,0,.04)}" +
+  // Der dritte Grenzfall: `position:sticky` klebt am nächsten ROLLBAREN
+  // Vorfahren, nicht zwangsläufig am Fenster. Eine Tabellenkopfzeile in einem
+  // eigenen Rollbereich gerät nie hinter die Editor-Leiste — sie um deren Höhe
+  // zu versetzen, schöbe sie nur innerhalb ihres Kastens nach unten.
+  ".pruefstand-rollbereich{height:150px;overflow:auto;border:1px solid #999;margin:12px 0}" +
+  ".pruefstand-tabellenkopf{position:sticky;top:0;background:#eee;padding:4px}";
+
+function seite(ki: boolean, klebrigerKopf = false): string {
   const cfg = {
     pagePath: "index.html",
     fileHash: "a".repeat(64),
@@ -546,8 +767,10 @@ function seite(ki: boolean): string {
   };
   return `<!doctype html><html lang="de"><head><meta charset="utf-8">
 <title>Prüfstand: KI-Seitenleiste</title>
-<style>body{font:16px/1.6 system-ui,sans-serif;margin:0;padding:24px;max-width:46em}</style>
+<style>body{font:16px/1.6 system-ui,sans-serif;margin:0;padding:24px;max-width:46em}
+${klebrigerKopf ? KLEBRIGER_KOPF_CSS : ""}</style>
 </head><body>
+${klebrigerKopf ? KLEBRIGER_KOPF : ""}
 <h1 data-edit-idx="0">Prüfstand</h1>
 <p data-edit-idx="1">Dieser Absatz ist editierbar — damit der Dirty-Guard der Leiste
 prüfbar ist: Text ändern, dann einen Auftrag abschicken. Die Leiste muss ihn ablehnen
@@ -745,7 +968,7 @@ function starte(): void {
     if (seitenAufruf) {
       auftragLaeuft = false; // frische Seite, frischer Zustand
       kontingentWeg = false;
-      return new Response(seite(erschoepft ? true : fall.ki), {
+      return new Response(seite(erschoepft ? true : fall.ki, fall.klebrigerKopf), {
         headers: {
           "Content-Type": "text/html; charset=utf-8",
           // Der Fall muss die absoluten API-Pfade des Overlays erreichen.
@@ -797,9 +1020,29 @@ const OEFFNEN =
   "js \"if(!document.querySelector('#__regoro-agent')){" +
   "var b=Array.from(document.querySelectorAll('#__regoro-bar button'))" +
   ".find(function(x){return x.textContent==='KI-Assistent'}); if(b)b.click()}\"";
+/** Gegenstück zu OEFFNEN — ebenso idempotent, aus demselben Grund. */
+const SCHLIESSEN =
+  "js \"if(document.querySelector('#__regoro-agent')){" +
+  "var b=Array.from(document.querySelectorAll('#__regoro-bar button'))" +
+  ".find(function(x){return x.textContent==='KI-Assistent'}); if(b)b.click()}\"";
 const ABSCHICKEN =
   "js \"document.querySelector('.__regoro-aeingabe').value='mach was';" +
   " document.querySelector('.__regoro-asenden').click()\"";
+
+/**
+ * Die Fenstergröße, in der alle Fälle gemessen werden, wenn sie keine eigene
+ * nennen.
+ *
+ * JEDER Fall druckt seine `viewport`-Zeile, auch der, dem sie gleichgültig ist.
+ * Der Grund ist der Treiber: Er fährt die Fälle nacheinander gegen DENSELBEN
+ * Browser, und `viewport` wirkt über den Fall hinaus. Ohne diese Zeile erbte
+ * jeder Fall nach `kopf-frei` die 390 px des vorigen — dort bricht die Leiste
+ * dreizeilig um, Knöpfe rutschen, und Fälle, die mit dem Kopf nichts zu tun
+ * haben, würden je nach REIHENFOLGE etwas anderes messen. Eine Abhängigkeit von
+ * der Reihenfolge ist in einem Prüfstand schlimmer als ein fehlender Fall: Sie
+ * erzeugt Fehlschläge, die niemand einem Auslöser zuordnen kann.
+ */
+const STANDARD_VIEWPORT = "1440x900";
 
 function anleitung(name: string, fall: Fall): void {
   console.log(`── ${name} ──`);
@@ -808,8 +1051,9 @@ function anleitung(name: string, fall: Fall): void {
   console.log(`   Erwartung: ${fall.erwartung}`);
   console.log("   Maschinell:");
   console.log(`     B=${BROWSE}`);
+  console.log(`     $B viewport ${fall.viewport ?? STANDARD_VIEWPORT}`);
   console.log(`     $B goto ${basis}/${name}/edit`);
-  if (fall.ki) console.log(`     $B ${OEFFNEN}`);
+  if (fall.ki) console.log(`     $B ${fall.leisteZu ? SCHLIESSEN : OEFFNEN}`);
   if (fall.auftrag) console.log(`     $B ${ABSCHICKEN}`);
   if ((fall.gespraeche || fall.schritte) && !fall.sofort) console.log("     sleep 2");
   for (const schritt of fall.schritte ?? []) {

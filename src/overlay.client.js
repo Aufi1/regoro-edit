@@ -882,6 +882,136 @@
   function messeLeiste(bar) {
     var h = bar && bar.offsetHeight ? bar.offsetHeight : 52;
     document.documentElement.style.setProperty("--regoro-barh", h + "px");
+    // Der Wert gilt für zweierlei: den Abstand des Body (über die
+    // CSS-Variable) und die klebenden Elemente, die dieser Abstand nicht
+    // erreicht. Beides muss zusammen nachgeführt werden, sonst rutscht das eine
+    // ohne das andere.
+    versetzeKlebendeElemente(h);
+  }
+
+  /**
+   * Der ursprüngliche `top`-Wert jedes klebenden Elements der Kundenseite.
+   *
+   * DAS IST DER KERN DER SACHE, nicht Buchhaltung: Ohne gemerkten Ausgangswert
+   * läse der nächste Durchlauf den bereits verschobenen Wert und addierte
+   * erneut. Die Kundenseite wanderte dann bei JEDER Fenster-Änderung weiter
+   * nach unten — ein Fehler, den eine einzelne Messung nicht zeigt, weil direkt
+   * nach dem Laden beide Fassungen dasselbe liefern. Der Prüfstand hat dafür
+   * einen eigenen Fall (`kopf-wandert-nicht`).
+   *
+   * `WeakMap`, damit entfernte Elemente nicht am Leben gehalten werden.
+   */
+  var KLEBER = new WeakMap();
+
+  /**
+   * Klebt dieses `sticky`-Element am FENSTER — oder an einem eigenen Rollbereich?
+   *
+   * `position:sticky` bezieht sich auf den nächsten rollbaren Vorfahren, nicht
+   * zwangsläufig auf das Fenster. Eine Tabellenkopfzeile in einem Kasten mit
+   * `overflow:auto` klebt an DIESEM Kasten; sie gerät nie hinter die Editor-
+   * leiste, und ein Versatz schöbe sie nur innerhalb ihres Kastens nach unten.
+   * Gemessen: ohne diese Prüfung bekam sie `top:128px` und rutschte genau so
+   * weit ab.
+   *
+   * Ein Vorfahr mit `overflow != visible` ist immer eine Rollbox — auch
+   * `hidden`, und auch das häufige `overflow-x:hidden` (CSS zwingt die andere
+   * Achse dann auf `auto`). Genau dann klebt das Element aber ohnehin nicht am
+   * Fenster, sondern scrollt mit seinem Kasten weg. Es auszulassen kostet also
+   * nichts: Was hier herausfällt, konnte die Leiste gar nicht stören.
+   */
+  function klebtAmFenster(knoten) {
+    for (var p = knoten.parentElement; p; p = p.parentElement) {
+      if (p === document.body || p === document.documentElement) return true;
+      var cs = getComputedStyle(p);
+      if (cs.overflowY !== "visible" || cs.overflowX !== "visible") return false;
+    }
+    return true;
+  }
+
+  /**
+   * KLEBENDE ELEMENTE DER KUNDENSEITE UNTER DIE LEISTE SCHIEBEN.
+   *
+   * `padding-top` auf dem `<body>` bewegt `position:sticky|fixed` NICHT — solche
+   * Elemente richten sich am Viewport aus, nicht am Fluss. Ungescrollt fällt das
+   * nicht auf, der Kopf steht dann ohnehin richtig; erst wenn die Seite läuft,
+   * bleibt er am oberen Rand hängen und verschwindet hinter der Leiste.
+   *
+   * Gemessen mit dem Kopf der Fabrik (`position:sticky;top:0`) nach
+   * `scrollTo(0, 900)`:
+   *
+   *   390×844 (mobil)     Leiste 0..128 über Kopf 0..55  → VOLLSTÄNDIG verdeckt
+   *   1440×900 (desktop)  Leiste 0..47  über Kopf 0..55  → 47 von 55 px verdeckt
+   *
+   * Auf dem Schreibtisch ist es also ebenfalls kaputt; es blieb nur ein
+   * 8-px-Streifen stehen, und daraus wurde „dort passt es".
+   *
+   * DIE AUSWAHL LÄUFT ÜBER `getComputedStyle`, NICHT ÜBER KLASSENNAMEN. Der
+   * Editor darf die Fabrik nicht kennen — er läuft auf fremden Seiten, deren
+   * Kopf anders heißt. Gemeint ist die EIGENSCHAFT, an der der Fehler hängt,
+   * nicht ein bestimmtes Bauteil.
+   *
+   * ENTSCHIEDEN WIRD AN DER LAGE, NICHT AN DER DEKLARATION — und das ist keine
+   * Feinheit, sondern ein gemessener Fehlschlag. Der naheliegende Test
+   * „`getComputedStyle(el).top === 'auto'` heißt: klebt unten, nicht anfassen"
+   * FUNKTIONIERT NICHT: Für ein positioniertes Element liefert `top` den
+   * benutzten Wert, nicht den geschriebenen. Ein Cookie-Banner mit
+   * `position:fixed;bottom:0` meldet gemessen `top: 930.406px` — niemals
+   * `"auto"`. Auf dieser Annahme gebaut, schob der Versatz den Banner samt
+   * seinen Knöpfen aus dem Bild (gemessen: Unterkante 946 px bei 844 px
+   * Fensterhöhe). `"auto"` bekommt man nur von UNPOSITIONIERTEN Elementen, und
+   * die sind hier gar nicht gemeint.
+   *
+   * Maßgeblich ist deshalb, ob das Element im Streifen liegt, den die Leiste
+   * verdeckt: `top < barh`. Das ist zugleich die ehrlichere Frage — verdeckt
+   * wird, was oben liegt, unabhängig davon, mit welcher Eigenschaft die Seite
+   * es dorthin gebracht hat. Ein Banner unten (`top` ist dort die AUSGERECHNETE
+   * Position, eine große Zahl) fällt von selbst heraus, ebenso ein Element, das
+   * absichtlich erst unterhalb der Leiste klebt.
+   *
+   * Ein Element, das den ganzen Bildschirm füllt (Vollbild-Overlay, Consent-
+   * Dialog), bleibt ebenfalls unangetastet: Es beginnt zwar oben, wird aber von
+   * der Leiste nicht „verdeckt" im Sinne dieses Fehlers — nach unten geschoben
+   * verlöre es nur seinen unteren Rand samt Knöpfen. Dasselbe gilt für ein
+   * `sticky`-Element in einem eigenen Rollbereich (siehe `klebtAmFenster`).
+   *
+   * Alle drei Ausnahmen sind GEMESSEN, nicht ausgedacht: Jede hat im Prüfstand
+   * einen Sollwert, und jede war vorher nachweislich verletzt.
+   */
+  function versetzeKlebendeElemente(barh) {
+    var shell = document.getElementById("__regoro-shell");
+    var alle = document.querySelectorAll("*");
+    // ERST LESEN, DANN SCHREIBEN. In einer Schleife zu messen und zu setzen
+    // erzwingt pro Element ein neues Layout; auf einer gebauten Kundenseite mit
+    // tausenden Knoten wird daraus eine sichtbare Hängepartie bei jedem
+    // Umbruch der Leiste. Zwei Durchgänge kosten nichts und vermeiden das.
+    var treffer = [];
+    for (var i = 0; i < alle.length; i++) {
+      var knoten = alle[i];
+      // Die eigene Hülle ausnehmen — sie ist selbst `position:fixed;inset:0`
+      // und schöbe sonst die Leiste vor sich her. `contains` schließt die Hülle
+      // selbst mit ein; alle Panels sitzen darin.
+      if (shell && shell.contains(knoten)) continue;
+      var cs = getComputedStyle(knoten);
+      if (cs.position !== "sticky" && cs.position !== "fixed") continue;
+      if (!KLEBER.has(knoten)) {
+        if (cs.top === "auto") continue;
+        var alt = parseFloat(cs.top);
+        if (!isFinite(alt)) continue;
+        // Liegt es überhaupt in dem Streifen, den die Leiste verdeckt?
+        if (alt >= barh) continue;
+        // Füllt es den ganzen Bildschirm? Dann ist Verschieben nur Verlust.
+        if (knoten.getBoundingClientRect().height >= window.innerHeight) continue;
+        // Klebt es an einem eigenen Rollbereich statt am Fenster?
+        if (cs.position === "sticky" && !klebtAmFenster(knoten)) continue;
+        KLEBER.set(knoten, alt);
+      }
+      treffer.push(knoten);
+    }
+    for (var j = 0; j < treffer.length; j++) {
+      // `important`, weil die Kundenseite ihr eigenes `top` per Stylesheet
+      // setzt — ein Inline-Stil ohne Vorrang verlöre gegen `!important` dort.
+      treffer[j].style.setProperty("top", KLEBER.get(treffer[j]) + barh + "px", "important");
+    }
   }
 
   // ---------------------------------------------------------------------------
