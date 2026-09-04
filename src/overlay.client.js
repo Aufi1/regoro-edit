@@ -882,6 +882,256 @@
   function messeLeiste(bar) {
     var h = bar && bar.offsetHeight ? bar.offsetHeight : 52;
     document.documentElement.style.setProperty("--regoro-barh", h + "px");
+    // Der Wert gilt für zweierlei: den Abstand des Body (über die
+    // CSS-Variable) und die klebenden Elemente, die dieser Abstand nicht
+    // erreicht. Beides muss zusammen nachgeführt werden, sonst rutscht das eine
+    // ohne das andere — der zweite Teil gesammelt, siehe `planeVersatz`.
+    planeVersatz(h);
+  }
+
+  /**
+   * Was die KUNDENSEITE selbst inline an `top` stehen hatte — nicht ihr
+   * Ausgangswert.
+   *
+   * Der Unterschied ist der Kern einer Korrektur: Zuerst stand hier der einmal
+   * gelesene Ausgangswert, und das war falsch, sobald die Seite ihn später
+   * ändert. Ein Kopf mit `top:0` und einer Media Query, die auf schmalen
+   * Fenstern `top:20px` setzt, bekam weiterhin `0 + Leistenhöhe` — der
+   * Media-Query-Wert war für immer verloren, weil unser eigenes `!important`
+   * jedes erneute Lesen verdeckte.
+   *
+   * Deshalb wird der Ausgangswert jetzt bei JEDEM Durchlauf frisch gelesen, und
+   * gemerkt wird nur, was wir vorgefunden haben: der Inline-Wert der Seite (fast
+   * immer leer) samt seiner Priorität. Er wird vor jedem Neu-Lesen
+   * wiederhergestellt, damit wir den echten aktuellen Sollwert sehen und nicht
+   * unseren eigenen.
+   *
+   * Dazu `unser` — der zuletzt von UNS geschriebene Wert. Steht er nicht mehr
+   * da, hat ein Skript der Kundenseite inzwischen selbst gesetzt; dann gilt
+   * dessen Wert und wird zur neuen Grundlage. Ohne diesen Vergleich schriebe
+   * jede Leistenmessung die Seite auf einen Zustand von vorhin zurück, und eine
+   * Kopfzeile, die ihre Lage selbst nachführt, bliebe stehen.
+   *
+   * `WeakMap`, damit entfernte Elemente nicht am Leben gehalten werden.
+   */
+  var KLEBER = new WeakMap();
+
+  /**
+   * Die Elemente, an denen gerade ein Versatz von uns steht.
+   *
+   * Ohne diese Liste müsste Schritt 1 wieder über das ganze Dokument laufen, um
+   * die eigenen Spuren zu finden — und ein Element, das kein Kandidat mehr ist,
+   * behielte seinen Versatz für immer.
+   */
+  var GESETZT = [];
+
+  /**
+   * Höchstens ein Durchlauf je Bild.
+   *
+   * Der Versatz liest den Stil JEDES Knotens der Kundenseite. Der
+   * ResizeObserver feuert aber mehrfach hintereinander — beim Umbrechen der
+   * Leiste, beim Öffnen eines Panels, bei jedem Ziehen am Fensterrand. Ohne
+   * Sammelpunkt liefe dieser O(n)-Durchgang dutzende Male je Sekunde auf dem
+   * Hauptthread, und auf einer großen Kundenseite ruckelt der Editor sichtbar.
+   * Die CSS-Variable wird weiterhin SOFORT gesetzt — sie ist billig, und der
+   * Abstand des Body soll nicht ein Bild lang hinterherhinken.
+   */
+  var VERSATZ_GEPLANT = 0;
+  var LETZTE_BARH = 0;
+
+  function planeVersatz(barh) {
+    LETZTE_BARH = barh;
+    if (VERSATZ_GEPLANT) return;
+    if (typeof requestAnimationFrame !== "function") {
+      versetzeKlebendeElemente(barh);
+      return;
+    }
+    VERSATZ_GEPLANT = requestAnimationFrame(function () {
+      VERSATZ_GEPLANT = 0;
+      versetzeKlebendeElemente(LETZTE_BARH);
+    });
+  }
+
+  /**
+   * Erzeugt dieses Element einen eigenen Bezugsrahmen für `position:fixed`?
+   *
+   * `fixed` misst normalerweise am Fenster — aber nicht, wenn ein Vorfahr einen
+   * „containing block" aufspannt. `transform`, `perspective`, `filter`,
+   * `backdrop-filter`, ein entsprechendes `will-change`, `contain` mit
+   * Layout-/Paint-Wirkung oder ein Container-Query-Kontext tun genau das. Ein
+   * Dialog in einem solchen Kasten misst dann an dessen Kante, und unser
+   * Versatz verschöbe ihn INNERHALB des Kastens — sichtbar daneben, obwohl er
+   * mit der Leiste nie in Berührung kam.
+   */
+  function erzeugtBezugsrahmen(cs) {
+    return (
+      cs.transform !== "none" ||
+      cs.perspective !== "none" ||
+      (cs.filter && cs.filter !== "none") ||
+      (cs.backdropFilter && cs.backdropFilter !== "none") ||
+      /transform|perspective|filter/.test(cs.willChange || "") ||
+      /paint|layout|strict|content/.test(cs.contain || "") ||
+      (cs.containerType && cs.containerType !== "normal")
+    );
+  }
+
+  /**
+   * Misst dieses klebende Element am FENSTER — oder an einem eigenen Kasten?
+   *
+   * Beide Positionsarten können am Fenster vorbeizielen, aber aus verschiedenen
+   * Gründen, und deshalb prüft die Funktion sie verschieden:
+   *
+   * `sticky` bezieht sich auf den nächsten ROLLBAREN Vorfahren. Eine
+   * Tabellenkopfzeile in einem Kasten mit `overflow:auto` klebt an diesem
+   * Kasten; sie gerät nie hinter die Editorleiste, und ein Versatz schöbe sie
+   * nur innerhalb ihres Kastens nach unten. Gemessen: ohne diese Prüfung bekam
+   * sie `top:128px` und rutschte genau so weit ab. Ein Vorfahr mit
+   * `overflow != visible` ist immer eine Rollbox — auch `hidden`, und auch das
+   * häufige `overflow-x:hidden` (CSS zwingt die andere Achse dann auf `auto`).
+   * Genau dann klebt das Element aber ohnehin nicht am Fenster, sondern scrollt
+   * mit seinem Kasten weg. Es auszulassen kostet also nichts: Was hier
+   * herausfällt, konnte die Leiste gar nicht stören.
+   *
+   * `fixed` dagegen ficht `overflow` nicht an — dort zählt allein, ob ein
+   * Vorfahr einen Bezugsrahmen aufspannt (siehe `erzeugtBezugsrahmen`). Deshalb
+   * läuft die Schleife für `fixed` bis ganz nach oben durch, `body` und `html`
+   * eingeschlossen: Ein `transform` auf dem `body` ist ein verbreiteter
+   * Seiteneffekt von Animationsbibliotheken.
+   */
+  function klebtAmFenster(knoten, pos) {
+    for (var p = knoten.parentElement; p; p = p.parentElement) {
+      var cs = getComputedStyle(p);
+      if (pos === "fixed") {
+        if (erzeugtBezugsrahmen(cs)) return false;
+      } else {
+        if (p === document.body || p === document.documentElement) return true;
+        if (cs.overflowY !== "visible" || cs.overflowX !== "visible") return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * KLEBENDE ELEMENTE DER KUNDENSEITE UNTER DIE LEISTE SCHIEBEN.
+   *
+   * `padding-top` auf dem `<body>` bewegt `position:sticky|fixed` NICHT — solche
+   * Elemente richten sich am Viewport aus, nicht am Fluss. Ungescrollt fällt das
+   * nicht auf, der Kopf steht dann ohnehin richtig; erst wenn die Seite läuft,
+   * bleibt er am oberen Rand hängen und verschwindet hinter der Leiste.
+   *
+   * Gemessen mit dem Kopf der Fabrik (`position:sticky;top:0`) nach
+   * `scrollTo(0, 900)`:
+   *
+   *   390×844 (mobil)     Leiste 0..128 über Kopf 0..55  → VOLLSTÄNDIG verdeckt
+   *   1440×900 (desktop)  Leiste 0..47  über Kopf 0..55  → 47 von 55 px verdeckt
+   *
+   * Auf dem Schreibtisch ist es also ebenfalls kaputt; es blieb nur ein
+   * 8-px-Streifen stehen, und daraus wurde „dort passt es".
+   *
+   * DIE AUSWAHL LÄUFT ÜBER `getComputedStyle`, NICHT ÜBER KLASSENNAMEN. Der
+   * Editor darf die Fabrik nicht kennen — er läuft auf fremden Seiten, deren
+   * Kopf anders heißt. Gemeint ist die EIGENSCHAFT, an der der Fehler hängt,
+   * nicht ein bestimmtes Bauteil.
+   *
+   * ENTSCHIEDEN WIRD AN DER LAGE, NICHT AN DER DEKLARATION — und das ist keine
+   * Feinheit, sondern ein gemessener Fehlschlag. Der naheliegende Test
+   * „`getComputedStyle(el).top === 'auto'` heißt: klebt unten, nicht anfassen"
+   * FUNKTIONIERT NICHT: Für ein positioniertes Element liefert `top` den
+   * benutzten Wert, nicht den geschriebenen. Ein Cookie-Banner mit
+   * `position:fixed;bottom:0` meldet gemessen `top: 930.406px` — niemals
+   * `"auto"`. Auf dieser Annahme gebaut, schob der Versatz den Banner samt
+   * seinen Knöpfen aus dem Bild (gemessen: Unterkante 946 px bei 844 px
+   * Fensterhöhe). `"auto"` bekommt man nur von UNPOSITIONIERTEN Elementen, und
+   * die sind hier gar nicht gemeint.
+   *
+   * Maßgeblich ist deshalb, ob das Element im Streifen liegt, den die Leiste
+   * verdeckt: `top < barh`. Das ist zugleich die ehrlichere Frage — verdeckt
+   * wird, was oben liegt, unabhängig davon, mit welcher Eigenschaft die Seite
+   * es dorthin gebracht hat. Ein Banner unten (`top` ist dort die AUSGERECHNETE
+   * Position, eine große Zahl) fällt von selbst heraus, ebenso ein Element, das
+   * absichtlich erst unterhalb der Leiste klebt.
+   *
+   * Ein Element, das den ganzen Bildschirm füllt (Vollbild-Overlay, Consent-
+   * Dialog), bleibt ebenfalls unangetastet: Es beginnt zwar oben, wird aber von
+   * der Leiste nicht „verdeckt" im Sinne dieses Fehlers — nach unten geschoben
+   * verlöre es nur seinen unteren Rand samt Knöpfen. Dasselbe gilt für ein
+   * `sticky`-Element in einem eigenen Rollbereich (siehe `klebtAmFenster`).
+   *
+   * Alle drei Ausnahmen sind GEMESSEN, nicht ausgedacht: Jede hat im Prüfstand
+   * einen Sollwert, und jede war vorher nachweislich verletzt.
+   */
+  function versetzeKlebendeElemente(barh) {
+    var shell = document.getElementById("__regoro-shell");
+    var i, knoten, cs;
+
+    // SCHRITT 1 — SCHREIBEN: den eigenen Versatz zurücknehmen. Erst dadurch
+    // zeigt Schritt 2 den ECHTEN aktuellen Sollwert der Seite statt unseres
+    // zuletzt gesetzten Wertes. Das ersetzt zugleich den früheren Schutz gegen
+    // Aufaddieren: Es steht gar nichts mehr da, worauf sich addieren ließe.
+    for (i = 0; i < GESETZT.length; i++) {
+      knoten = GESETZT[i];
+      var merk = KLEBER.get(knoten);
+      if (!merk) continue;
+      // Steht überhaupt noch UNSER Wert da? Ein Skript der Kundenseite kann
+      // `style.top` inzwischen selbst gesetzt haben — eine ausfahrende
+      // Kopfzeile, ein Dialog, der seine Lage nachführt. Dann gehört der Wert
+      // ihr, nicht uns: Wir übernehmen ihn als neue Grundlage, statt unseren
+      // alten darüberzuschreiben. Andernfalls fiele die Seite bei der nächsten
+      // Leistenmessung auf einen Zustand von vorhin zurück.
+      if (knoten.style.getPropertyValue("top") !== merk.unser) {
+        merk.inline = knoten.style.getPropertyValue("top");
+        merk.prio = knoten.style.getPropertyPriority("top");
+        continue;
+      }
+      if (merk.inline) knoten.style.setProperty("top", merk.inline, merk.prio);
+      else knoten.style.removeProperty("top");
+    }
+    GESETZT.length = 0;
+
+    // SCHRITT 2 — LESEN. Kein Schreiben in dieser Schleife: messen und setzen
+    // im Wechsel erzwingt pro Element ein neues Layout, und auf einer gebauten
+    // Kundenseite mit tausenden Knoten wird daraus eine Hängepartie.
+    var alle = document.querySelectorAll("*");
+    var treffer = [];
+    for (i = 0; i < alle.length; i++) {
+      knoten = alle[i];
+      // Die eigene Hülle ausnehmen — sie ist selbst `position:fixed;inset:0`
+      // und schöbe sonst die Leiste vor sich her. `contains` schließt die Hülle
+      // selbst mit ein; alle Panels sitzen darin.
+      if (shell && shell.contains(knoten)) continue;
+      cs = getComputedStyle(knoten);
+      var pos = cs.position;
+      if (pos !== "sticky" && pos !== "fixed") continue;
+      if (cs.top === "auto") continue;
+      var alt = parseFloat(cs.top);
+      if (!isFinite(alt)) continue;
+      // Liegt es überhaupt in dem Streifen, den die Leiste verdeckt?
+      if (alt >= barh) continue;
+      // Füllt es den ganzen Bildschirm? Dann ist Verschieben nur Verlust.
+      if (knoten.getBoundingClientRect().height >= window.innerHeight) continue;
+      // Misst es überhaupt am Fenster — oder an einem eigenen Kasten?
+      if (!klebtAmFenster(knoten, pos)) continue;
+      if (!KLEBER.has(knoten)) {
+        KLEBER.set(knoten, {
+          inline: knoten.style.getPropertyValue("top"),
+          prio: knoten.style.getPropertyPriority("top"),
+          unser: "",
+        });
+      }
+      treffer.push({ el: knoten, alt: alt });
+    }
+
+    // SCHRITT 3 — SCHREIBEN.
+    for (i = 0; i < treffer.length; i++) {
+      // `important`, weil die Kundenseite ihr eigenes `top` per Stylesheet
+      // setzt — ein Inline-Stil ohne Vorrang verlöre gegen `!important` dort.
+      var wert = treffer[i].alt + barh + "px";
+      treffer[i].el.style.setProperty("top", wert, "important");
+      // Merken, WAS wir gesetzt haben — daran erkennt der nächste Durchlauf,
+      // ob der Inline-Wert noch unserer ist oder inzwischen der Seite gehört.
+      KLEBER.get(treffer[i].el).unser = wert;
+      GESETZT.push(treffer[i].el);
+    }
   }
 
   // ---------------------------------------------------------------------------

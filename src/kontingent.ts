@@ -17,7 +17,7 @@ import { join } from "node:path";
 import { AUTH_DIR_NAME } from "./auth.ts";
 
 /**
- * 1.000.000 Token je Website und Monat. **Vorläufiger Wert.**
+ * 10.000.000 Token je Website und Monat. **Zwischenlösung.**
  *
  * Die Grenze soll einen entgleisten Lauf abschneiden, nicht den Normalgebrauch
  * einrahmen. Gemessen an echten Läufen:
@@ -32,20 +32,48 @@ import { AUTH_DIR_NAME } from "./auth.ts";
  * Grenze von 200.000 die falsche Zahl: Sie hätte einem echten Kunden **einen**
  * Auftrag im Monat erlaubt, und der wäre knapp durchgegangen.
  *
- * Die Kosten bleiben unkritisch: Bei `z-ai/glm-5.3-flash` (0,075 / 0,250 $ je
- * Million) sind eine Million Token grob 8 bis 25 Cent je Website und Monat.
+ * **Die Kosten kann diese Datei nicht ausrechnen — sie kann sie nur schätzen.**
+ * Abgerechnet wurden am 2026-09-04 für `z-ai/glm-5.3-flash` 0,15 $ je Million
+ * Eingabe- und 0,50 $ je Million Ausgabe-Token; eine Million Token liegen damit
+ * grob zwischen 15 und 50 Cent je Website und Monat.
  *
- * STAND 2026-09-04: DREI MILLIONEN, ZUM AUSPROBIEREN ANGEHOBEN. Gemessen an
- * einem echten Lauf auf einer Kundenseite (207.371 Token für 0,0157 $, also
- * 7,6·10⁻⁸ $/Token) sind das rund 23 Cent je Website und Monat und etwa
- * fünfzehn Aufträge. Der Vorgängerwert von 1.000.000 reichte gemessen für acht
- * Läufe (1.193.186 Token verbraucht) und war beim Erproben zu knapp.
+ * DIESE ZAHLEN SIND DOPPELT SO HOCH WIE DIE, DIE HIER EINMAL STANDEN (0,075 /
+ * 0,250), UND DER GRUND IST WICHTIGER ALS DER FAKTOR: Es ist keine ausgelaufene
+ * Aktion, sondern das Routing. `GET /api/v1/generation` meldet zu einem
+ * gemessenen Lauf `provider_name: Together` — OpenRouter hat nicht an Z.ai
+ * selbst geroutet. **Welcher Anbieter bedient, steht erst zur Laufzeit fest**,
+ * und der Preis, den `/models` ausweist, ist nicht der, der berechnet wird.
+ * Eine vorab gerechnete Zahl kann den echten Preis deshalb grundsätzlich nicht
+ * treffen — auch die hier genannte nicht. Sie taugt für die Größenordnung, für
+ * nichts weiter, und wer eine Preistabelle in diesen Code schreibt, baut eine
+ * zweite Wahrheit, die beim nächsten Routing-Wechsel still falsch wird.
  *
- * Die endgültige Festlegung kommt, wenn mehr Läufe gemessen sind — wer sie
- * ändert, sollte die Zahlen oben mit aktualisieren, damit die nächste Änderung
- * eine Grundlage hat statt eines Bauchgefühls.
+ * Belastbar ist nur, was der Anbieter je Lauf zurückmeldet. Genau dorthin geht
+ * die Abrechnung als Nächstes: Sie liest `usage.cost` statt zu rechnen und
+ * zählt in Credits statt in Token (Plan `credits-statt-token`).
+ *
+ * STAND 2026-09-04: ZEHN MILLIONEN, ZWISCHENLÖSUNG BIS ZUR CREDITS-UMSTELLUNG.
+ * Der Auftraggeber beim Erproben: eine Million Token sei praktisch nichts, es
+ * brauche mindestens zehn. Gemessen an einem echten Lauf auf einer Kundenseite
+ * (207.371 Token für 3,84 Cent, also 1,85·10⁻⁷ $/Token) sind zehn Millionen
+ * rund 1,85 $ je Website und Monat und knapp fünfzig Aufträge der teuersten
+ * gemessenen Sorte. Bei einer gepflegten Kundenwebsite ist das keine relevante
+ * Größe. Gemessen ist vom Vorgängerwert nur der erste: 1.000.000 trug acht
+ * Läufe (1.193.186 Token verbraucht). Für 3.000.000 liegt keine Messreihe vor —
+ * die Anhebung kommt aus der Ansage des Auftraggebers, nicht aus einem
+ * beobachteten Aufbrauchen, und das soll hier so stehen statt als Zahl zu
+ * erscheinen, die niemand erhoben hat.
+ *
+ * Der frühere Effektivwert 7,6·10⁻⁸ $/Token in diesem Absatz war derselbe Lauf
+ * zu den Preisen, die `/models` auswies — er ist um denselben Faktor zwei zu
+ * niedrig und steht hier nur noch, damit niemand ihn aus einem alten Stand
+ * zurückholt.
+ *
+ * Wer die Konstante ändert, aktualisiert die Zahlen oben mit — dieser Absatz
+ * ist die Grundlage der nächsten Entscheidung über das Guthaben, und solange er
+ * falsche Zahlen nennt, führt er sie in die Irre.
  */
-export const TOKEN_KONTINGENT = 3_000_000;
+export const TOKEN_KONTINGENT = 10_000_000;
 
 export type Kontingent = {
   frei: number;
